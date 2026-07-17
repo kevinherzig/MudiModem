@@ -1,0 +1,12 @@
+{
+    "index": 10,
+    "view": "overview",
+    "level": 2,
+    "parent": "system",
+    "parent_icon": "setting",
+    "parent_index": 70
+}
+{
+    "view": "modemsignallog",
+    "level": 0
+}
