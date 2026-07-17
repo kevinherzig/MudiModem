@@ -122,10 +122,50 @@ test('quality colour comes from GL levels, mapped to GL ramp tokens', () => {
   assert.ok(styled.includes('var(--warning)'), 'sinr level 2 -> fair ramp token');
 });
 
-test('render is a pure read — never mutates modem state', () => {
+test('Bands tab renders the three-layer grid from get_bands data', () => {
   const c = loadChunk();
-  // The whole component exposes no set_/write path in Phase 1.
+  const vm = makeVm(c, LIVE);
+  vm.tab = 'bands';
+  // Inject a realistic get_bands result (as the backend returns it).
+  vm.bands = {
+    supported: { sa: [71, 41, 78], nsa: [71], LTE: [66, 12] },
+    config: { enable: true, mode: 0, sa: [71], nsa: [], LTE: [] },
+    policy: { sa: [41, 71], nsa: [71], LTE: [12, 66] },
+    capability: { sa: [71], nsa: [], LTE: [12, 66] },
+    meta: { bus: 'cpu', slot: '1', plmn: '310260', sub_id: 1, plmn_matched: true }
+  };
+  const nodes = walk(c.render.call(vm, h));
+  const bandChips = nodes.filter((n) => n.data.staticClass && /mm-band/.test(n.data.staticClass));
+  assert.ok(bandChips.length >= 6, 'renders a chip per supported band');
+  const cls = (b) => bandChips.find((n) => textOf(n).startsWith(b));
+  // n71 is in capability -> active; n78 is not in policy -> blocked.
+  assert.match(cls('n71').data.staticClass, /active/, 'n71 advertised -> active');
+  assert.match(cls('n78').data.staticClass, /blocked/, 'n78 not permitted -> blocked');
+  assert.match(cls('n41').data.staticClass, /permitted/, 'n41 policy-only -> permitted');
+});
+
+test('Bands grid orders NR chips by frequency, low to high', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, LIVE);
+  vm.tab = 'bands';
+  vm.bands = {
+    supported: { sa: [41, 71, 78], nsa: [], LTE: [] },
+    config: { enable: true, mode: 0, sa: [], nsa: [], LTE: [] },
+    policy: { sa: [41, 71, 78], nsa: [], LTE: [] },
+    capability: { sa: [41, 71, 78], nsa: [], LTE: [] },
+    meta: { plmn_matched: true }
+  };
+  const nodes = walk(c.render.call(vm, h));
+  const order = nodes.filter((n) => n.data.staticClass && /mm-band/.test(n.data.staticClass))
+    .map((n) => textOf(n.children[0])); // the <b> label child, e.g. "n71"
+  // n71=600, n41=2500, n78=3500 -> spectrum order is n71, n41, n78.
+  assert.deepStrictEqual(order, ['n71', 'n41', 'n78']);
+});
+
+test('contains no WRITE path yet — reads via $rpcRequest are fine', () => {
   const src = fs.readFileSync(SRC, 'utf8');
-  assert.doesNotMatch(src, /\$rpcRequest|set_bands|set_lock|get_result_AT/,
-    'Phase 1 must contain no write/AT calls');
+  // $rpcRequest("call", [.., "get_bands", ..]) is a read and allowed.
+  // Forbidden until the auto-revert watchdog exists: any write/AT method name.
+  assert.doesNotMatch(src, /set_bands|set_lock|clear_lock|set_apn|get_result_AT|"confirm"/,
+    'no write/AT method may be invoked before the revert watchdog lands');
 });
