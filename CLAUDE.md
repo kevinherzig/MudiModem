@@ -451,7 +451,16 @@ router and searchable. It's a differentiator no router UI has.
 ## 8. Dev gotchas
 - **nginx caches the Lua plugin per worker** (`objects[object]` in `oui/rpc.lua`) → after editing
   the backend you must **reload nginx** (`/etc/init.d/nginx reload`) or changes won't take. This is
-  the analogue of MudiUI's `/etc/init.d/mudi restart` loop.
+  the analogue of MudiUI's `/etc/init.d/mudi restart` loop. ⚠️ `reload` (HUP) leaves old workers
+  serving drained connections; when a fix must take *now*, use `restart`, not `reload`.
+- ⚠️⚠️ **NEVER wrap `oui.ubus.call` in `pcall`.** It uses an nginx **cosocket**, which *yields* while
+  waiting on I/O, and this box's Lua **cannot yield across a C-call boundary** (`pcall` is a C call).
+  A `pcall` wrapper makes *every* ubus call throw `attempt to yield across metamethod/C-call
+  boundary` — and if you swallow that in the same `pcall`, you get silent empty results everywhere.
+  GL's own plugins call `ubus.call(...)` **bare** for exactly this reason; it already returns
+  `(nil, err)` on ubus-level failure without throwing, so no `pcall` is needed. (Cost a whole
+  debugging session — the two stub-based tests both passed because neither exercised the real
+  cosocket path; only the live browser call revealed it.)
 - **`gzip_static on`** → the chunk must exist **gzipped on disk** (`gl-sdk4-ui-*.common.js.gz`).
   Ship the `.gz`. ~~browsers cache aggressively — hard-reload when iterating~~ — **wrong**: the SPA
   requests chunks with a `?_t=<timestamp>` cache-buster, so a normal page reload always refetches.

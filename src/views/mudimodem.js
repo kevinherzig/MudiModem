@@ -272,10 +272,17 @@ module.exports = {
         ? h("div", { staticClass: "mm-hint", staticStyle: { color: "var(--warning)", marginTop: "2px" } },
             "⚠ couldn’t confirm which SIM answered — values may be for the other slot")
         : null;
+      var m = d.meta || {};
       return h("div", { staticClass: "mm-card" }, [
         h("div", { staticStyle: { display: "flex", justifyContent: "space-between", alignItems: "baseline" } }, [
           h("span", { staticClass: "mm-sect" }, "Bands"),
-          h("span", { staticClass: "mm-hint" }, "read-only · carrier " + op)
+          h("span", [
+            h("span", { staticClass: "mm-hint", staticStyle: { marginRight: "10px" } }, "read-only · carrier " + op),
+            h("button", {
+              staticClass: "mm-tab", staticStyle: { fontSize: "11.5px", padding: "2px 0", borderBottom: "0" },
+              on: { click: function () { self.fetchBands(); } }
+            }, self.bandsLoading ? "refreshing…" : "↻ refresh")
+          ])
         ]),
         h("div", { staticClass: "mm-hint", staticStyle: { margin: "3px 0 12px" } },
           "What the modem supports, what your carrier permits, and what it’s actually using. " +

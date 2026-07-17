@@ -12,11 +12,16 @@ local ubus = require "oui.ubus"
 
 local M = {}
 
--- Call a dotted ubus object, never throwing: returns (table|nil, err).
+-- Call a dotted ubus object, returning (table|nil, err).
+--
+-- ⚠️ MUST NOT be wrapped in pcall: oui.ubus.call uses an nginx cosocket, which
+-- YIELDS while waiting on I/O. This box's Lua cannot yield across a C-call
+-- boundary (pcall), so a pcall wrapper makes every call throw
+-- "attempt to yield across metamethod/C-call boundary". GL's own plugins call
+-- ubus.call bare for exactly this reason. ubus.call already returns (nil, err)
+-- on ubus-level failure without throwing, so no pcall is needed.
 local function ucall(object, method, args)
-  local ok, res = pcall(ubus.call, object, method, args or {})
-  if not ok then return nil, tostring(res) end
-  return res, nil
+  return ubus.call(object, method, args or {})
 end
 
 -- Run a raw AT command at a given sub_id, return the payload string (or nil).
