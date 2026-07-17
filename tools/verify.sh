@@ -23,12 +23,26 @@ BODY=$(ssh -o BatchMode=yes "root@$HOST" \
   'curl -sk -H "Accept-Encoding: gzip" "https://127.0.0.1/views/gl-sdk4-ui-mudimodem.common.js?_t=1" | gzip -dc')
 echo "$BODY" | grep -q 'name: *"mudimodem"' || fail "chunk not served / wrong content"
 
-echo "4. chunk still evals to the component after the round trip"
+echo "4. chunk evals AND renders live data after the round trip"
 printf '%s' "$BODY" | node -e '
   let s=""; process.stdin.on("data",d=>s+=d).on("end",()=>{
     const module={exports:{}}; const c=eval(s);
     if(!c||c.name!=="mudimodem"){console.error("FAIL: eval");process.exit(1);}
-    console.log("   eval OK ->", c.name);
+    if(typeof c.render!=="function"||c.template!==undefined){console.error("FAIL: not render-only");process.exit(1);}
+    // Harness the component exactly as Vue would, with a stub websocket store.
+    const h=(t,d,ch)=>((Array.isArray(d)||typeof d==="string")&&(ch=d,d={}),{t,d:d||{},ch});
+    const txt=n=>n==null?"":typeof n==="string"?n:Array.isArray(n)?n.map(txt).join(""):txt(n.ch);
+    const S={"cellular.modems_info":{modems:[{bus:"cpu",name:"RG650V-NA",type:0,band:{"NR-SA":[71]}}]},
+             "cellular.modems_status":{modems:[{bus:"cpu",current_sim_slot:"1"}]},
+             "cellular.networks_info":{networks:[{slot:"1",cell_info:{band:71,mode:"NR5G-SA FDD",rsrp:"-101",rsrp_level:3,sinr:"4",sinr_level:2,rsrq:"-14",rsrq_level:3,dl_bandwidth:"15MHz"}}]},
+             "cellular.sims_info":{sims:[{slot:"1",mcc:"310",mnc:"260"}]}};
+    const vm=Object.assign({},c.data());
+    vm.$store={getters:{moduleStatus:n=>S[n]||{}}};
+    for(const[k,f]of Object.entries(c.methods||{}))vm[k]=f.bind(vm);
+    for(const[k,f]of Object.entries(c.computed||{}))Object.defineProperty(vm,k,{get:f.bind(vm),configurable:true});
+    const out=txt(c.render.call(vm,h));
+    if(!/-101/.test(out)||!/n71/.test(out)){console.error("FAIL: render missing live data\n"+out);process.exit(1);}
+    console.log("   eval + render OK ->", c.name, "(shows -101 / n71)");
   })'
 
-echo "ALL PHASE 0 CHECKS PASSED"
+echo "ALL CHECKS PASSED (Phase 0 + Phase 1 render)"
