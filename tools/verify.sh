@@ -45,4 +45,14 @@ printf '%s' "$BODY" | node -e '
     console.log("   eval + render OK ->", c.name, "(shows -101 / n71)");
   })'
 
-echo "ALL CHECKS PASSED (Phase 0 + Phase 1 render)"
+# 5. RPC backend (only if we ship one) — run the real plugin against live ubus.
+if [ -f src/rpc/mudimodem ]; then
+  echo "5. RPC backend present + get_bands returns the three-layer model"
+  ssh -o BatchMode=yes "root@$HOST" 'test -s /usr/lib/oui-httpd/rpc/mudimodem' \
+    || fail "backend not deployed (run ./tools/deploy.sh)"
+  ssh -o BatchMode=yes "root@$HOST" 'cat > /tmp/mm-backend.test.lua' < test/backend.test.lua
+  ssh -o BatchMode=yes "root@$HOST" 'lua /tmp/mm-backend.test.lua; rc=$?; rm -f /tmp/mm-backend.test.lua; exit $rc' \
+    || fail "backend test failed on-device"
+fi
+
+echo "ALL CHECKS PASSED"

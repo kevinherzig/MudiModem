@@ -19,4 +19,13 @@ ssh -o BatchMode=yes "root@$HOST" 'cat > /www/views/gl-sdk4-ui-mudimodem.common.
   < build/gl-sdk4-ui-mudimodem.common.js.gz
 ssh -o BatchMode=yes "root@$HOST" 'cat > /usr/share/oui/menu.d/mudimodem.json' \
   < src/menu/mudimodem.json
+
+# RPC backend (Lua plugin). nginx caches the plugin per worker, so a reload is
+# required for edits to take effect (CLAUDE.md §8).
+if [ -f src/rpc/mudimodem ]; then
+  ssh -o BatchMode=yes "root@$HOST" 'cat > /usr/lib/oui-httpd/rpc/mudimodem' \
+    < src/rpc/mudimodem
+  ssh -o BatchMode=yes "root@$HOST" '/etc/init.d/nginx reload' 2>/dev/null || true
+  echo "backend deployed + nginx reloaded"
+fi
 echo "deployed to $HOST"

@@ -286,12 +286,24 @@ Measured on this box — **both SIMs, because policy is per-SIM**:
   shown, explained, **not selectable**.
 - **`policy_band` is the number that matters**, not the module list. Show all three; lead with policy.
 
-### GL's config layer vs. the modem — they disagree right now
-`ubus call cellular.sim get_config` returns **no `band_list` at all** → GL believes there is no band
-restriction. The modem says `+QNWPREFCFG: "nr5g_band",71`. Both are true: Kevin set that lock via raw
-AT, and **GL only knows about locks written through its own config path.** So GL's band UI is
-currently displaying stale state for this box, and would keep doing so until someone used it to write
-a band list. Never trust `sim get_config` for band truth — ask the modem.
+### ⭐ Where GL's band CONFIG actually lives — pre-parsed, no AT needed (corrected 2026-07-17)
+`ubus call cellular.modem get_feature_config '{"bus":"cpu"}'` (also `get_all_config`, per-slot)
+returns GL's stored band config **already parsed**:
+```json
+{ "band": { "band_enable": true, "band_filter_mode": 0,
+            "band_list": { "LTE": [], "NR-SA": [71], "NR-NSA": [] } } }
+```
+- `band_filter_mode`: **0 = Open (allowlist)**, 1 = Block (denylist). Here: allow only NR-SA n71.
+- ⇒ **GL's config and the modem AGREE** (both say n71). The band lock IS tracked by GL.
+- ⚠️ **CORRECTION:** an earlier version of this doc claimed they *disagree* — that was from checking
+  `cellular.sim get_config` (returns SIM auth/APN, **no band_list**), the wrong method. **Band config
+  is in `cellular.modem get_feature_config`, not `sim get_config`.** Trust the box.
+
+**What GL config still does NOT surface: `policy_band` / `ue_capability_band`.** Those are AT-only
+(§ reference §2). So the three-layer *lie* stands — GL offers all 18 module bands as checkboxes and
+never shows that policy permits 6 — but "GL displays stale state" was **not** the issue; that was my
+error. **The backend read path is: supported + config from ubus (clean, no sub_id); policy +
+capability from raw AT (needs sub_id).**
 
 ### NV semantics (verified 2026-07-17)
 - **No commit step for band commands.** `AT+QNWPREFCFG` writes NV **immediately**; there is no

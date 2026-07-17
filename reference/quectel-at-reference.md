@@ -120,6 +120,20 @@ listing all 18. (Settles a long-standing open question.)
 - `ue_capability_band` — *"queries the band configured in the UE capability information"*
 - Both are **read-only write-commands, no parameter**. Safe to query.
 
+### Read path for the backend — ubus where possible, AT only where needed 🟢
+| Layer | Source | Needs AT / sub_id? |
+|---|---|---|
+| **supported** | `ubus call cellular.modem info` → `.modems[0].band` | no |
+| **config** (band_enable, filter_mode, band_list) | `ubus call cellular.modem get_feature_config '{"bus":"cpu"}'` | no |
+| **policy** | `AT+QNWPREFCFG="policy_band"` | **yes** |
+| **capability** | `AT+QNWPREFCFG="ue_capability_band"` | **yes** |
+
+⚠️ **Correction (2026-07-17):** band config lives in `cellular.modem get_feature_config`
+(`{band_enable, band_filter_mode, band_list:{LTE,NR-SA,NR-NSA}}`), **not** `cellular.sim get_config`
+(which is SIM auth/APN only). GL's config and the modem **agree** on the n71 lock — the earlier
+"they disagree" note was from querying the wrong method. `band_filter_mode`: 0 = Open (allowlist),
+1 = Block.
+
 ---
 
 ## 3. `AT+QNWPREFCFG` — the core command
