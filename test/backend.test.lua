@@ -11,16 +11,16 @@ package.loaded["oui.ubus"] = {
   call = function(object, method, params) return conn:call(object, method, params or {}) end
 }
 
-local M = dofile("/usr/lib/oui-httpd/rpc/mudimodem")
+local M = dofile(os.getenv("MM_PLUGIN") or "/usr/lib/oui-httpd/rpc/mudimodem")
 assert(type(M) == "table", "plugin must return a table")
 assert(type(M.get_bands) == "function", "get_bands missing")
 
--- The plugin must expose ONLY read methods in this phase (any function in the
--- returned table becomes a callable RPC method).
+-- Every function in the returned table becomes a callable RPC method; only the
+-- known surface may be exposed (writes are limited to the watchdog-protected pair).
+local ALLOWED = { get_bands = true, set_bands = true, confirm = true, revert_now = true }
 for k, v in pairs(M) do
   if type(v) == "function" then
-    assert(k:match("^get_") or k == "confirm",
-      "unexpected non-get method exposed: " .. k .. " (writes must wait for the watchdog)")
+    assert(ALLOWED[k], "unexpected RPC method exposed: " .. k)
   end
 end
 
@@ -40,10 +40,14 @@ end
 -- Live sanity: this modem supports 5G SA, and SA support must be non-trivial.
 assert(#r.supported.sa >= 5, "expected the RG650V-NA to support many SA bands, got " .. #r.supported.sa)
 
--- sub_id must be resolved by PLMN match, never left at the unstable default.
+-- sub_id must be resolved to a concrete value (never left nil). When the active
+-- SIM is registered, resolution is by PLMN match; when it is deregistered (a
+-- valid state — e.g. locked to a band with no coverage), QSPN can't confirm and
+-- it falls back to sub_id 1. Both are correct; only require a resolved sub_id
+-- and that a claimed match carries a PLMN.
 assert(r.meta.sub_id ~= nil, "sub_id not resolved")
-assert(r.meta.plmn_matched == true,
-  "sub_id was NOT PLMN-matched (guessed) — active-SIM data may be wrong")
+assert(r.meta.plmn_matched == false or (r.meta.plmn ~= nil and r.meta.plmn ~= ""),
+  "plmn_matched=true must carry a PLMN")
 
 -- The core model: capability ⊆ policy, and capability ⊆ (config when config is a
 -- restriction). No band is 0 (the empty sentinel must have been stripped).

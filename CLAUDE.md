@@ -301,9 +301,15 @@ returns GL's stored band config **already parsed**:
 
 **What GL config still does NOT surface: `policy_band` / `ue_capability_band`.** Those are AT-only
 (§ reference §2). So the three-layer *lie* stands — GL offers all 18 module bands as checkboxes and
-never shows that policy permits 6 — but "GL displays stale state" was **not** the issue; that was my
-error. **The backend read path is: supported + config from ubus (clean, no sub_id); policy +
-capability from raw AT (needs sub_id).**
+never shows that policy permits 6.
+
+⚠️ **CORRECTION 2 (2026-07-17, from Phase 2b): read `config` from RAW AT, not `get_feature_config`.**
+`get_feature_config` is GL's *own* stored view; it does **not** observe our raw-AT `set_bands` writes,
+so right after a band change it reports STALE bands and the UI reseeds the selection from the wrong
+list (the n66-vanishes bug). Since we WRITE via raw `AT+QNWPREFCFG`, we must READ config from raw AT
+too (`nr5g_band` at the resolved sub_id). Then supported (ubus) / config+policy+capability (raw AT)
+all stay consistent through a write. `get_bands` reads only `config.sa` from AT (the UI's live need);
+nsa/LTE config are left empty to save AT round-trips (each risks the 10s `/rpc` timeout).
 
 ### NV semantics (verified 2026-07-17)
 - **No commit step for band commands.** `AT+QNWPREFCFG` writes NV **immediately**; there is no

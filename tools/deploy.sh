@@ -20,6 +20,14 @@ ssh -o BatchMode=yes "root@$HOST" 'cat > /www/views/gl-sdk4-ui-mudimodem.common.
 ssh -o BatchMode=yes "root@$HOST" 'cat > /usr/share/oui/menu.d/mudimodem.json' \
   < src/menu/mudimodem.json
 
+# Confirm-or-revert watchdog + panic restore (§5). Inert until invoked; install
+# it BEFORE the backend so set_bands can always find it.
+if [ -f src/sbin/mudimodem-revert ]; then
+  ssh -o BatchMode=yes "root@$HOST" 'cat > /usr/sbin/mudimodem-revert && chmod 0755 /usr/sbin/mudimodem-revert && mkdir -p /etc/mudimodem' \
+    < src/sbin/mudimodem-revert
+  echo "watchdog installed (/usr/sbin/mudimodem-revert)"
+fi
+
 # RPC backend (Lua plugin). nginx caches the plugin per worker, so a reload is
 # required for edits to take effect (CLAUDE.md §8).
 if [ -f src/rpc/mudimodem ]; then

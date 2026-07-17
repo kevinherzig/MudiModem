@@ -401,9 +401,28 @@ now "read the value ranges off the box", not "does this command even exist".
 This is the pattern for the whole 6-series: **the manual omits it, the box's `=?` test form
 documents it.** When a command is missing from the 5-series doc, query its test form on the box first.
 
-Commands present in the manual and relevant later: `QCFG` (§3.3, extended config), `QUIMSLOT`
-(§4.11, switch SIM slot), `QNWCFG` (§5.14), `QENDC` (§5.13, EN-DC status), `C5GREG` (§9.12),
-`CFUN` (§2.22), `QGDCNT` (§9.13, data counter), `QTEMP` (§12.5).
+But it cuts the *other* way too — **the 5-series has commands the 6-series dropped:**
+
+### ⚠️ `AT+QUIMSLOT` (SIM-slot switch) — in the 5-series manual, ABSENT on our box 🟢
+📘 §4.11: `AT+QUIMSLOT?` reads the slot, `AT+QUIMSLOT=1|2` switches it (saved automatically).
+🟢 On the RG650V-NA, **`QUIMSLOT` / `QDSIM` / `QUSIM` all return ERROR**, and `QCFG` has no slot
+parameter. The only working SIM AT is `AT+QSIMDET?` → `1,0` (SIM *detection* config, not slot select).
+⇒ **There is no modem-level AT command to choose the SIM slot on this modem.** Slot selection is
+GL-layer only: `cellular.modem get/set_slot_priority_config` (ubus; `slot_priority:[1,2]`) and
+`mvas.switch_sim_slot` (GL's RPC object → closed `modem.so`, QMI/OCPU internally). A MudiModem SIM
+switcher must go through GL's ubus/RPC, **not** raw AT.
+
+### The active SIM vs. the serving SIM (verified 2026-07-17)
+`current_sim_slot` (from `cellular.modem status`) is the **selected** slot — GL's "active SIM". It can
+disagree with the slot actually carrying data: a `dial_status`/registration split (`cellular.network
+status` → `dial_status:1` on the connected slot; `cellular.sim status` → `status:6` registered,
+`5` not registered). Seen live: `current_sim_slot=1` (T-Mobile, unregistered) while slot 2 (AT&T,
+`dial_status:1`) carried failover data. **The UI anchors on `current_sim_slot`** (GL's active SIM) and
+shows *that* SIM's state — even "not registered" — never the other slot's cell.
+
+Commands present in the manual and relevant later: `QCFG` (§3.3, extended config), `QNWCFG` (§5.14),
+`QENDC` (§5.13, EN-DC status), `C5GREG` (§9.12), `CFUN` (§2.22), `QGDCNT` (§9.13, data counter),
+`QTEMP` (§12.5), `QSIMDET` (§4.9, SIM detect — the one SIM AT that works here).
 
 ---
 

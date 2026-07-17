@@ -55,4 +55,18 @@ if [ -f src/rpc/mudimodem ]; then
     || fail "backend test failed on-device"
 fi
 
+# 6. Confirm-or-revert watchdog: isolation tests (dry, temp paths) + set_bands
+#    interlock (shimmed — no real modem writes).
+if [ -f src/sbin/mudimodem-revert ]; then
+  echo "6. watchdog + set_bands safety interlock"
+  ssh -o BatchMode=yes "root@$HOST" 'test -x /usr/sbin/mudimodem-revert' \
+    || fail "watchdog not installed (run ./tools/deploy.sh)"
+  ssh -o BatchMode=yes "root@$HOST" 'cat > /tmp/mm-revert.test.sh'  < test/revert.test.sh
+  ssh -o BatchMode=yes "root@$HOST" 'sh /tmp/mm-revert.test.sh /usr/sbin/mudimodem-revert >/dev/null; rc=$?; rm -f /tmp/mm-revert.test.sh; exit $rc' \
+    || fail "watchdog isolation tests failed"
+  ssh -o BatchMode=yes "root@$HOST" 'cat > /tmp/mm-w.test.lua' < test/backend-write.test.lua
+  ssh -o BatchMode=yes "root@$HOST" 'MUDIMODEM_PENDING=/tmp/mmv-pending MUDIMODEM_ARMED=/tmp/mmv-armed MUDIMODEM_BIN=/usr/sbin/mudimodem-revert lua /tmp/mm-w.test.lua >/dev/null; rc=$?; rm -f /tmp/mm-w.test.lua /tmp/mmv-pending /tmp/mmv-armed; exit $rc' \
+    || fail "set_bands interlock test failed"
+fi
+
 echo "ALL CHECKS PASSED"

@@ -1,4 +1,4 @@
-// MudiModem — Phase 1 diagnostics + Phase 2a read-only three-layer band grid.
+// MudiModem — Phase 1 diagnostics + Phase 2 interactive three-layer band grid.
 //
 // Loaded by GL's SPA via eval(), so this file MUST be a single expression whose
 // value is the component (module.exports = {...}). `module` is in scope at eval
@@ -8,7 +8,10 @@
 //   - live status: this.$store.getters.moduleStatus("cellular.*") over /ws
 //   - band model:  window.$rpcRequest("call",["sid","mudimodem","get_bands",{}])
 // The "sid" string is a verbatim placeholder GL swaps for the session cookie.
-// NOTHING here writes: get_bands is read-only, no set_/lock/AT call exists yet.
+//
+// The one WRITE (set_bands) is confirm-or-revert: the backend arms the
+// /usr/sbin/mudimodem-revert watchdog before writing, and this UI shows the
+// countdown + Keep/Revert. A bad lock self-restores within the window.
 //
 // All colour is GL theme tokens (var(--success) etc.), so light/dark/classic
 // all work with zero extra code.
@@ -24,6 +27,11 @@ module.exports = {
       bands: null,          // get_bands result, once fetched
       bandsLoading: false,
       bandsError: "",
+      selSA: null,          // desired SA allowlist (band numbers) being edited
+      pending: null,        // { window, previous, applied, remaining } after Apply
+      cdTimer: null,        // countdown interval handle
+      applying: false,      // Apply in flight
+      applyError: "",
       // Approximate downlink centre freq (MHz) per band, for spectrum ordering
       // and labels. Source: 3GPP TS 38.101-1 (NR) / 36.101 (LTE), rounded to the
       // marketing figure. Labels only — the modem is never sent a frequency.
@@ -52,17 +60,34 @@ module.exports = {
       var modems = this.ms("cellular.modems_status").modems || [];
       return modems.filter(function (m) { return m.bus === self.modem.bus; })[0] || modems[0] || {};
     },
+    // GL declares ONE active SIM: the SELECTED slot (current_sim_slot). The panel
+    // anchors on THAT SIM and shows its state honestly — even when it is
+    // unregistered — and never borrows the other slot's cell (which may be
+    // carrying failover data; that's GL's own SIM1-active / modem-connected split).
     activeSlot() { return this.modemStatus.current_sim_slot; },
-    serving() {
+    servingNet() {
       var self = this;
-      var nets = this.ms("cellular.networks_info").networks || [];
-      var n = nets.filter(function (x) { return x.slot === self.activeSlot; })[0] || nets[0] || {};
-      return n.cell_info || {};
+      var bus = this.modem.bus;
+      var nets = (this.ms("cellular.networks_info").networks || [])
+        .filter(function (n) { return !bus || n.bus == null || n.bus === bus; });
+      return nets.filter(function (n) { return String(n.slot) === String(self.activeSlot); })[0] || {};
     },
+    serving() { return this.servingNet.cell_info || {}; },
+    // Is the active SIM actually registered (has a serving cell)?
+    activeRegistered() { return this.serving.rsrp !== undefined && this.serving.rsrp !== null && this.serving.rsrp !== ""; },
+    anyNetwork() { return (this.ms("cellular.networks_info").networks || []).length > 0; },
     activeSim() {
       var self = this;
       var sims = this.ms("cellular.sims_info").sims || [];
-      return sims.filter(function (s) { return s.slot === self.activeSlot; })[0] || {};
+      return sims.filter(function (s) { return String(s.slot) === String(self.activeSlot); })[0] || {};
+    },
+    // Carrier of the ACTIVE SIM (from sim status), for the strip label.
+    servingCarrier() {
+      var self = this;
+      var sims = this.ms("cellular.sims_status").sims || [];
+      var s = sims.filter(function (x) { return String(x.slot) === String(self.activeSlot); })[0] || {};
+      if (s.carrier) return s.carrier;
+      return this.activeSim.mcc ? (this.activeSim.mcc + this.activeSim.mnc) : "";
     },
     hasData() { return this.serving.rsrp !== undefined && this.serving.rsrp !== null; },
     isNR() { return /NR5G/.test(this.serving.mode || ""); },
@@ -93,6 +118,7 @@ module.exports = {
       push("RSRQ", c.rsrq !== undefined ? c.rsrq + " dB" : null);
       push("SINR", c.sinr !== undefined ? c.sinr + " dB" : null);
       if (c.rssi !== undefined) push("RSSI", c.rssi + " dBm");
+      push("Carrier", this.servingCarrier);
       push("SIM slot", this.activeSlot);
       return out;
     }
@@ -114,6 +140,7 @@ module.exports = {
   },
 
   created() { this.injectStyle(); },
+  beforeDestroy() { this.clearCountdown(); },
 
   methods: {
     qFromLevel(lvl) {
@@ -130,7 +157,8 @@ module.exports = {
       return t[b];
     },
     prefixOf(group) { return group === "LTE" ? "B" : "n"; },
-    // Fetch the three-layer band model from our backend (read-only).
+
+    // Fetch the three-layer band model from our backend.
     fetchBands() {
       var self = this;
       if (typeof window === "undefined" || !window.$rpcRequest) {
@@ -139,14 +167,92 @@ module.exports = {
       }
       this.bandsLoading = true;
       this.bandsError = "";
-      window.$rpcRequest("call", ["sid", "mudimodem", "get_bands", {}])
-        .then(function (res) { self.bands = res; })
+      window.$rpcRequest("call", ["sid", "mudimodem", "get_bands", {}], { timeout: 15000 })
+        .then(function (res) {
+          self.bands = res;
+          // Seed the editable selection from the current config; an empty config
+          // means "unrestricted", so start from everything the carrier permits.
+          var cfg = (res.config && res.config.sa) || [];
+          var pol = (res.policy && res.policy.sa) || [];
+          self.selSA = (cfg.length ? cfg : pol).slice();
+        })
         .catch(function (e) {
           self.bandsError = (e && (e.type || e.message)) || "request failed";
         })
         .then(function () { self.bandsLoading = false; });
     },
-    // Classify one band: active (advertised) / permitted (policy only) / blocked.
+
+    // Only policy-permitted bands are selectable; blocked ones never take.
+    selectable(group, b) {
+      if (group !== "sa" || !this.bands) return false;
+      return (this.bands.policy.sa || []).indexOf(b) !== -1;
+    },
+    isSelected(b) { return this.selSA && this.selSA.indexOf(b) !== -1; },
+    toggleBand(b) {
+      if (this.pending || !this.selSA) return;      // locked during a pending revert
+      var i = this.selSA.indexOf(b);
+      if (i === -1) this.selSA.push(b); else this.selSA.splice(i, 1);
+    },
+    saChanged() {
+      if (!this.bands || !this.selSA) return false;
+      var cur = ((this.bands.config.sa || []).length
+        ? this.bands.config.sa : (this.bands.policy.sa || [])).slice().sort(function (a, b) { return a - b; });
+      var sel = this.selSA.slice().sort(function (a, b) { return a - b; });
+      if (cur.length !== sel.length) return true;
+      for (var i = 0; i < cur.length; i++) if (cur[i] !== sel[i]) return true;
+      return false;
+    },
+
+    applyBands() {
+      var self = this;
+      if (this.applying || !this.selSA || this.selSA.length === 0) return;
+      if (typeof window === "undefined" || !window.$rpcRequest) return;
+      this.applying = true;
+      this.applyError = "";
+      window.$rpcRequest("call", ["sid", "mudimodem", "set_bands", { sa: this.selSA.slice() }], { timeout: 20000 })
+        .then(function (res) {
+          if (!res || res.error) { self.applyError = (res && res.error) || "apply failed"; return; }
+          self.startCountdown(res.window || 60, res.previous, res.applied);
+        })
+        .catch(function (e) { self.applyError = (e && (e.type || e.message)) || "apply failed"; })
+        .then(function () { self.applying = false; });
+    },
+    startCountdown(window_s, previous, applied) {
+      var self = this;
+      this.clearCountdown();
+      this.pending = { remaining: window_s, window: window_s, previous: previous, applied: applied, done: false };
+      this.cdTimer = setInterval(function () {
+        if (!self.pending) return;
+        self.pending.remaining -= 1;
+        if (self.pending.remaining <= 0) {
+          // The watchdog has reverted server-side. Reflect it and re-read.
+          self.clearCountdown();
+          self.pending = { done: true, reverted: true };
+          self.fetchBands();
+          setTimeout(function () { self.pending = null; }, 4000);
+        }
+      }, 1000);
+    },
+    clearCountdown() {
+      if (this.cdTimer) { clearInterval(this.cdTimer); this.cdTimer = null; }
+    },
+    keepBands() {
+      var self = this;
+      this.clearCountdown();
+      window.$rpcRequest("call", ["sid", "mudimodem", "confirm", {}])
+        .then(function () {}).catch(function () {})
+        .then(function () { self.pending = null; self.fetchBands(); });
+    },
+    revertBands() {
+      var self = this;
+      this.clearCountdown();
+      this.pending = { done: true, reverting: true };
+      window.$rpcRequest("call", ["sid", "mudimodem", "revert_now", {}], { timeout: 20000 })
+        .then(function () {}).catch(function () {})
+        .then(function () { self.pending = null; self.fetchBands(); });
+    },
+
+    // Classify one band for the read-only groups: active / permitted / blocked.
     bandState(group, b) {
       var d = this.bands;
       var has = function (list, x) { return (list || []).indexOf(x) !== -1; };
@@ -186,6 +292,7 @@ module.exports = {
         '.mm-tabs{display:flex;gap:22px;border-bottom:1px solid var(--divider);margin-bottom:11px;padding:0 4px}' +
         '.mm-tab{background:none;border:0;padding:9px 0 8px;font:inherit;font-size:13px;cursor:pointer;color:var(--text-weak);border-bottom:2px solid transparent;margin-bottom:-1px}' +
         '.mm-tab.on{color:var(--primary);border-bottom-color:var(--primary);font-weight:600}' +
+        '.mm-tab:disabled{color:var(--text-hint);cursor:default}' +
         '.mm-card{background:var(--background-card);border-radius:4px;box-shadow:0 1px 5px rgba(0,0,0,.06);padding:13px 14px}' +
         '.mm-sect{font-size:13px;font-weight:600;color:var(--text-title)}.mm-hint{font-size:11.5px;color:var(--text-badge)}' +
         '.mm-dl{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px 16px;margin-top:11px}' +
@@ -197,25 +304,43 @@ module.exports = {
         '.mm-grp-h{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:7px}' +
         '.mm-grp-t{font-size:12px;font-weight:600;color:var(--text-title)}' +
         '.mm-wrap{display:flex;gap:4px;flex-wrap:wrap}' +
-        '.mm-band{position:relative;min-width:44px;padding:4px 6px 3px;text-align:center;border:1px solid var(--border);border-radius:4px;background:var(--background-card)}' +
+        '.mm-band{position:relative;min-width:44px;padding:4px 6px 3px;text-align:center;border:1px solid var(--border);border-radius:4px;background:var(--background-card);transition:border-color .1s,background .1s}' +
         '.mm-band b{display:block;font-size:12px;font-weight:600;line-height:1.2}.mm-band s{display:block;font-size:9px;line-height:1.2;color:var(--text-hint);text-decoration:none}' +
+        // read-only states
         '.mm-band.active{background:var(--success);border-color:var(--success)}.mm-band.active b{color:#fff}.mm-band.active s{color:rgba(255,255,255,.75)}' +
         '.mm-band.permitted{border-color:var(--primary)}.mm-band.permitted b{color:var(--primary)}' +
+        // interactive states
+        '.mm-band.sel{background:var(--success);border-color:var(--success)}.mm-band.sel b{color:#fff}.mm-band.sel s{color:rgba(255,255,255,.75)}' +
+        '.mm-band.unsel b{color:var(--text-regular)}' +
         '.mm-band.blocked{opacity:.5}.mm-band.blocked b{color:var(--text-hint);text-decoration:line-through}' +
+        '.mm-band.clickable{cursor:pointer}.mm-band.clickable:hover{border-color:var(--primary)}' +
         '.mm-band.serving{box-shadow:0 0 0 2px var(--success)}' +
         '.mm-band.serving::after{content:"";position:absolute;top:-3px;right:-3px;width:7px;height:7px;border-radius:50%;background:var(--success);border:1.5px solid var(--background-card)}' +
         '.mm-axis2{display:flex;justify-content:space-between;font-size:9.5px;color:var(--text-hint);margin-top:6px}' +
         '.mm-legend{display:flex;gap:14px;flex-wrap:wrap;font-size:10.5px;color:var(--text-badge);margin-top:12px;padding-top:10px;border-top:1px solid var(--divider)}' +
         '.mm-legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:4px;vertical-align:-1px}' +
-        '@media(max-width:640px){.mm-strip{flex-direction:column}.mm-read{border-left:0;border-top:1px solid var(--divider);text-align:left;align-items:flex-start}.mm-facts{justify-content:flex-start}}';
+        // apply + revert
+        '.mm-foot{display:flex;justify-content:space-between;align-items:center;gap:10px;border-top:1px solid var(--divider);padding-top:11px;margin-top:11px}' +
+        '.mm-btn{font:inherit;font-size:11.5px;font-weight:600;border-radius:3px;padding:6px 13px;cursor:pointer;border:1px solid transparent}' +
+        '.mm-btn.primary{background:var(--primary);color:#fff;border-color:var(--primary)}' +
+        '.mm-btn.primary:disabled{background:var(--primary-disabled);border-color:transparent;cursor:default}' +
+        '.mm-btn.keep{background:var(--warning);color:#fff;border-color:var(--warning)}' +
+        '.mm-btn.danger{background:transparent;color:var(--error);border-color:var(--error)}' +
+        '.mm-revert{background:var(--warning-background);border:1px solid var(--warning);border-radius:3px;padding:9px 11px;margin:0 0 12px}' +
+        '.mm-revert-row{display:flex;justify-content:space-between;align-items:center;gap:12px;font-size:11.5px;color:var(--warning-hover)}' +
+        '.mm-revert b{font-weight:600}.mm-cd{font-variant-numeric:tabular-nums}' +
+        '.mm-bar{height:2px;background:var(--warning-disabled);border-radius:1px;margin-top:8px;overflow:hidden}.mm-bar i{display:block;height:100%;background:var(--warning);transition:width 1s linear}' +
+        '@media(max-width:640px){.mm-strip{flex-direction:column}.mm-read{border-left:0;border-top:1px solid var(--divider);text-align:left;align-items:flex-start}.mm-facts{justify-content:flex-start}.mm-revert-row{flex-direction:column;align-items:flex-start}}';
       var el = document.createElement("style");
       el.id = this.styleId; el.textContent = css;
       document.head.appendChild(el);
     },
 
     // ---- band grid render helpers ----
+    // group "sa" is interactive (set_bands writes SA); nsa/LTE stay read-only.
     renderGroup(h, group, title) {
       var self = this, d = this.bands;
+      var interactive = (group === "sa");
       var supported = (d.supported[group] || []).slice();
       supported.sort(function (a, b) {
         var fa = self.freqOf(group, a), fb = self.freqOf(group, b);
@@ -225,77 +350,130 @@ module.exports = {
       if (supported.length === 0) return null;
       var pre = this.prefixOf(group);
       var chips = supported.map(function (b) {
-        var st = self.bandState(group, b);
         var serving = (self.servingGroup === group && String(self.serving.band) === String(b));
         var f = self.freqOf(group, b);
-        var title2 = pre + b + (f ? " · " + f + " MHz" : "") +
-          " · " + ({ active: "in use", permitted: "permitted, not active", blocked: "blocked by carrier policy" })[st];
+        var cls, tip;
+        if (interactive) {
+          if (!self.selectable("sa", b)) {
+            cls = "blocked"; tip = pre + b + " blocked by carrier policy; selecting has no effect";
+          } else if (self.isSelected(b)) {
+            cls = "sel"; tip = pre + b + " allowed (click to remove)";
+          } else {
+            cls = "unsel"; tip = pre + b + " permitted (click to allow)";
+          }
+        } else {
+          var st = self.bandState(group, b);
+          cls = st;
+          tip = pre + b + " " + ({ active: "in use", permitted: "permitted, not active", blocked: "blocked by carrier policy" })[st];
+        }
+        var clickable = interactive && cls !== "blocked" && !self.pending;
         return h("span", {
           key: b,
-          staticClass: "mm-band " + st + (serving ? " serving" : ""),
-          attrs: { title: title2 }
-        }, [
-          h("b", pre + b),
-          h("s", f ? String(f) : " ")
-        ]);
+          staticClass: "mm-band " + cls + (serving ? " serving" : "") + (clickable ? " clickable" : ""),
+          attrs: { title: tip },
+          on: clickable ? { click: function () { self.toggleBand(b); } } : {}
+        }, [h("b", pre + b), h("s", f ? String(f) : " ")]);
       });
-      var counts = {
-        sup: supported.length,
-        pol: (d.policy[group] || []).length,
-        cap: (d.capability[group] || []).length
-      };
+      var counts = (d.supported[group] || []).length + " supported / " +
+        (d.policy[group] || []).length + " permitted / " + (d.capability[group] || []).length + " active";
       return h("div", { staticClass: "mm-grp", key: group }, [
         h("div", { staticClass: "mm-grp-h" }, [
-          h("span", { staticClass: "mm-grp-t" }, title),
-          h("span", { staticClass: "mm-hint" },
-            counts.sup + " supported · " + counts.pol + " permitted · " + counts.cap + " active")
+          h("span", { staticClass: "mm-grp-t" }, title + (interactive ? "" : "  (read-only)")),
+          h("span", { staticClass: "mm-hint" }, counts)
         ]),
         h("div", { staticClass: "mm-wrap" }, chips),
         h("div", { staticClass: "mm-axis2" }, [
-          h("span", "low band — reaches far"),
-          h("span", "high band — fast, short range")
+          h("span", "low band, reaches far"),
+          h("span", "high band, fast + short range")
         ])
       ]);
     },
+
+    // Confirm-or-revert banner (design C1: inline, on the tab that caused it).
+    renderRevert(h) {
+      var self = this, p = this.pending;
+      var nlist = function (s) { return "n" + String(s || "").split(":").join(" n"); };
+      if (p.done) {
+        return h("div", { staticClass: "mm-revert" }, [
+          h("span", { staticClass: "mm-revert-row" },
+            p.reverting ? "Reverting..." : (p.reverted ? "Reverted - restored your previous bands." : ""))
+        ]);
+      }
+      var pct = Math.max(0, Math.min(100, (p.remaining / p.window) * 100));
+      return h("div", { staticClass: "mm-revert" }, [
+        h("div", { staticClass: "mm-revert-row" }, [
+          h("span", [
+            "Applied ", h("b", nlist(p.applied)), ". Reverting to ", h("b", nlist(p.previous)),
+            " in ", h("b", { staticClass: "mm-cd" }, String(p.remaining) + "s"),
+            " unless you keep it - watch the trace above."
+          ]),
+          h("span", { staticStyle: { flex: "none", display: "flex", gap: "6px" } }, [
+            h("button", { staticClass: "mm-btn danger", on: { click: function () { self.revertBands(); } } }, "Revert now"),
+            h("button", { staticClass: "mm-btn keep", on: { click: function () { self.keepBands(); } } }, "Keep")
+          ])
+        ]),
+        h("div", { staticClass: "mm-bar" }, [h("i", { staticStyle: { width: pct.toFixed(1) + "%" } })])
+      ]);
+    },
+
     renderBands(h) {
-      if (this.bandsLoading) return h("div", { staticClass: "mm-empty" }, "Reading band configuration from the modem…");
-      if (this.bandsError) return h("div", { staticClass: "mm-empty" }, "Couldn’t read bands: " + this.bandsError);
-      if (!this.bands) return h("div", { staticClass: "mm-empty" }, "…");
+      if (this.bandsLoading) return h("div", { staticClass: "mm-empty" }, "Reading band configuration from the modem...");
+      if (this.bandsError) return h("div", { staticClass: "mm-empty" }, "Couldn't read bands: " + this.bandsError);
+      if (!this.bands) return h("div", { staticClass: "mm-empty" }, "...");
       var d = this.bands, self = this;
       var groups = [
-        this.renderGroup(h, "sa", "5G NR · standalone"),
-        this.renderGroup(h, "nsa", "5G NR · non-standalone"),
+        this.renderGroup(h, "sa", "5G NR standalone"),
+        this.renderGroup(h, "nsa", "5G NR non-standalone"),
         this.renderGroup(h, "LTE", "LTE")
       ].filter(Boolean);
       var op = (d.meta && d.meta.plmn) ? d.meta.plmn : "carrier";
       var warn = (d.meta && d.meta.plmn_matched === false)
         ? h("div", { staticClass: "mm-hint", staticStyle: { color: "var(--warning)", marginTop: "2px" } },
-            "⚠ couldn’t confirm which SIM answered — values may be for the other slot")
+            "Couldn't confirm which SIM answered - values may be for the other slot")
         : null;
-      var m = d.meta || {};
-      return h("div", { staticClass: "mm-card" }, [
+      var head = [
         h("div", { staticStyle: { display: "flex", justifyContent: "space-between", alignItems: "baseline" } }, [
           h("span", { staticClass: "mm-sect" }, "Bands"),
           h("span", [
-            h("span", { staticClass: "mm-hint", staticStyle: { marginRight: "10px" } }, "read-only · carrier " + op),
+            h("span", { staticClass: "mm-hint", staticStyle: { marginRight: "10px" } }, "carrier " + op),
             h("button", {
               staticClass: "mm-tab", staticStyle: { fontSize: "11.5px", padding: "2px 0", borderBottom: "0" },
-              on: { click: function () { self.fetchBands(); } }
-            }, self.bandsLoading ? "refreshing…" : "↻ refresh")
+              attrs: { disabled: !!this.pending },
+              on: { click: function () { if (!self.pending) self.fetchBands(); } }
+            }, self.bandsLoading ? "refreshing..." : "refresh")
           ])
         ]),
         h("div", { staticClass: "mm-hint", staticStyle: { margin: "3px 0 12px" } },
-          "What the modem supports, what your carrier permits, and what it’s actually using. " +
-          "Blocked bands are ones the module supports but carrier policy forbids — selecting them has no effect."),
-        warn
-      ].concat(groups).concat([
-        h("div", { staticClass: "mm-legend" }, [
-          h("span", [h("i", { staticStyle: { background: "var(--success)" } }), "in use / advertised"]),
-          h("span", [h("i", { staticStyle: { background: "transparent", border: "1px solid var(--primary)" } }), "permitted by carrier"]),
-          h("span", [h("i", { staticStyle: { background: "var(--text-hint)" } }), "blocked by policy"]),
-          h("span", "◦ ring = serving now")
-        ])
-      ]));
+          "Choose which 5G-SA bands the modem may use. Blocked bands are ones the module supports " +
+          "but your carrier forbids - they can't be selected because they never take."),
+        warn,
+        this.pending ? this.renderRevert(h) : null
+      ];
+      var footer = [];
+      if (!this.pending) {
+        var changed = this.saChanged();
+        var empty = this.selSA && this.selSA.length === 0;
+        var status;
+        if (this.applyError) status = h("span", { staticStyle: { color: "var(--error)" } }, this.applyError);
+        else if (empty) status = h("span", { staticStyle: { color: "var(--error)" } }, "Select at least one band");
+        else if (changed) status = this.selSA.length + " SA band" + (this.selSA.length === 1 ? "" : "s") + " selected; applies with a 60s revert";
+        else status = "No changes";
+        footer.push(h("div", { staticClass: "mm-foot" }, [
+          h("span", { staticClass: "mm-hint" }, [status]),
+          h("button", {
+            staticClass: "mm-btn primary",
+            attrs: { disabled: !changed || this.applying || empty },
+            on: { click: function () { self.applyBands(); } }
+          }, this.applying ? "Applying..." : "Apply")
+        ]));
+      }
+      var legend = [h("div", { staticClass: "mm-legend" }, [
+        h("span", [h("i", { staticStyle: { background: "var(--success)" } }), "allowed"]),
+        h("span", [h("i", { staticStyle: { background: "transparent", border: "1px solid var(--border)" } }), "permitted, not selected"]),
+        h("span", [h("i", { staticStyle: { background: "var(--text-hint)" } }), "blocked by policy"]),
+        h("span", "ring = serving now")
+      ])];
+      return h("div", { staticClass: "mm-card" }, head.filter(Boolean).concat(groups).concat(footer).concat(legend));
     }
   },
 
@@ -308,7 +486,7 @@ module.exports = {
       var rsrpColor = this.qColor(this.rsrpQ);
       stripKids = [
         h("div", { staticClass: "mm-trace" }, [
-          h("div", { staticClass: "mm-eyebrow" }, "RSRP · live"),
+          h("div", { staticClass: "mm-eyebrow" }, "RSRP live"),
           h("div", { staticClass: "mm-plot" }, [
             h("svg", { attrs: { viewBox: "0 0 320 40", preserveAspectRatio: "none" } }, [
               h("path", { attrs: {
@@ -318,9 +496,10 @@ module.exports = {
             ])
           ]),
           h("div", { staticClass: "mm-axis" }, [
-            h("span", "−120"),
-            h("span", (c.mode || "") + (this.activeSim.mcc ? " · " + this.activeSim.mcc + this.activeSim.mnc : "")),
-            h("span", "−80 dBm")
+            h("span", "-120"),
+            h("span", (c.mode || "") + (this.servingCarrier ? "  " + this.servingCarrier : "") +
+              (this.activeSlot ? "  SIM " + this.activeSlot : "")),
+            h("span", "-80 dBm")
           ])
         ]),
         h("div", { staticClass: "mm-read" }, [
@@ -329,16 +508,20 @@ module.exports = {
           ]),
           h("div", { staticClass: "mm-facts" }, [
             h("div", [h("span", { staticClass: "k" }, "SINR"),
-              h("b", { style: { color: this.qColor(this.sinrQ) } }, c.sinr !== undefined ? String(c.sinr) : "—")]),
+              h("b", { style: { color: this.qColor(this.sinrQ) } }, c.sinr !== undefined ? String(c.sinr) : "-")]),
             h("div", [h("span", { staticClass: "k" }, "RSRQ"),
-              h("b", { style: { color: this.qColor(this.rsrqQ) } }, c.rsrq !== undefined ? String(c.rsrq) : "—")]),
+              h("b", { style: { color: this.qColor(this.rsrqQ) } }, c.rsrq !== undefined ? String(c.rsrq) : "-")]),
             h("div", [h("span", { staticClass: "k" }, "Band"), h("b", this.bandLabel)])
           ])
         ])
       ];
     } else {
+      var slot = this.activeSlot;
       stripKids = [h("div", { staticClass: "mm-empty" },
-        "Waiting for the modem’s first status push over the websocket…")];
+        (slot && this.anyNetwork)
+          ? "SIM " + slot + " (active) is not registered on a network right now" +
+            (this.servingCarrier ? " - " + this.servingCarrier : "") + "."
+          : "Waiting for the modem's first status push over the websocket...")];
     }
     var strip = h("div", { staticClass: "mm-strip" }, stripKids);
 
@@ -359,7 +542,7 @@ module.exports = {
       panel = h("div", { staticClass: "mm-card" }, [
         h("div", { staticStyle: { display: "flex", justifyContent: "space-between", alignItems: "baseline" } }, [
           h("span", { staticClass: "mm-sect" }, "Serving cell"),
-          h("span", { staticClass: "mm-hint" }, m.name ? m.name + " · live" : "live")
+          h("span", { staticClass: "mm-hint" }, m.name ? m.name + " live" : "live")
         ]),
         this.hasData
           ? h("div", { staticClass: "mm-dl" }, this.facts.map(function (f, i) {
@@ -371,9 +554,9 @@ module.exports = {
       panel = this.renderBands(h);
     } else {
       var soon = {
-        lock: "Cell lock — Phase 2.",
-        at: "AT console + community library — Phase 3.",
-        sim: "SIM / APN — Phase 4."
+        lock: "Cell lock - Phase 2.",
+        at: "AT console + community library - Phase 3.",
+        sim: "SIM / APN - Phase 4."
       }[this.tab];
       panel = h("div", { staticClass: "mm-card" }, [h("div", { staticClass: "mm-soon" }, soon)]);
     }

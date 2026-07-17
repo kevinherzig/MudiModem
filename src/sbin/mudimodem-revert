@@ -1,0 +1,108 @@
+#!/bin/sh
+# /usr/sbin/mudimodem-revert — MudiModem confirm-or-revert watchdog + panic restore.
+#
+# WHY this exists (CLAUDE.md §5): band lock persists in modem NV and a bad lock
+# can drop the cellular link you are administering over. So every band write is
+# confirm-or-revert. nginx runs 4 workers with no shared state, so a timer there
+# is unreliable — instead set_bands launches THIS as a detached process.
+#
+# Modes:
+#   watch              sleep the revert window, then restore the previous band
+#                      config UNLESS mudimodem.confirm removed the pending file.
+#   boot-check         run from init at boot; if a pending revert survived a
+#                      reboot (file still present), restore now — the NV lock
+#                      would otherwise outlive the (dead) watchdog.
+#   panic [sub_id]     immediate restore to the known-good full band lists and
+#                      clear cell locks. ssh-callable when the web UI is down:
+#                        ssh root@mudi /usr/sbin/mudimodem-revert panic
+#
+# Safety:
+#   - State lives in /etc (survives reboot), never /tmp.
+#   - Band writes hit NV immediately (no commit step), so revert = write the
+#     previous list back.
+#   - Env overrides for testing (the isolation tests set all three):
+#       MUDIMODEM_DRY=1        log intended AT writes instead of running them
+#       MUDIMODEM_WINDOW=<s>   revert window (default 60)
+#       MUDIMODEM_PENDING=<f>  pending-state path (default /etc/mudimodem/pending)
+#       MUDIMODEM_LOG=<f>      log path
+
+set -u
+PENDING="${MUDIMODEM_PENDING:-/etc/mudimodem/pending}"
+ARMED="${MUDIMODEM_ARMED:-/etc/mudimodem/armed}"
+LOG="${MUDIMODEM_LOG:-/var/log/mudimodem-revert.log}"
+WINDOW="${MUDIMODEM_WINDOW:-60}"
+DRY="${MUDIMODEM_DRY:-0}"
+
+# Known-good = the full module-supported SA set (CLAUDE.md §5). Not a curated
+# safe subset — simply everything the module supports.
+KG_SA="2:5:7:12:13:14:25:26:29:30:38:41:48:66:70:71:77:78"
+
+log() { echo "$(date '+%F %T') [$$] $*" >> "$LOG" 2>/dev/null; }
+
+# Run one AT command. Inner quotes are JSON-escaped (CLAUDE.md §8), else ubus
+# silently returns empty/ERROR.
+at() {  # $1 = AT command, $2 = sub_id
+  esc=$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  json=$(printf '{"cmd":"%s","timeout":10,"sub_id":%s}' "$esc" "$2")
+  if [ "$DRY" = "1" ]; then
+    log "DRY at: $json"
+    return 0
+  fi
+  ubus call modem.CPU.AT get_result_AT "$json" >> "$LOG" 2>&1
+}
+
+set_band() {  # $1 = param (e.g. nr5g_band), $2 = colon list, $3 = sub_id
+  [ -n "$2" ] || return 0
+  log "restore $1 -> $2 (sub_id $3)"
+  at "AT+QNWPREFCFG=\"$1\",$2" "$3"
+}
+
+restore_from_pending() {
+  if [ ! -f "$PENDING" ]; then log "no pending file; nothing to restore"; return 0; fi
+  SUB_ID=1; PREV_nr5g_band=""
+  # shellcheck disable=SC1090
+  . "$PENDING"
+  [ -n "${PREV_nr5g_band:-}" ] && set_band "nr5g_band" "$PREV_nr5g_band" "${SUB_ID:-1}"
+  rm -f "$PENDING"
+  log "revert complete; pending cleared"
+}
+
+case "${1:-}" in
+  watch)
+    # Drop the arm marker BEFORE sleeping so set_bands can confirm the safety
+    # net is live before it writes the (potentially link-dropping) new bands.
+    : > "$ARMED" 2>/dev/null
+    log "watch armed; window ${WINDOW}s; pending=$PENDING"
+    sleep "$WINDOW"
+    if [ -f "$PENDING" ]; then
+      log "window elapsed, still pending -> reverting"
+      restore_from_pending
+    else
+      log "confirmed within window; no revert"
+    fi
+    rm -f "$ARMED"
+    ;;
+  boot-check)
+    if [ -f "$PENDING" ]; then
+      log "boot-check: stale pending found -> reverting"
+      restore_from_pending
+    else
+      log "boot-check: nothing pending"
+    fi
+    ;;
+  panic)
+    SUB="${2:-1}"
+    log "PANIC restore -> known-good SA (sub_id $SUB)"
+    set_band "nr5g_band" "$KG_SA" "$SUB"
+    # Clear cell locks. Set-side QNWLOCK is unverified (reference §6a) but panic
+    # is a recovery action of last resort, so clearing is the right default.
+    at 'AT+QNWLOCK="common/4g",0' "$SUB"
+    at 'AT+QNWLOCK="common/5g",0' "$SUB"
+    rm -f "$PENDING"
+    log "panic complete"
+    ;;
+  *)
+    echo "usage: $0 {watch|boot-check|panic [sub_id]}" >&2
+    exit 1
+    ;;
+esac

@@ -2,8 +2,9 @@
 -- functions.  ubus.call() here may use DOTTED object names (server-side, past
 -- the /rpc dot gate), which is the whole reason this backend exists.
 --
--- Phase 1/2 scope: READ ONLY.  No method here writes modem NV.  Write methods
--- (set_bands, set_lock, confirm) arrive later behind the auto-revert watchdog.
+-- Reads: get_bands (three-layer model). Writes: set_bands (SA allowlist) +
+-- confirm, both behind the /usr/sbin/mudimodem-revert confirm-or-revert
+-- watchdog. set_bands refuses to write unless the watchdog has ARMED first.
 --
 -- ACL: admin session is aclgroup "root" => always allowed (oui/rpc.lua:87). No
 -- ACL file needed; do NOT expose any no-auth method.
@@ -11,6 +12,11 @@
 local ubus = require "oui.ubus"
 
 local M = {}
+
+-- Paths (overridable via env for the isolation tests).
+local PENDING    = os.getenv("MUDIMODEM_PENDING") or "/etc/mudimodem/pending"
+local ARMED      = os.getenv("MUDIMODEM_ARMED")   or "/etc/mudimodem/armed"
+local REVERT_BIN = os.getenv("MUDIMODEM_BIN")     or "/usr/sbin/mudimodem-revert"
 
 -- Call a dotted ubus object, returning (table|nil, err).
 --
@@ -54,6 +60,18 @@ local function pref_line(blob, key)
   return parse_list(val)
 end
 
+-- Same, but the raw value string, verbatim (for writing back on revert). "" if absent.
+local function pref_raw(blob, key)
+  if not blob then return "" end
+  return blob:match('"' .. key .. '",([%d:]*)') or ""
+end
+
+local function file_exists(p)
+  local f = io.open(p, "r")
+  if f then f:close(); return true end
+  return false
+end
+
 -- Extract the RPLMN (last quoted field) from a QSPN response:
 --   +QSPN: "T-Mobile","T-Mobile","",0,"310260"
 local function qspn_plmn(blob)
@@ -78,6 +96,24 @@ local function resolve_sub_id(want_plmn)
   return 1, nil, false                            -- fallback: sub_id 1, flagged
 end
 
+-- Resolve the active subscription end-to-end: find the serving slot's PLMN from
+-- ubus, then the sub_id whose QSPN matches it. Returns (sub_id, plmn, matched, slot).
+local function resolve_active()
+  local want_plmn
+  local st = ucall("cellular.modem", "status", {})
+  local slot = st and st.modems and st.modems[1] and st.modems[1].current_sim_slot
+  local sims = ucall("cellular.sim", "info", {})
+  if sims and sims.sims then
+    for _, s in ipairs(sims.sims) do
+      if tostring(s.slot) == tostring(slot) and s.mcc and s.mnc then
+        want_plmn = tostring(s.mcc) .. tostring(s.mnc)
+      end
+    end
+  end
+  local sub_id, plmn, matched = resolve_sub_id(want_plmn)
+  return sub_id, plmn, matched, slot
+end
+
 -- READ: the three-layer band picture for the active subscription.
 -- { supported={LTE,nsa,sa}, config={enable,mode,LTE,nsa,sa},
 --   policy={LTE,nsa,sa}, capability={LTE,nsa,sa},
@@ -97,33 +133,19 @@ function M.get_bands(args)
     supported.sa  = modem.band["NR-SA"] or {}
   end
 
-  -- 2. config (GL's stored allow/block list) — clean ubus, no AT.
-  local config = { enable = false, mode = 0, LTE = {}, nsa = {}, sa = {} }
-  local feat = ucall("cellular.modem", "get_feature_config", { bus = bus })
-  local band = feat and feat.band
-  if band then
-    config.enable = band.band_enable and true or false
-    config.mode   = band.band_filter_mode or 0     -- 0 Open(allow) / 1 Block(deny)
-    local bl = band.band_list or {}
-    config.LTE = bl.LTE or {}
-    config.nsa = bl["NR-NSA"] or {}
-    config.sa  = bl["NR-SA"] or {}
-  end
+  -- 2. active subscription (PLMN-matched sub_id), to target the AT queries.
+  local sub_id, plmn, matched, slot = resolve_active()
 
-  -- 3. active subscription's PLMN, to target the AT queries correctly.
-  local want_plmn
-  local st = ucall("cellular.modem", "status", {})
-  local slot = st and st.modems and st.modems[1] and st.modems[1].current_sim_slot
-  local sims = ucall("cellular.sim", "info", {})
-  if sims and sims.sims then
-    for _, s in ipairs(sims.sims) do
-      if tostring(s.slot) == tostring(slot) and s.mcc and s.mnc then
-        want_plmn = tostring(s.mcc) .. tostring(s.mnc)
-      end
-    end
-  end
-
-  local sub_id, plmn, matched = resolve_sub_id(want_plmn)
+  -- 3. config (what YOU configured) — from RAW AT, the modem's truth.
+  --    NOT cellular.modem get_feature_config: GL's config layer never observes
+  --    our raw-AT writes, so right after a set_bands it reports STALE bands and
+  --    the UI would reseed the selection from the wrong list. Reading raw AT
+  --    keeps config comparable to policy/capability (all same source).
+  --    Only config.sa is consumed (the interactive SA grid); nsa/LTE config are
+  --    left empty to avoid two extra AT round-trips (every one risks the /rpc
+  --    10s timeout, worse during a re-registration).
+  local config = { enable = true, mode = 0, LTE = {}, nsa = {}, sa = {} }
+  config.sa = pref_line(at('AT+QNWPREFCFG="nr5g_band"', sub_id), "nr5g_band")
 
   -- 4. policy + capability — AT only, at the resolved sub_id.
   local pol_blob = at('AT+QNWPREFCFG="policy_band"', sub_id)
@@ -152,6 +174,77 @@ function M.get_bands(args)
       plmn_matched = matched,   -- false => sub_id resolution is a best guess
     },
   }
+end
+
+-- WRITE: set the 5G-SA band allowlist, protected by confirm-or-revert.
+-- args = { sa = { <band numbers> } }.  Returns { ok, window, previous, applied,
+-- sub_id } or { error }.  The change reverts automatically after `window`
+-- seconds unless confirm() is called first.
+function M.set_bands(args)
+  local sa = args and args.sa
+  if type(sa) ~= "table" or #sa == 0 then
+    return { error = "refusing to write an empty band list (would drop all service)" }
+  end
+  local parts = {}
+  for _, b in ipairs(sa) do
+    local n = tonumber(b)
+    if not n or n < 1 or n ~= math.floor(n) then
+      return { error = "invalid band value: " .. tostring(b) }
+    end
+    parts[#parts + 1] = tostring(n)
+  end
+  local newlist = table.concat(parts, ":")
+
+  local sub_id = resolve_active()
+
+  -- Capture the CURRENT config verbatim as the revert target.
+  local prev = pref_raw(at('AT+QNWPREFCFG="nr5g_band"', sub_id), "nr5g_band")
+
+  -- Persist pending state in /etc (survives reboot) for the watchdog.
+  os.execute("mkdir -p /etc/mudimodem 2>/dev/null")
+  local f = io.open(PENDING, "w")
+  if not f then return { error = "cannot write pending state" } end
+  f:write("SUB_ID=" .. sub_id .. "\n")
+  f:write("PREV_nr5g_band=" .. prev .. "\n")
+  f:close()
+
+  -- Arm the watchdog, and CONFIRM it is live before the risky write.
+  -- No safety net, no write.
+  os.remove(ARMED)
+  os.execute(REVERT_BIN .. " watch >/dev/null 2>&1 &")
+  os.execute("sleep 1")
+  if not file_exists(ARMED) then
+    os.remove(PENDING)
+    return { error = "revert watchdog failed to arm; no change written" }
+  end
+
+  -- Safe to write: a bad lock now self-reverts within the window.
+  at('AT+QNWPREFCFG="nr5g_band",' .. newlist, sub_id)
+
+  return { ok = true, window = 60, previous = prev, applied = newlist, sub_id = sub_id }
+end
+
+-- Commit a pending change: remove the pending file so the watchdog won't revert.
+function M.confirm(args)
+  os.remove(PENDING)
+  return { ok = true, confirmed = true }
+end
+
+-- Revert a pending change NOW (don't wait out the window). Writes the previous
+-- config back and clears pending, so the still-sleeping watchdog then finds
+-- nothing to do. Same restore the watchdog would perform on timeout.
+function M.revert_now(args)
+  if not file_exists(PENDING) then return { ok = true, note = "nothing pending" } end
+  local prev, sub = "", 1
+  for line in io.lines(PENDING) do
+    local k, v = line:match("^(%w+)=(.*)$")
+    if k == "PREV_nr5g_band" then prev = v end
+    if k == "SUB_ID" then sub = tonumber(v) or 1 end
+  end
+  if prev ~= "" then at('AT+QNWPREFCFG="nr5g_band",' .. prev, sub) end
+  os.remove(PENDING)
+  os.remove(ARMED)
+  return { ok = true, reverted = true, restored = prev }
 end
 
 return M

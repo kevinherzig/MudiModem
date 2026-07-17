@@ -1,0 +1,64 @@
+#!/bin/sh
+# Isolation tests for mudimodem-revert. DRY mode + temp paths: never touches the
+# modem or /etc. Proves the safety logic before any real band write can exist.
+#
+# Usage: sh revert.test.sh /path/to/mudimodem-revert
+set -u
+SCRIPT="${1:-/tmp/mudimodem-revert}"
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+FAILED=0
+
+pass() { echo "  ok  - $1"; }
+fail() { echo "  FAIL- $1"; FAILED=1; }
+
+run() {  # runs the watchdog with isolated env; extra env in $EXTRA
+  P="$WORK/pending"; L="$WORK/log"
+  env MUDIMODEM_DRY=1 MUDIMODEM_PENDING="$P" MUDIMODEM_LOG="$L" \
+      MUDIMODEM_ARMED="$WORK/armed" MUDIMODEM_WINDOW="${WIN:-1}" sh "$SCRIPT" "$@"
+}
+mkpending() { printf 'SUB_ID=1\nPREV_nr5g_band=%s\n' "$1" > "$WORK/pending"; }
+inlog() { grep -q "$1" "$WORK/log" 2>/dev/null; }
+
+echo "1. watch: window elapses, still pending -> reverts to previous"
+rm -f "$WORK/log"; mkpending "71"
+WIN=1 run watch
+inlog "reverting"                 && pass "logged revert" || fail "no revert logged"
+inlog 'nr5g_band\\",71'           && pass "DRY-wrote nr5g_band 71" || fail "wrong/no AT write"
+[ ! -f "$WORK/pending" ]          && pass "pending cleared" || fail "pending not cleared"
+
+echo "2. watch: confirmed within window -> NO revert"
+rm -f "$WORK/log" "$WORK/armed"; mkpending "71"
+WIN=3 run watch &
+WPID=$!
+sleep 1
+[ -f "$WORK/armed" ]              && pass "arm marker present during window" || fail "never armed"
+rm -f "$WORK/pending"             # simulate mudimodem.confirm
+wait "$WPID"
+inlog "confirmed within window"   && pass "logged confirm" || fail "no confirm logged"
+inlog "reverting"                 && fail "reverted despite confirm!" || pass "did not revert"
+[ ! -f "$WORK/armed" ]            && pass "arm marker cleared after" || fail "arm marker leaked"
+
+echo "3. boot-check: stale pending survives reboot -> reverts"
+rm -f "$WORK/log"; mkpending "71"
+run boot-check
+inlog "stale pending"             && pass "detected stale" || fail "missed stale pending"
+[ ! -f "$WORK/pending" ]          && pass "pending cleared" || fail "pending not cleared"
+
+echo "4. boot-check: nothing pending -> no-op"
+rm -f "$WORK/log" "$WORK/pending"
+run boot-check
+inlog "nothing pending"           && pass "clean no-op" || fail "unexpected action"
+inlog "reverting"                 && fail "reverted with no pending!" || pass "did not revert"
+
+echo "5. panic: restores known-good SA + clears cell locks"
+rm -f "$WORK/log"; mkpending "71"
+run panic 1
+inlog 'nr5g_band\\",2:5:7:12:13:14:25:26:29:30:38:41:48:66:70:71:77:78' \
+                                  && pass "wrote full known-good SA" || fail "wrong known-good list"
+inlog 'QNWLOCK=\\"common/4g\\",0' && pass "cleared 4g lock" || fail "did not clear 4g lock"
+inlog 'QNWLOCK=\\"common/5g\\",0' && pass "cleared 5g lock" || fail "did not clear 5g lock"
+[ ! -f "$WORK/pending" ]          && pass "pending cleared" || fail "pending not cleared"
+
+echo
+if [ "$FAILED" = "0" ]; then echo "ALL REVERT TESTS PASSED"; else echo "REVERT TESTS FAILED"; exit 1; fi
