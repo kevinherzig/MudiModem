@@ -487,3 +487,86 @@ omitting it shifts every subsequent field (a bug that shipped in the first mocku
 | "Known-good lists are the full module-supported sets" | ✅ still true (§5 of CLAUDE.md) — but **module support ≠ usable**; policy narrows it further. |
 | "`AT+QNWLOCK` unverified — test before designing" | ✅ **syntax captured off the box (§6a).** NR order is `pci,freq,scs,band` — the mockup's guess was wrong. Set-side semantics still open. |
 | lock-5g mockup entry `"common/5g",{{arfcn}},{{pci}},…` | ❌ **wrong order** — PCI is first. Fix to `"common/5g",{{pci}},{{arfcn}},{{scs}},{{band}}`. |
+
+---
+
+## 10. AT transport — ports, our own channel, and the crossed-response bug 🟢
+
+All verified on the box 2026-07-17.
+
+### The AT ports on this device
+`modem_AT -B cpu -P /dev/smd9` (a GL daemon) holds **`/dev/smd9`** and backs the `modem.CPU.AT` ubus
+object we call from the Lua backend. But smd9 is **not the only AT port**:
+
+| Port | Perms | Held by | Notes |
+|---|---|---|---|
+| `/dev/smd9` | `crw-------` | **GL's `modem_AT`** | backs `modem.CPU.AT`; has the `sub_id` abstraction |
+| **`/dev/at_mdm0`** | **`crwxrwxrwx`** | **free** | ⭐ a full, world-accessible AT port — **our own channel** |
+| `/dev/at_usb0..2` | mixed | free/root | AT over USB; silent here (built-in modem, no USB host) |
+| `/dev/smd7` | — | `ql_nw_service` | Quectel network svc |
+| `/dev/smd8` | — | `ql_remotefs_ser` | remote FS |
+| `/dev/smd11` | — | `MCM_atcop_svc` | AT command processor |
+| `/dev/smd10/21/22`, `smdcntl*` | — | free | not AT-verified |
+
+### ⚠️ The crossed-response bug (why we might want our own channel)
+`ubus call modem.CPU.AT get_result_AT` is **NOT isolated per-caller.** When the modem is churning
+(unstable SIM state → GL's `cellular_manager` polls smd9 hard), a query returns **the response to
+someone else's command**. Seen live: asking for `nr5g_band` returned `+ICCID:…`, a write returned
+`+QSIMTYPE:"slot2",1`. It only manifests under heavy concurrent polling — in stable operation every
+read this project ever made was correct.
+- **Cheap fix (recommended):** in the Lua backend, **validate the reply** — a `nr5g_band` query must
+  contain `"nr5g_band"`; retry a few times if not (the `atv()` shell helper in the scratchpad does this).
+- ⚠️ **You cannot fix it by stopping the poller.** `/etc/init.d/gl_cellular_manager stop` tears down
+  **`modem_AT` too** (they're one stack) → AT access disappears entirely. Restart with
+  `/etc/init.d/gl_cellular_manager start`. (procd-managed; graceful `cleanup_resources` on stop.)
+
+### ⭐ Our own AT channel: `/dev/at_mdm0` + `tools/mudimodem-at.py`
+`/dev/at_mdm0` is a free, world-accessible, fully-working AT port **independent of GL's smd9** — so
+its responses never cross with GL's polling. Verified: `ATI`, `QSPN`, `QNWPREFCFG`, `CSQ` all return
+clean, correctly-paired responses, ~instant.
+
+**Compile-free client:** `tools/mudimodem-at.py` (CPython 3.11 stdlib only — the box ships it; no
+`pyserial`, no C). ~40 lines: open blocking, write `CMD\r`, `select`-timed read until `OK`/`ERROR`,
+filter URCs. Intended transport for the **Phase 3 AT console**.
+
+Gotchas (all in the file's header):
+- **Open BLOCKING.** A non-blocking write returns **`EBUSY`** on this SMD channel.
+- `/dev/at_mdm0` is **not a tty** → `termios` raises `ENOTTY`; skip it, it's already a raw byte stream.
+- **URCs arrive unprompted** (`RDY`, `+CPIN:`, `+QUSIM:`) — a real client must pair responses and drop
+  URCs. The client does.
+- ⚠️ **No `sub_id` on the direct port** — it answers in the **active subscription's** context only
+  (`QSPN`→T-Mobile, `policy_band`→T-Mobile's list). For the *other* SIM's per-subscription data, you
+  still need GL's `modem.CPU.AT` sub_id path (§1). ⇒ **AT console + active-SIM work: at_mdm0. The
+  cross-SIM three-layer band model: keep GL's channel.**
+
+---
+
+## 11. Modem behaviour: dual-SIM + config durability 🟢
+
+### DSDS, not DSDA — one data connection at a time
+Verified via ubus (`cellular.sim status`, `cellular.network status`) 2026-07-17: **both SIMs can be
+REGISTERED simultaneously** (status `6`), but only **one carries data at a time** (`dial_status=1` on
+exactly one slot; a single `rmnet_data0` interface up, the per-slot `modem_*_s1_6` interfaces down).
+This is **Dual-SIM Dual-Standby** — both reachable for registration/SMS/monitoring, one internet
+connection. True simultaneous dual-data (DSDA) would need two radios; this module doesn't have them.
+- Seen live: SIM1 (T-Mobile) selected + registered, but SIM2 (AT&T) held `dial_status=1` and carried
+  failover data — so *selected slot ≠ data-carrying slot* (see CLAUDE.md, active-vs-serving SIM).
+- SIM sim-status codes (from GL's frontend): `0` no-SIM · `5` **not registered** · `6` **registered**.
+
+### ⚠️⚠️ GL re-applies its stored band config on restart — raw-AT writes are NOT durable
+When `cellular_manager` (re)starts, it **pushes GL's stored config to the modem**, overwriting raw-AT
+changes. Seen live: `nr5g_band` had been experiment-set (via raw AT) to `25:41:48:66:77`; a
+`cellular_manager` restart reset it to **`71`** — GL's stored `NR-SA:[71]` won.
+- This reconciles "band lock persists across reboots" (CLAUDE.md §5/§9): it persists *because GL's
+  stored config agreed*. The instant raw AT diverges from GL's config, **GL wins on the next restart
+  or reboot.**
+- ⇒ **`set_bands` (raw AT only) is not durable.** A change survives until the next `cellular_manager`
+  restart/reboot, then reverts to GL's stored config. For a durable change, `set_bands` must **also**
+  update GL's config via `modem.set_sim_config` (`{band_enable, band_filter_mode, band_list}`, bare
+  integers — CLAUDE.md §6). Open design task before Phase 2b is "done".
+- ✅ **Silver lining:** this is a *second*, free revert path — a reboot/manager-restart restores GL's
+  stored bands regardless of what raw AT holds.
+
+### SIM slot switching — no modem AT (recap of §7)
+`AT+QUIMSLOT`/`QDSIM`/`QUSIM` all ERROR on this modem. Slot selection is GL-layer only:
+`cellular.modem set_slot_priority_config` (ubus) and `mvas.switch_sim_slot` (RPC → closed `modem.so`).

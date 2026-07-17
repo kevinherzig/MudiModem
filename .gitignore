@@ -4,3 +4,7 @@ build/
 # Vendor manual — copyrighted Quectel PDF, kept locally for reference only.
 # Its verified contents live in reference/quectel-at-reference.md.
 docs/*.pdf
+
+# Python bytecode
+__pycache__/
+*.pyc

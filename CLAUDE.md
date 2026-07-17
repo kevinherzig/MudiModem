@@ -311,6 +311,15 @@ too (`nr5g_band` at the resolved sub_id). Then supported (ubus) / config+policy+
 all stay consistent through a write. `get_bands` reads only `config.sa` from AT (the UI's live need);
 nsa/LTE config are left empty to save AT round-trips (each risks the 10s `/rpc` timeout).
 
+⚠️⚠️ **DURABILITY GAP (2026-07-17) — raw-AT band writes revert on `cellular_manager` restart.**
+GL's `cellular_manager` **re-applies its stored config to the modem on (re)start**, overwriting raw-AT
+changes. Verified: an experiment-set `nr5g_band=25:41:48:66:77` reset to **`71`** (GL's stored value)
+after a manager restart. So **`set_bands` (raw AT only) is NOT durable** — a change survives until the
+next manager restart or reboot, then reverts to GL's config. **Open design task: `set_bands` should
+ALSO update GL's config via `modem.set_sim_config`** (§6; bare integers `{band_enable,
+band_filter_mode, band_list}`) so the two agree and the change persists. (Silver lining: a
+reboot/manager-restart is a *free* second revert path to GL's stored bands.) Full detail: reference §11.
+
 ### NV semantics (verified 2026-07-17)
 - **No commit step for band commands.** `AT+QNWPREFCFG` writes NV **immediately**; there is no
   staging area, so a "don't persist this" checkbox is **not possible**. (`AT&V` does show a classic
@@ -453,6 +462,12 @@ router and searchable. It's a differentiator no router UI has.
 - **`verified: []` + `source` are load-bearing** — an unverified community command must render as
   "*nobody yet*", not hide. Keeps the library from becoming a folk-remedy collection. AT is
   vendor- *and* firmware-specific; `AT+QNWPREFCFG` is Quectel-only.
+- ⭐ **Transport: our own AT channel, not GL's `modem.CPU.AT`.** GL's channel (`/dev/smd9`) crosses
+  responses under heavy polling (reference §10). `/dev/at_mdm0` is a free, world-accessible, separate
+  AT port; **`tools/mudimodem-at.py`** (CPython stdlib, no compile, no `pyserial`) drives it cleanly.
+  The backend can spawn it per command. ⚠️ It has **no `sub_id`** (active-subscription context only),
+  so it's right for the console + active-SIM work but NOT the cross-SIM band model — that stays on
+  GL's channel. Gotchas (open blocking = no `EBUSY`; not a tty; filter URCs) are in the file header.
 
 ## 8. Dev gotchas
 - **nginx caches the Lua plugin per worker** (`objects[object]` in `oui/rpc.lua`) → after editing
@@ -528,9 +543,9 @@ router and searchable. It's a differentiator no router UI has.
 |---|---|---|
 | **0** | Hello-world chunk + menu entry | ✅ done. Settled the template-compiler + `level` unknowns. |
 | **1** | Read-only diagnostics tab | Now **cheaper than planned** — reads come free over `global_sockets` (§2); no backend needed except `policy_band`/`ue_capability_band` (§5a). |
-| **2** | Band grid + cell lock, auto-revert, panic restore | The actual value. Must render the **three-layer** model (§5a), not a flat list. |
-| **3** | AT console + community library | Riskiest surface — build on proven plumbing. Design in §7a. |
-| **4** | SIM / APN | Most overlap with GL's own pages. |
+| **2** | Band grid + cell lock, auto-revert, panic restore | ✅ **2a+2b done** (band read/write/revert). ⏳ cell lock (`QNWLOCK` §6a) + durability (make `set_bands` persist via `modem.set_sim_config`) remain. |
+| **3** | AT console + community library | Riskiest surface — build on proven plumbing. Use our own AT channel (`tools/mudimodem-at.py` on `/dev/at_mdm0`, §7a). Design in §7a. |
+| **4** | SIM / APN | Most overlap with GL's own pages. Slot switch = GL layer only (`mvas.switch_sim_slot`), no modem AT (reference §7/§11). |
 
 ## 11. Repo layout
 ```
@@ -545,7 +560,8 @@ MudiModem/
 ├── tools/
 │   ├── build.sh                 ← "build" = gzip to gl-sdk4-ui-mudimodem.common.js.gz
 │   ├── deploy.sh                ← model-guarded push over ssh `cat` (no scp: no sftp-server)
-│   └── verify.sh                ← on-device assertions (files, JSON parse, gzip_static, eval)
+│   ├── verify.sh                ← on-device assertions (files, JSON parse, gzip_static, eval, backend, watchdog)
+│   └── mudimodem-at.py          ← our own AT channel on /dev/at_mdm0 (Python stdlib; Phase 3 console)
 ├── test/chunk.test.js           ← local Node test: evals the chunk exactly as the SPA does
 ├── build/                       ← generated, gitignored
 ├── docs/
@@ -576,10 +592,27 @@ MudiModem/
   countdown asks a question about the numbers and the strip must hold the evidence. Interactive
   mockups (self-contained HTML, open in any browser) in `.superpowers/brainstorm/*/content/`:
   `design.html` (whole page, 5 tabs) and `console.html` (AT library).
-- ⏭ **Next:** rebuild the Bands tab around the **three-layer model** (§5a) — module-supported /
-  policy-blocked / configured / serving — and fold the "enable higher-risk commands" toggle into the
-  console. Then Phase 1.
-- 🔭 Later: `install.sh`/`uninstall.sh` (device-guarded + idempotent, mirroring MudiUI's), ipk.
+- ✅ **Phase 1 done** — read-only live diagnostics (strip trace + serving cell), all over `global_sockets`.
+- ✅ **Phase 2a done** — read-only three-layer Bands grid + `get_bands` backend.
+- ✅ **Phase 2b done (2026-07-17)** — band **writes** with confirm-or-revert: `mudimodem-revert`
+  watchdog (+ arm interlock + panic), `set_bands`/`confirm`/`revert_now`, interactive SA grid + C1
+  countdown. Also fixed: **never `pcall` a cosocket** (crossed-yield bug), config read from raw AT,
+  strip anchors on the active SIM.
+- ⏭ **Next:** (a) make `set_bands` **durable** via `modem.set_sim_config` (else it reverts on
+  `cellular_manager` restart — §5a durability gap); (b) cell-lock tab on `QNWLOCK` (§6a); (c) Phase 3
+  AT console on our own channel (`tools/mudimodem-at.py`, §7a).
+- 🔭 Later: `install.sh`/`uninstall.sh` (device-guarded + idempotent, mirroring MudiUI's); register
+  the watchdog `boot-check` in a boot hook; `/etc/sysupgrade.conf`; ipk.
+
+### Session findings 2026-07-17 (all in reference §10–§11)
+- **DSDS, not DSDA** — both SIMs register, only one carries data at a time. No simultaneous dual-data.
+- **`current_sim_slot` (selected) ≠ data-carrying slot** — seen live (SIM1 selected, SIM2 failover
+  data). UI anchors on `current_sim_slot` (GL's active SIM), shows its honest state.
+- **GL overrides raw AT on restart** — the durability gap above.
+- **Crossed AT responses** on `modem.CPU.AT` under heavy polling → backend should validate replies.
+- **Our own AT channel found** — `/dev/at_mdm0` + `tools/mudimodem-at.py` (Python, no compile), for
+  the Phase 3 console. No `sub_id` there (active-sub context only).
+- **`AT+QUIMSLOT` absent** on the 6-series — SIM slot switch is GL-layer only.
 
 ### Open questions (do not guess these — verify)
 📖 All AT detail + evidence lives in **`reference/quectel-at-reference.md`**.
@@ -605,6 +638,11 @@ MudiModem/
    with SINR; on SA it may return nothing. **Test before building.**
 7. **`AT+QCAINFO` field order** — `<pcell_state>` is documented `0|1`; our box returned **`5`**.
    Don't decode it positionally until resolved.
+8. **Does `modem.set_sim_config` make a band change durable?** (verify) — the fix for the durability
+   gap (§5a). Send GL its config `{band_enable, band_filter_mode, band_list}` alongside our raw-AT
+   write, then restart `cellular_manager` and confirm the band survives. Do it off Kevin's only link.
+9. **Can the direct port (`/dev/at_mdm0`) target a specific `sub_id`?** (reference §10) — it defaults
+   to the active subscription. If not, cross-SIM band data must stay on GL's `modem.CPU.AT`.
 - 🧹 Not yet done: nothing is registered in `/etc/sysupgrade.conf` — a firmware upgrade will wipe
   the deployed files. Re-deploy with `./tools/deploy.sh` (idempotent) until the installer exists.
 - 🧹 `tools/verify.sh` still only checks the menu JSON *parses*; it should also assert
