@@ -9,9 +9,11 @@
 //   - band model:  window.$rpcRequest("call",["sid","mudimodem","get_bands",{}])
 // The "sid" string is a verbatim placeholder GL swaps for the session cookie.
 //
-// The one WRITE (set_bands) is confirm-or-revert: the backend arms the
-// /usr/sbin/mudimodem-revert watchdog before writing, and this UI shows the
-// countdown + Keep/Revert. A bad lock self-restores within the window.
+// Writes: set_bands is confirm-or-revert via the mudimodem backend + watchdog.
+// The SIM tab (Phase 4) instead writes browser-direct to GL's own undotted RPC
+// (modem.set_sim_config — ALWAYS read-modify-write, the same object carries the
+// band config; modem.set_slot_failover_config — also GL's slot-switch path,
+// since QUIMSLOT does not exist on this modem). No backend, no AT, no sub_id.
 //
 // All colour is GL theme tokens (var(--success) etc.), so light/dark/classic
 // all work with zero extra code.
@@ -456,6 +458,106 @@ module.exports = {
           self.simApplyErr[slot] = (e && (e.type || e.message)) || "request failed";
         });
     },
+    applyFailover(confirmed) {
+      var self = this;
+      if (this.failoverApplying || !this.failoverEdit ||
+          typeof window === "undefined" || !window.$rpcRequest) return;
+      var ed = this.failoverEdit;
+      var base = this.failover || {};
+      var payload = {};
+      for (var k in base) payload[k] = base[k];          // esim2_enable, slot_type… intact
+      payload.bus = this.modem.bus;
+      payload.enable_switch = !!ed.enable_switch;
+      payload.slot_priority = ed.slot_priority.slice();
+      payload.enable_timing = !!ed.enable_timing;
+      payload.hour = String(ed.hour);
+      payload.min = String(ed.min);
+      // GL's invariant: with auto-switch on, the preferred slot IS the current one.
+      if (payload.enable_switch) payload.current_sim = payload.slot_priority[0];
+      // If this apply would change the selected slot, it's a switch — same
+      // consequence, same confirmation, no back door.
+      var wouldSwitch = payload.current_sim &&
+        String(payload.current_sim) !== String(this.activeSlot);
+      if (wouldSwitch && !confirmed) { this.failoverConfirm = true; return; }
+      this.failoverConfirm = false;
+      this.failoverApplying = true;
+      this.failoverErr = "";
+      if (wouldSwitch) this.switchTarget = Number(payload.current_sim);
+      window.$rpcRequest("call", ["sid", "modem", "set_slot_failover_config", payload],
+        { timeout: 30000 })
+        .then(function () {
+          self.failoverApplying = false;
+          if (wouldSwitch) self.armSwitchFallback(); else self.fetchFailover();
+        })
+        .catch(function (e) {
+          self.failoverApplying = false;
+          if (wouldSwitch && e && e.type === "timeout") { self.armSwitchFallback(); return; }
+          if (wouldSwitch) self.clearSwitchState();
+          self.failoverErr = (e && (e.type || e.message)) || "request failed";
+        });
+    },
+    renderFailoverCard(h) {
+      var self = this, ed = this.failoverEdit;
+      var kids = [h("span", { staticClass: "mm-sect" }, "Failover")];
+      if (!ed) {
+        kids.push(h("div", { staticClass: "mm-hint" },
+          this.failoverErr ? "Couldn't load failover config: " + this.failoverErr
+            : "Loading failover config…"));
+        return h("div", { staticClass: "mm-card", staticStyle: { marginTop: "11px" } }, kids);
+      }
+      var frow = function (label, ctl) {
+        return h("div", { staticClass: "mm-frow" }, [h("span", { staticClass: "k" }, label), ctl]);
+      };
+      kids.push(frow("Auto failover", h("button", {
+        staticClass: "mm-apnchip" + (ed.enable_switch ? " on" : ""),
+        attrs: { "aria-pressed": String(!!ed.enable_switch) },
+        on: { click: function () { ed.enable_switch = !ed.enable_switch; } }
+      }, ed.enable_switch ? "On" : "Off")));
+      var names = this.slotCards.map(function (c) {
+        return "Slot " + c.slot + (c.carrier ? " · " + c.carrier : "");
+      });
+      kids.push(frow("Preferred order", h("button", {
+        staticClass: "mm-apnchip",
+        attrs: { title: "Swap priority" },
+        on: { click: function () { ed.slot_priority = ed.slot_priority.slice().reverse(); } }
+      }, ed.slot_priority.map(function (s) { return names[s - 1]; }).join("  →  "))));
+      kids.push(frow("Scheduled switch to preferred", h("button", {
+        staticClass: "mm-apnchip" + (ed.enable_timing ? " on" : ""),
+        attrs: { "aria-pressed": String(!!ed.enable_timing) },
+        on: { click: function () { ed.enable_timing = !ed.enable_timing; } }
+      }, ed.enable_timing ? "On" : "Off")));
+      if (ed.enable_timing) {
+        kids.push(frow("At", h("input", {
+          staticClass: "mm-input",
+          attrs: { type: "time", value: ed.hour + ":" + ed.min },
+          on: { input: function (ev) {
+            var p = String(ev.target.value || "00:00").split(":");
+            ed.hour = p[0] || "00"; ed.min = p[1] || "00";
+          } }
+        })));
+      }
+      if (this.failoverConfirm) {
+        kids.push(h("div", { staticClass: "mm-switchbox" }, [
+          h("div", "This change makes slot " + (ed.slot_priority[0]) + " the active SIM — " +
+            "it drops connectivity for ~30 seconds."),
+          h("div", { staticStyle: { display: "flex", gap: "9px", marginTop: "7px" } }, [
+            h("button", { staticClass: "mm-apply", on: { click: function () { self.applyFailover(true); } } }, "Apply anyway"),
+            h("button", { staticClass: "mm-reveal", on: { click: function () { self.failoverConfirm = false; } } }, "Cancel")
+          ])
+        ]));
+      } else {
+        kids.push(h("button", {
+          staticClass: "mm-apply",
+          attrs: { disabled: this.failoverApplying },
+          on: { click: function () { self.applyFailover(); } }
+        }, this.failoverApplying ? "Applying…" : "Apply"));
+      }
+      if (this.failoverErr && ed) {
+        kids.push(h("div", { staticClass: "mm-hint", staticStyle: { color: "var(--error)" } },
+          "Failover apply failed: " + this.failoverErr));
+      }
+      return h("div", { staticClass: "mm-card", staticStyle: { marginTop: "11px" } }, kids);
+    },
     maskId(v) { return v ? String(v).slice(0, 4) + "…" : "—"; },
     renderSlotCard(h, card) {
       var self = this, slot = card.slot;
@@ -605,7 +707,7 @@ module.exports = {
       return h("div", [
         h("div", { staticClass: "mm-simgrid" },
           this.slotCards.map(function (c) { return self.renderSlotCard(h, c); })),
-        // Failover card lands here in Task 6.
+        this.renderFailoverCard(h),
         h("div", { staticClass: "mm-hint", staticStyle: { marginTop: "9px" } },
           "DSDS: both SIMs stay registered; exactly one carries data at a time. " +
           "The selected slot and the data-carrying slot can differ during failover — " +

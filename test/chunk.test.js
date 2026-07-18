@@ -681,3 +681,59 @@ test('switch confirm: button on non-selected card only, confirm box states the c
   assert.equal(box.length, 1);
   assert.ok(textOf(box[0]).includes('drops connectivity'));
 });
+
+test('applyFailover: full passthrough payload; enable_switch forces current_sim = priority[0]', async () => {
+  const FCFG = { enable_switch: false, esim2_enable: false, current_sim: 1,
+    slot_priority: [1, 2], enable_timing: false, hour: '00', min: '00',
+    slot_type: [{ slot: 1, type: 0 }, { slot: 2, type: 0 }] };
+  const calls = stubRpc([{}]);
+  try {
+    const vm = makeVm(loadChunk(), SPLIT);
+    vm.failover = FCFG;
+    vm.failoverEdit = { enable_switch: true, slot_priority: [1, 2],
+      enable_timing: true, hour: '03', min: '30' };
+    vm.applyFailover(true);
+    await new Promise((r) => setImmediate(r));
+    const p = calls[0].params[3];
+    assert.equal(calls[0].params[2], 'set_slot_failover_config');
+    assert.equal(p.enable_switch, true);
+    assert.equal(p.current_sim, 1);                    // priority[0], GL's invariant
+    assert.deepEqual(p.slot_priority, [1, 2]);
+    assert.equal(p.enable_timing, true);
+    assert.strictEqual(p.hour, '03');                  // strings, as GL sends them
+    assert.equal(p.esim2_enable, false);               // passthrough intact
+    assert.deepEqual(p.slot_type, FCFG.slot_type);
+  } finally { unstubRpc(); }
+});
+
+test('applyFailover: a config that would change the active slot demands confirmation', async () => {
+  const calls = stubRpc([{}]);
+  let vm;
+  try {
+    vm = makeVm(loadChunk(), SPLIT);   // active slot is 1
+    vm.failover = { enable_switch: false, current_sim: 1, slot_priority: [1, 2] };
+    vm.failoverEdit = { enable_switch: true, slot_priority: [2, 1],
+      enable_timing: false, hour: '00', min: '00' };
+    vm.applyFailover();                       // not confirmed
+    await new Promise((r) => setImmediate(r));
+    assert.equal(calls.length, 0);            // nothing sent
+    assert.equal(vm.failoverConfirm, true);   // confirm UI armed instead
+    vm.applyFailover(true);                   // user confirmed
+    await new Promise((r) => setImmediate(r));
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].params[3].current_sim, 2);
+  } finally { vm && vm.clearSwitchState && vm.clearSwitchState(); unstubRpc(); }
+});
+
+test('failover card renders toggle, priority order and time picker when timing on', () => {
+  const comp = loadChunk();
+  const vm = makeVm(comp, SPLIT);
+  vm.tab = 'sim';
+  vm.failover = { enable_switch: true, current_sim: 1, slot_priority: [1, 2] };
+  vm.failoverEdit = { enable_switch: true, slot_priority: [1, 2],
+    enable_timing: true, hour: '03', min: '30' };
+  const text = textOf(comp.render.call(vm, h));
+  assert.ok(text.includes('Auto failover'));
+  assert.ok(text.includes('Preferred order'));
+  assert.ok(text.includes('Scheduled switch'));
+});
