@@ -1,0 +1,23 @@
+[
+  { "id": "3gpp.identity", "cat": "Diagnostics", "title": "Modem identity",
+    "cmd": "ATI", "risk": "read", "vendor": "any", "verified": ["RG650V-NA"],
+    "summary": "Manufacturer, model and revision. The universal 'what am I talking to'.",
+    "source": "ITU V.250 §6.1.3", "by": "kevin" },
+  { "id": "3gpp.signal", "cat": "Diagnostics", "title": "Signal quality (universal)",
+    "cmd": "AT+CSQ", "risk": "read", "vendor": "any", "verified": ["RG650V-NA"],
+    "summary": "The one signal read every modem ever made understands. RSSI 0-31 (99 = unknown), bit error rate.",
+    "source": "3GPP TS 27.007 §8.5", "by": "kevin",
+    "decode": { "prefix": "+CSQ:", "fields": ["rssi", "ber"],
+                "enums": { "rssi": { "99": "unknown" }, "ber": { "99": "unknown" } } } },
+  { "id": "3gpp.registration-5g", "cat": "Diagnostics", "title": "5G network registration",
+    "cmd": "AT+C5GREG?", "risk": "read", "vendor": "any", "verified": ["RG650V-NA"],
+    "summary": "Whether you're registered on 5G. Second number: 1 = home, 5 = roaming, 2 = searching, 3 = denied.",
+    "source": "3GPP TS 27.007 §10.1.35", "by": "kevin" },
+  { "id": "3gpp.radio", "cat": "Power", "title": "Radio off / on",
+    "cmd": "AT+CFUN={{fun}}", "risk": "set", "vendor": "any", "verified": ["RG650V-NA"],
+    "summary": "Airplane mode at the modem. 0 is off, 1 is full function. Forces re-registration on the way back up.",
+    "warn": "Runtime only — a reboot restores the radio — but you WILL drop the cellular link (and possibly this admin session) for ~20 seconds.",
+    "source": "3GPP TS 27.007 §8.2", "by": "kevin",
+    "params": [ { "name": "fun", "hint": "0 = radio off, 1 = full function",
+                  "example": "1", "values": ["0", "1"] } ] }
+]
