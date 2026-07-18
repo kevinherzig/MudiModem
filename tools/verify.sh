@@ -151,4 +151,15 @@ ssh -o BatchMode=yes "root@$HOST" \
   'pids=$(pidof gl_modem); [ -n "$pids" ] || exit 1; for p in $pids; do s=$(cut -d" " -f3 "/proc/$p/stat"); [ "$s" = "T" ] && exit 1; done; exit 0' \
   || fail "gl_modem missing or left in state T after the AT call"
 
+# 9. Arg validator: the AT console's /rpc gate. Without this, oui's default
+#    string validator -32602's every AT command containing + = " (only bare
+#    ATI/AT slip through). This asserts the override admits real AT syntax —
+#    the layer our direct-plugin tests (8c) never exercise.
+echo "9. at_console arg validator admits real AT syntax (the -32602 fix)"
+ssh -o BatchMode=yes "root@$HOST" 'test -s /usr/share/gl-validator.d/mudimodem.lua' \
+  || fail "mudimodem arg validator missing (AT commands would -32602 at /rpc)"
+ssh -o BatchMode=yes "root@$HOST" 'cat > /tmp/mm-validator.test.lua' < test/backend-validator.test.lua
+ssh -o BatchMode=yes "root@$HOST" 'lua /tmp/mm-validator.test.lua; rc=$?; rm -f /tmp/mm-validator.test.lua; exit $rc' \
+  || fail "arg validator does not admit AT syntax (console would -32602)"
+
 echo "ALL CHECKS PASSED"

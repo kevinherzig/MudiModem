@@ -44,6 +44,16 @@ if [ -f src/sbin/mudimodem-revert ]; then
   echo "watchdog installed (/usr/sbin/mudimodem-revert)"
 fi
 
+# Arg validator for the mudimodem object. ⚠️ REQUIRED for the AT console: without
+# it, oui applies a default allowlist that rejects '+', '=', '"' — so every real
+# AT command -32602's before the backend runs (only bare ATI/AT slip through).
+# Push BEFORE the backend so the nginx restart below picks up a consistent set.
+if [ -f src/validator/mudimodem.lua ]; then
+  ssh -o BatchMode=yes "root@$HOST" 'cat > /usr/share/gl-validator.d/mudimodem.lua' \
+    < src/validator/mudimodem.lua
+  echo "arg validator deployed (/usr/share/gl-validator.d/mudimodem.lua)"
+fi
+
 # RPC backend (Lua plugin). nginx caches the plugin per worker (oui/rpc.lua
 # objects[]). ⚠️ Use RESTART, not reload: reload (HUP) leaves old workers alive
 # — and long-lived /ws websocket connections keep them alive — still serving
@@ -83,6 +93,7 @@ ssh -o BatchMode=yes "root@$HOST" 'f=/etc/sysupgrade.conf; touch "$f"; for p in 
   /www/views/gl-sdk4-ui-mudimodem-console.common.js.gz \
   /www/mudimodem/at-library.json.gz \
   /usr/lib/mudimodem/mudimodem-at.py \
+  /usr/share/gl-validator.d/mudimodem.lua \
   ; do \
   grep -qxF "$p" "$f" || echo "$p" >> "$f" ; done'
 echo "sysupgrade.conf registered"
