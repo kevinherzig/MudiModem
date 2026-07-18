@@ -18,6 +18,7 @@ local M = {}
 local PENDING    = os.getenv("MUDIMODEM_PENDING") or "/etc/mudimodem/pending"
 local ARMED      = os.getenv("MUDIMODEM_ARMED")   or "/etc/mudimodem/armed"
 local REVERT_BIN = os.getenv("MUDIMODEM_BIN")     or "/usr/sbin/mudimodem-revert"
+local STALE      = os.getenv("MUDIMODEM_STALE")   or "/etc/mudimodem/gl-stale"
 -- History telemetry lives in tmpfs (volatile), separate from the durable /etc
 -- pending state. samples.jsonl is written by mudimodem-collectd; events.jsonl by
 -- us (user events) + the watchdog (dog events). get_history serves both.
@@ -97,6 +98,16 @@ local function file_exists(p)
   return false
 end
 
+-- Read one key=value out of the pending file.
+local function pending_get(key)
+  if not file_exists(PENDING) then return nil end
+  for line in io.lines(PENDING) do
+    local k, v = line:match("^([%w_]+)=(.*)$")
+    if k == key then return v end
+  end
+  return nil
+end
+
 -- Append one user/watchdog event to the shared telemetry log (spec §4.1). Net
 -- (handover/failover) events are NOT written here — the page derives those from
 -- the sample stream. A single O_APPEND JSON line < PIPE_BUF is atomic, so the
@@ -149,6 +160,93 @@ local function resolve_active()
   end
   local sub_id, plmn, matched = resolve_sub_id(want_plmn)
   return sub_id, plmn, matched, slot
+end
+
+-- Call one of GL's C rpc plugins (modem.so) exactly as oui.rpc's glc_call does
+-- (reference/oui-lib-rpc.lua:126): nginx-internal POST to /cgi-bin/glc, response
+-- body is "<code> <json>". Returns (table|nil, err). NOT pcall-wrapped: capture
+-- is a cosocket-style nginx API and must be allowed to yield.
+local function glc(object, method, args)
+  local res = ngx.location.capture("/cgi-bin/glc", {
+    method = ngx.HTTP_POST,
+    body = cjson.encode({ object = object, method = method, args = args or {} }),
+  })
+  if not res or res.status ~= 200 then
+    return nil, "glc http " .. tostring(res and res.status)
+  end
+  local code = tonumber(res.body:match("(-?%d+)"))
+  if code ~= 0 then return nil, code end                 -- GL error code (e.g. 20002044)
+  local msg = res.body:match("%d+ (.*)") or ""
+  local ok, obj = pcall(cjson.decode, msg)               -- decode can't yield; pcall fine
+  if not ok or type(obj) ~= "table" then return nil, "glc bad json" end
+  return obj
+end
+
+-- AT read with the crossed-reply guard (reference §10): the shared channel can
+-- answer with a DIFFERENT command's payload. Retry until the reply carries the
+-- expected marker; nil after 3 tries (callers treat nil as "unknown").
+local function at_expect(cmd, expect, sub_id)
+  for _ = 1, 3 do
+    local blob = at(cmd, sub_id)
+    if blob and blob:find(expect, 1, true) then return blob end
+  end
+  return nil
+end
+
+-- Numbers after a QNWLOCK tag:  '+QNWLOCK: "common/5g",516,127490,15,71'
+local function qnwlock_nums(blob, tag)
+  if not blob then return nil end
+  local tail = blob:match('%+QNWLOCK: "' .. tag .. '",([%d,%s]*)')
+  if not tail then return nil end
+  local out = {}
+  for n in tail:gmatch("(%d+)") do out[#out + 1] = tonumber(n) end
+  return out
+end
+
+-- "common/4g": ,0 = unlocked; locked reply is ,<mode>,<freq>,<pci>
+-- (field order per GL's own parser in /lib/functions/modem.sh:940-942).
+local function parse_qnwlock4(blob)
+  local n = qnwlock_nums(blob, "common/4g")
+  if not n then return nil end
+  if #n <= 1 then return { locked = (n[1] or 0) ~= 0 } end
+  return { locked = true, mode = n[1], freq = n[2], pci = n[3] }
+end
+
+-- "common/5g": ,0 = unlocked; locked reply is ,<pci>,<freq>,<scs>,<band>
+-- (PCI FIRST — reference §6a; parser order per modem.sh:926-929).
+local function parse_qnwlock5(blob)
+  local n = qnwlock_nums(blob, "common/5g")
+  if not n then return nil end
+  if #n <= 1 then return { locked = (n[1] or 0) ~= 0 } end
+  return { locked = true, pci = n[1], freq = n[2], scs = n[3], band = n[4] }
+end
+
+local function parse_savectrl(blob)
+  local n = qnwlock_nums(blob, "save_ctrl")
+  if not n or #n < 2 then return nil end
+  return { raw = n[1] .. "," .. n[2], s4g = n[1], s5g = n[2] }
+end
+
+-- Serving cell from QENG. SA field order verified on-box (reference §8):
+-- "servingcell",<state>,"NR5G-SA",<duplex>,<mcc>,<mnc>,<cell_id>,<pci>,<tac>,<arfcn>,<band>,…
+-- LTE order is from the 5-series manual (📘 — re-verify at the Task 7 milestone):
+-- "servingcell",<state>,"LTE",<is_tdd>,<mcc>,<mnc>,<cell_id>,<pci>,<earfcn>,<band>,…
+local function parse_serving(blob)
+  if not blob then return nil end
+  local line = blob:match('%+QENG: "servingcell"[^\r\n]*')
+  if not line then return nil end
+  local f = {}
+  for tok in line:gmatch('[^,]+') do f[#f + 1] = (tok:gsub('^%s*"?', ''):gsub('"?%s*$', '')) end
+  -- f[1]='+QENG: servingcell', f[2]=state, f[3]=rat
+  local rat = f[3]
+  if rat == "NR5G-SA" then
+    return { rat = rat, cell_id = f[7], pci = tonumber(f[8]),
+             arfcn = tonumber(f[10]), band = tonumber(f[11]) }
+  elseif rat == "LTE" then
+    return { rat = rat, cell_id = f[7], pci = tonumber(f[8]),
+             arfcn = tonumber(f[9]), band = tonumber(f[10]) }
+  end
+  return { rat = rat }
 end
 
 -- READ: the three-layer band picture for the active subscription.
@@ -219,6 +317,34 @@ function M.get_bands(args)
       plmn_matched = matched,   -- false => sub_id resolution is a best guess
       mode = mode_pref,         -- AUTO | NR5G | LTE (or a combo) — the RAT gate
     },
+  }
+end
+
+-- READ: cell-lock picture — modem truth (QNWLOCK), GL's store (get_cell_tower),
+-- the serving cell (lock target for pin-current), and stale/pending flags.
+function M.get_lock(args)
+  local sub_id, plmn, matched, slot = resolve_active()
+  local l4 = parse_qnwlock4(at_expect('AT+QNWLOCK="common/4g"', '"common/4g"', sub_id))
+  local l5 = parse_qnwlock5(at_expect('AT+QNWLOCK="common/5g"', '"common/5g"', sub_id))
+  local sc = parse_savectrl(at_expect('AT+QNWLOCK="save_ctrl"', '"save_ctrl"', sub_id))
+  local serving = parse_serving(at_expect('AT+QENG="servingcell"', '"servingcell"', sub_id))
+
+  local gl = glc("modem", "get_cell_tower", { bus = "cpu" })
+  local tower = gl and gl["slot" .. tostring(slot)] or nil
+  local gl_locked = (tower and tower.cellid and tower.cellid ~= "") and true or false
+  local modem_locked = (l4 and l4.locked) or (l5 and l5.locked) or false
+
+  -- Shape unknown until Task 7 captures it; returned raw for the UI to inspect.
+  local opcfg = glc("modem", "get_operator_config", { bus = "cpu" })
+
+  return {
+    lock = { l4g = l4, l5g = l5, save_ctrl = sc },
+    gl = { locked = gl_locked, tower = tower },
+    serving = serving,
+    stale = file_exists(STALE) or (gl_locked and not modem_locked),
+    pending_kind = pending_get("KIND") or (file_exists(PENDING) and "bands" or nil),
+    operator_config = opcfg,
+    meta = { sub_id = sub_id, slot = slot, plmn = plmn, plmn_matched = matched },
   }
 end
 
@@ -326,16 +452,6 @@ function M.get_history(args)
     return out
   end
   return { samples = arr(read_lines(SAMPLES)), events = arr(read_lines(EVENTS)), now = os.time() * 1000 }
-end
-
--- Read one key=value out of the pending file.
-local function pending_get(key)
-  if not file_exists(PENDING) then return nil end
-  for line in io.lines(PENDING) do
-    local k, v = line:match("^([%w_]+)=(.*)$")
-    if k == key then return v end
-  end
-  return nil
 end
 
 -- Commit a pending change durably (Path B). Two things happen here:
