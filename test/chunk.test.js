@@ -133,7 +133,7 @@ test('renders gracefully with an empty store (no push yet)', () => {
   const tree = c.render.call(vm, h);
   assert.strictEqual(tree.tag, 'div');
   assert.match(textOf(tree), /Waiting for the modem/, 'must show an honest empty state');
-  assert.match(textOf(tree), /Diagnostics/, 'tabs still render without data');
+  assert.match(textOf(tree), /Bands/, 'tabs still render without data');
 });
 
 test('reads live data via $store.getters.moduleStatus and renders the serving cell', () => {
@@ -201,6 +201,58 @@ test('quality colour comes from GL levels, mapped to GL ramp tokens', () => {
     .map((n) => n.data.style.color);
   assert.ok(styled.includes('var(--info-hover)'), 'rsrp level 3 -> good ramp token');
   assert.ok(styled.includes('var(--warning)'), 'sinr level 2 -> fair ramp token');
+});
+
+test('strip facts row carries the moved diagnostics fields (Cell/Channel/BW/RSSI)', () => {
+  const c = loadChunk();
+  // Clone LIVE and add an RSSI reading to the active slot's cell_info.
+  const withRssi = JSON.parse(JSON.stringify(LIVE));
+  withRssi['cellular.networks_info'].networks[0].cell_info.rssi = '-70';
+  const vm = makeVm(c, withRssi);
+  vm.tab = 'bands';                 // NOT diag/tracking — isolate the strip as the source
+  const nodes = walk(c.render.call(vm, h));
+  const facts = nodes.find((n) => n.data.staticClass === 'mm-facts');
+  assert.ok(facts, 'strip facts row renders');
+  const txt = textOf(facts);
+  assert.match(txt, /Cell/, 'Cell label present in strip');
+  assert.match(txt, /187461035/, 'Cell id from serving cell');
+  assert.match(txt, /Ch/, 'Channel label present');
+  assert.match(txt, /127490/, 'ARFCN from serving cell');
+  assert.match(txt, /15MHz/, 'bandwidth from serving cell');
+  assert.match(txt, /RSSI/, 'RSSI label present');
+  assert.match(txt, /-70/, 'RSSI value from serving cell');
+});
+
+test('strip is inert: no Tracking link, no click handler on the trace', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, LIVE);
+  const nodes = walk(c.render.call(vm, h));
+  const trace = nodes.find((n) => n.data.staticClass === 'mm-trace');
+  assert.ok(trace, 'trace block still renders');
+  assert.ok(!(trace.data.on && trace.data.on.click), 'trace has no click handler');
+  assert.ok(!(trace.data.attrs && trace.data.attrs.title), 'trace has no Open Tracking title');
+  assert.doesNotMatch(textOf(trace), /↗/, 'no "Tracking ↗" affordance in the strip');
+});
+
+test('Diagnostics tab is gone; Tracking is first and the default', () => {
+  const c = loadChunk();
+  assert.strictEqual(c.data().tab, 'tracking', 'default landing tab is Tracking');
+  const vm = makeVm(c, LIVE);
+  const tabLabels = walk(c.render.call(vm, h))
+    .filter((n) => n.data.staticClass && /\bmm-tab\b/.test(n.data.staticClass))
+    .map(textOf);
+  assert.strictEqual(tabLabels[0], 'Tracking', 'Tracking is the first tab');
+  assert.ok(!tabLabels.includes('Diagnostics'), 'no Diagnostics tab');
+});
+
+test('mounted() fetches the tracking chunk on landing', () => {
+  const c = loadChunk();
+  assert.strictEqual(typeof c.mounted, 'function', 'component has a mounted hook');
+  const vm = makeVm(c, LIVE);       // tab defaults to 'tracking'
+  let called = 0;
+  vm.loadTracking = function () { called++; };
+  c.mounted.call(vm);
+  assert.strictEqual(called, 1, 'mounted calls loadTracking when landing on Tracking');
 });
 
 // Bands with a seeded SA selection (as fetchBands would set after get_bands).

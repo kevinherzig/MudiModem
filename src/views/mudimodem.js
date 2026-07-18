@@ -29,7 +29,7 @@ module.exports = {
 
   data() {
     return {
-      tab: "diag",
+      tab: "tracking",
       trace: [],
       TRACE_MAX: 90,
       styleId: "mudimodem-css",
@@ -261,6 +261,7 @@ module.exports = {
   },
 
   created() { this.injectStyle(); },
+  mounted() { if (this.tab === "tracking") this.loadTracking(); },
   beforeDestroy() { this.clearCountdown(); this.clearSwitchState(); },
 
   methods: {
@@ -1050,7 +1051,7 @@ module.exports = {
         '.mm-axis{display:flex;justify-content:space-between;font-size:9.5px;color:var(--text-hint);margin-top:2px}' +
         '.mm-read{flex:none;min-width:120px;padding:10px 14px 9px 15px;text-align:right;border-left:1px solid var(--divider);display:flex;flex-direction:column;justify-content:center}' +
         '.mm-rsrp{font-size:29px;font-weight:600;line-height:1;letter-spacing:-.025em}.mm-rsrp .u{font-size:11px;font-weight:500;color:var(--text-hint);margin-left:2px}' +
-        '.mm-facts{display:flex;gap:13px;justify-content:flex-end;margin-top:7px}' +
+        '.mm-facts{display:flex;flex-wrap:wrap;gap:5px 13px;justify-content:flex-end;margin-top:7px}' +
         '.mm-facts .k{display:block;font-size:9px;letter-spacing:.04em;text-transform:uppercase;color:var(--text-badge)}.mm-facts b{font-size:12.5px;font-weight:600}' +
         '.mm-tabs{display:flex;gap:22px;border-bottom:1px solid var(--divider);margin-bottom:11px;padding:0 4px}' +
         '.mm-tab{background:none;border:0;padding:9px 0 8px;font:inherit;font-size:13px;cursor:pointer;color:var(--text-weak);border-bottom:2px solid transparent;margin-bottom:-1px}' +
@@ -1576,27 +1577,15 @@ module.exports = {
 
   render(h) {
     var self = this, c = this.serving;
-    // Open the in-page Tracking tab (lazy-loads the graph chunk). Shared by the
-    // Tracking tab button and the strip's live sparkline.
-    var openTracking = function () { self.openTracking(); };
 
     // ---- status strip ----
     var stripKids;
     if (this.hasData) {
       var rsrpColor = this.qColor(this.rsrpQ);
       stripKids = [
-        h("div", {
-          staticClass: "mm-trace",
-          staticStyle: { cursor: "pointer" },
-          attrs: { title: "Open Tracking" },
-          on: { click: openTracking }
-        }, [
+        h("div", { staticClass: "mm-trace" }, [
           h("div", { staticStyle: { display: "flex", justifyContent: "space-between", alignItems: "baseline" } }, [
-            h("span", { staticClass: "mm-eyebrow" }, "RSRP live"),
-            h("span", {
-              staticClass: "mm-eyebrow",
-              staticStyle: { color: "var(--primary)", letterSpacing: ".03em" }
-            }, "Tracking ↗")
+            h("span", { staticClass: "mm-eyebrow" }, "RSRP live")
           ]),
           h("div", { staticClass: "mm-plot" }, [
             h("svg", { attrs: { viewBox: "0 0 320 40", preserveAspectRatio: "none" } }, [
@@ -1623,7 +1612,13 @@ module.exports = {
             h("div", [h("span", { staticClass: "k" }, "RSRQ"),
               h("b", { style: { color: this.qColor(this.rsrqQ) } }, c.rsrq !== undefined ? String(c.rsrq) : "-")]),
             h("div", [h("span", { staticClass: "k" }, "Band"), h("b", this.bandLabel)])
-          ])
+          ].concat(
+            [["BW", c.dl_bandwidth], ["Cell", c.id], ["Ch", c.tx_channel], ["RSSI", c.rssi]]
+              .filter(function (f) { return f[1] !== undefined && f[1] !== null && f[1] !== ""; })
+              .map(function (f) {
+                return h("div", [h("span", { staticClass: "k" }, f[0]), h("b", String(f[1]))]);
+              })
+          ))
         ])
       ];
     } else {
@@ -1639,8 +1634,8 @@ module.exports = {
     // ---- tabs ----
     // "tracking" is an in-page tab like the rest — the strip + tab bar stay put;
     // its graph chunk is lazy-loaded into the panel on first open.
-    var TABS = [["diag", "Diagnostics"], ["bands", "Bands"], ["lock", "Cell lock"],
-      ["at", "AT console"], ["sim", "SIM"], ["tracking", "Tracking"]];
+    var TABS = [["tracking", "Tracking"], ["bands", "Bands"], ["lock", "Cell lock"],
+      ["at", "AT console"], ["sim", "SIM"]];
     var tabs = h("div", { staticClass: "mm-tabs" }, TABS.map(function (t) {
       return h("button", {
         key: t[0], staticClass: "mm-tab" + (self.tab === t[0] ? " on" : ""),
@@ -1650,20 +1645,7 @@ module.exports = {
 
     // ---- panel ----
     var panel;
-    if (this.tab === "diag") {
-      var m = this.modem;
-      panel = h("div", { staticClass: "mm-card" }, [
-        h("div", { staticStyle: { display: "flex", justifyContent: "space-between", alignItems: "baseline" } }, [
-          h("span", { staticClass: "mm-sect" }, "Serving cell"),
-          h("span", { staticClass: "mm-hint" }, m.name ? m.name + " live" : "live")
-        ]),
-        this.hasData
-          ? h("div", { staticClass: "mm-dl" }, this.facts.map(function (f, i) {
-              return h("div", { key: i }, [h("span", { staticClass: "k" }, f[0]), h("b", String(f[1]))]);
-            }))
-          : h("div", { staticClass: "mm-empty" }, "No serving-cell data yet.")
-      ]);
-    } else if (this.tab === "bands") {
+    if (this.tab === "bands") {
       panel = this.renderBands(h);
     } else if (this.tab === "lock") {
       panel = this.renderLock(h);
