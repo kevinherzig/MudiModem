@@ -423,4 +423,47 @@ function M.revert_now(args)
   return { ok = true, reverted = true, restored = restored }
 end
 
+-- ============================ Phase 3: AT console ============================
+-- Raw AT over OUR OWN channel (/dev/at_mdm0), NOT GL's modem.CPU.AT. The heavy
+-- lifting — flock serialization, gl_modem SIGSTOP with paired SIGCONT +
+-- startup recovery, drain/terminator read loop, timeout — lives in the Python
+-- tool; this method only clamps args, spawns it, and parses the one-line
+-- envelope (MM-AT:<status>:<elapsed_ms>). The port has NO sub_id: it answers
+-- for the ACTIVE subscription only (spec 2026-07-18 §0).
+--
+-- io.popen blocks this nginx worker until the tool exits. The tool self-limits
+-- to timeout + lock-wait, so the block is bounded (consistent with the
+-- existing os.execute use in set_bands). No ubus in here, so no cosocket, so
+-- this is safe even though it blocks.
+local AT_TOOL = os.getenv("MUDIMODEM_AT_TOOL") or "/usr/lib/mudimodem/mudimodem-at.py"
+
+function M.at_console(args)
+  local cmd = args and args.cmd
+  if type(cmd) ~= "string" then return { error = "cmd required" } end
+  -- One command per send: collapse CR/LF, trim. Raw otherwise (it's a console).
+  cmd = cmd:gsub("[\r\n]+", " "):match("^%s*(.-)%s*$")
+  if cmd == "" then return { error = "cmd required" } end
+  if #cmd > 256 then return { error = "command too long (max 256 chars)" } end
+  local timeout = tonumber(args and args.timeout) or 8
+  if timeout < 1 then timeout = 1 end
+  if timeout > 60 then timeout = 60 end
+  timeout = math.floor(timeout)
+
+  -- POSIX shell single-quote escaping: ' -> '\''
+  local quoted = "'" .. cmd:gsub("'", "'\\''") .. "'"
+  local f = io.popen("python3 " .. AT_TOOL .. " --envelope --timeout " ..
+                     timeout .. " " .. quoted .. " 2>/dev/null")
+  if not f then return { error = "failed to spawn the AT tool" } end
+  local out = f:read("*a") or ""
+  f:close()
+
+  local status, ms, rest = out:match("^MM%-AT:(%w+):(%d+)\r?\n?(.*)$")
+  if not status then
+    return { error = "AT tool returned no envelope (is " .. AT_TOOL .. " deployed?)" }
+  end
+  if status == "busy" then return { error = "channel busy - another command in flight" } end
+  if status == "openfail" then return { error = "cannot open the AT port (/dev/at_mdm0)" } end
+  return { ok = true, status = status, response = rest, elapsed_ms = tonumber(ms) }
+end
+
 return M
