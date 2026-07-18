@@ -10,9 +10,11 @@
 //   - band model:  window.$rpcRequest("call",["sid","mudimodem","get_bands",{}])
 // The "sid" string is a verbatim placeholder GL swaps for the session cookie.
 //
-// The one WRITE (set_bands) is confirm-or-revert: the backend arms the
-// /usr/sbin/mudimodem-revert watchdog before writing, and this UI shows the
-// countdown + Keep/Revert. A bad lock self-restores within the window.
+// Writes: set_bands is confirm-or-revert via the mudimodem backend + watchdog.
+// The SIM tab (Phase 4) instead writes browser-direct to GL's own undotted RPC
+// (modem.set_sim_config — ALWAYS read-modify-write, the same object carries the
+// band config; modem.set_slot_failover_config — also GL's slot-switch path,
+// since QUIMSLOT does not exist on this modem). No backend, no AT, no sub_id.
 //
 // All colour is GL theme tokens (var(--success) etc.), so light/dark/classic
 // all work with zero extra code.
@@ -60,6 +62,25 @@ module.exports = {
       consoleComp: null,
       consoleLoading: false,
       consoleErr: "",
+      // ---- SIM tab (Phase 4) — all writes browser-direct to GL's own undotted
+      // RPC (modem.*); zero mudimodem-backend involvement. Keys 1/2 are the two
+      // physical slots, predeclared so plain assignment stays reactive.
+      simCfg: { 1: null, 2: null },      // fresh get_sim_config per slot (the RMW base)
+      simCfgErr: { 1: "", 2: "" },
+      simEdit: { 1: null, 2: null },     // editable dial-profile fields per slot
+      simReveal: { 1: true, 2: true },   // ICCID/IMSI/phone shown in full by default
+                                         // (admin-only page); "Hide identifiers" masks them
+      simApplying: 0,                    // slot with an Apply in flight, else 0
+      simApplyErr: { 1: "", 2: "" },
+      switchConfirm: 0,                  // slot awaiting "Use this SIM" confirm, else 0
+      switchTarget: 0,                   // slot a switch is moving to, else 0
+      switchErr: "",
+      switchTimer: null,                 // fallback timer clearing the switching state
+      failover: null,                    // get_slot_failover_config result (passthrough base)
+      failoverEdit: null,                // editable copy
+      failoverErr: "",
+      failoverApplying: false,
+      failoverConfirm: false,            // failover Apply would switch slots — confirm first
       // Approximate downlink centre freq (MHz) per band, for spectrum ordering
       // and labels. Source: 3GPP TS 38.101-1 (NR) / 36.101 (LTE), rounded to the
       // marketing figure. Labels only — the modem is never sent a frequency.
@@ -78,7 +99,17 @@ module.exports = {
       // verified at the supervised milestone before first use.
       SCS_DEFAULT: { 2: 15, 5: 15, 7: 15, 12: 15, 13: 15, 14: 15, 25: 15, 26: 15,
                      29: 15, 30: 15, 38: 30, 41: 30, 48: 30, 66: 15, 70: 15,
-                     71: 15, 77: 30, 78: 30, 79: 30 }
+                     71: 15, 77: 30, 78: 30, 79: 30 },
+      // Home-operator names for common PLMNs (MCC+MNC from sims_info). Labels
+      // only — used for the "roaming on X" honesty line. Unknown → "MCC-MNC".
+      PLMN: {
+        "310260": "T-Mobile US", "312250": "T-Mobile US", "310410": "AT&T US",
+        "310280": "AT&T US", "311480": "Verizon US", "313100": "FirstNet US",
+        "20601": "Proximus BE", "20404": "Vodafone NL", "26201": "Telekom DE",
+        "23430": "EE UK", "20801": "Orange FR", "22201": "TIM IT",
+        "21407": "Movistar ES", "50501": "Telstra AU", "44010": "docomo JP",
+        "302220": "Telus CA", "302610": "Bell CA", "302720": "Rogers CA"
+      }
     };
   },
 
@@ -125,6 +156,50 @@ module.exports = {
       if (s.carrier) return s.carrier;
       return this.activeSim.mcc ? (this.activeSim.mcc + this.activeSim.mnc) : "";
     },
+    // ---- SIM tab (Phase 4) ----
+    // One view-model per physical slot: identity + registration + the two DSDS
+    // facts GL never shows together (selected slot vs data-carrying slot).
+    slotCards() {
+      var self = this;
+      var infos = this.ms("cellular.sims_info").sims || [];
+      var stats = this.ms("cellular.sims_status").sims || [];
+      var nets = this.ms("cellular.networks_status").networks || [];
+      return [1, 2].map(function (slot) {
+        var bySlot = function (arr) {
+          return arr.filter(function (x) { return String(x.slot) === String(slot); })[0] || {};
+        };
+        var info = bySlot(infos), st = bySlot(stats), net = bySlot(nets);
+        var home = self.plmnName(info.mcc, info.mnc);
+        var named = !!self.PLMN[String(info.mcc || "") + String(info.mnc || "")];
+        return {
+          slot: slot,
+          selected: String(self.activeSlot) === String(slot),
+          data: net.dial_status === 1,
+          reg: st.status,
+          // A SIM is PRESENT per GL's own status codes (5 searching / 6 registered).
+          // status 0 = No SIM: the modem may still report a stale/garbage iccid
+          // during a re-scan, so never key identity/form off the iccid string.
+          present: st.status === 5 || st.status === 6,
+          carrier: st.carrier || "",
+          home: home,
+          // Roaming claim only when confident: registered, home PLMN known, and
+          // the serving carrier's name doesn't contain the home name (or vice
+          // versa — "T-Mobile" vs "T-Mobile US" is home, not roaming).
+          roaming: st.status === 6 && named && !!st.carrier &&
+            !self.nameOverlap(home, st.carrier),
+          iccid: info.iccid || "", imsi: info.imsi || "",
+          phone: info.phone_number || "",
+          mcc: info.mcc || "", mnc: info.mnc || "",
+          apn: st.apn || "",
+          apnList: (info.apn_list || []).filter(function (a, i, arr) {
+            return arr.indexOf(a) === i;
+          })
+        };
+      });
+    },
+    // IP-type labels come from the modem itself over the websocket — never
+    // hardcoded (supports_ip_type: 0 IPv4&IPv6 · 1 IPv4 · 2 IPv6 on this box).
+    ipTypeOptions() { return this.modem.supports_ip_type || []; },
     hasData() { return this.serving.rsrp !== undefined && this.serving.rsrp !== null; },
     isNR() { return /NR5G/.test(this.serving.mode || ""); },
     bandLabel() {
@@ -174,11 +249,19 @@ module.exports = {
       if (t === "bands" && !this.bands && !this.bandsLoading) this.fetchBands();
       if (t === "lock" && !this.lockData && !this.lockLoading) this.fetchLock();
       if (t === "at" && !this.consoleComp && !this.consoleLoading) this.loadConsole();
+      if (t === "sim") this.loadSimTab();
+    },
+    // A slot switch is done when GL's selected slot lands on the target.
+    activeSlot(v) {
+      if (this.switchTarget && String(v) === String(this.switchTarget)) {
+        this.clearSwitchState();
+        this.loadSimTab();   // fresh configs for the new arrangement
+      }
     }
   },
 
   created() { this.injectStyle(); },
-  beforeDestroy() { this.clearCountdown(); },
+  beforeDestroy() { this.clearCountdown(); this.clearSwitchState(); },
 
   methods: {
     qFromLevel(lvl) {
@@ -189,6 +272,20 @@ module.exports = {
         poor: "var(--error)", fair: "var(--warning)", good: "var(--info-hover)",
         excellent: "var(--success)", none: "var(--text-hint)"
       })[q];
+    },
+    plmnName(mcc, mnc) {
+      if (!mcc) return "";
+      return this.PLMN[String(mcc) + String(mnc)] || (mcc + "-" + mnc);
+    },
+    // Case/punctuation-insensitive containment: "T-Mobile US" vs "T-Mobile".
+    nameOverlap(a, b) {
+      var n = function (s) { return String(s).toLowerCase().replace(/[^a-z0-9]/g, ""); };
+      var x = n(a), y = n(b);
+      return !!x && !!y && (x.indexOf(y) !== -1 || y.indexOf(x) !== -1);
+    },
+    regLabel(reg) {
+      if (reg === undefined || reg === null) return "—";
+      return ({ 0: "No SIM", 5: "Not registered", 6: "Registered" })[reg] || ("Status " + reg);
     },
     freqOf(group, b) {
       var t = (group === "LTE") ? this.freq.B : this.freq.n;
@@ -353,6 +450,410 @@ module.exports = {
                 label: "scanned cell PCI " + row.pci, extra: row };
       if (isNR) { t.scs = Number(row.scs); t.scsAssumed = false; }
       return t;
+    },
+
+    // ---- SIM tab (Phase 4) ----
+    // Refetch on every tab entry: cheap, and the RMW base must be fresh anyway.
+    loadSimTab() {
+      this.fetchFailover();
+      this.fetchSimCfg(1);
+      this.fetchSimCfg(2);
+    },
+    fetchSimCfg(slot) {
+      var self = this;
+      if (typeof window === "undefined" || !window.$rpcRequest) return;
+      var card = this.slotCards[slot - 1];
+      // No SIM (or stale garbage during a rescan): nothing to fetch or edit.
+      if (!card.present || !card.iccid) { this.simCfgErr[slot] = ""; this.simEdit[slot] = null; return; }
+      window.$rpcRequest("call", ["sid", "modem", "get_sim_config",
+        { slot: slot, bus: this.modem.bus, iccid: card.iccid }], { timeout: 30000 })
+        .then(function (cfg) {
+          self.simCfg[slot] = cfg;
+          self.simEdit[slot] = {
+            apn: cfg.apn || "", auth: cfg.auth || "NONE",
+            username: cfg.username || "", password: cfg.password || "",
+            ip_type: Number(cfg.ip_type || 0), roaming: !!cfg.roaming
+          };
+          self.simCfgErr[slot] = "";
+        })
+        .catch(function (e) {
+          self.simCfgErr[slot] = (e && (e.type || e.message)) || "request failed";
+        });
+    },
+    // RMW guard — the ONLY way a set_sim_config payload may be built. The same
+    // object carries the band config (band_enable/band_filter_mode/band_list);
+    // merging into a fresh read is what keeps the n71 lock unclobberable.
+    mergeSimConfig(fresh, edits) {
+      var out = {};
+      for (var k in fresh) out[k] = fresh[k];
+      out.apn = edits.apn;
+      out.auth = edits.auth;
+      out.username = edits.username;
+      out.password = edits.password;
+      out.ip_type = Number(edits.ip_type);
+      out.roaming = !!edits.roaming;
+      // GL coerces these to Number on its own writes; mirror it.
+      if (out.ttl !== undefined) out.ttl = Number(out.ttl || 0);
+      if (out.hl !== undefined) out.hl = Number(out.hl || 0);
+      if (out.mtu !== undefined) out.mtu = Number(out.mtu || 0);
+      return out;
+    },
+    fetchFailover() {
+      var self = this;
+      if (typeof window === "undefined" || !window.$rpcRequest) return;
+      window.$rpcRequest("call", ["sid", "modem", "get_slot_failover_config",
+        { bus: this.modem.bus }], { timeout: 30000 })
+        .then(function (cfg) {
+          self.failover = cfg;
+          self.failoverEdit = {
+            enable_switch: !!cfg.enable_switch,
+            slot_priority: (cfg.slot_priority || [1, 2]).slice(),
+            enable_timing: !!cfg.enable_timing,
+            hour: cfg.hour != null ? String(cfg.hour) : "00",
+            min: cfg.min != null ? String(cfg.min) : "00"
+          };
+          self.failoverErr = "";
+        })
+        .catch(function (e) {
+          self.failoverErr = (e && (e.type || e.message)) || "request failed";
+        });
+    },
+    askSwitch(slot) { this.switchConfirm = slot; this.switchErr = ""; },
+    clearSwitchState() {
+      this.switchTarget = 0;
+      if (this.switchTimer) { clearTimeout(this.switchTimer); this.switchTimer = null; }
+    },
+    // GL's own UI switches slots by applying the failover config with
+    // current_sim set — QUIMSLOT does not exist on this modem (GL-layer only).
+    doSwitch(slot) {
+      var self = this;
+      if (this.switchTarget || typeof window === "undefined" || !window.$rpcRequest) return;
+      this.switchConfirm = 0;
+      this.switchErr = "";
+      this.switchTarget = slot;
+      window.$rpcRequest("call", ["sid", "modem", "get_slot_failover_config",
+        { bus: this.modem.bus }], { timeout: 30000 })
+        .then(function (cfg) {
+          var payload = {};
+          for (var k in cfg) payload[k] = cfg[k];        // esim2_enable, slot_type… intact
+          payload.bus = self.modem.bus;
+          payload.current_sim = slot;
+          // GL's invariant: with auto-switch on, current_sim == slot_priority[0].
+          if (payload.enable_switch) payload.slot_priority = [slot, slot === 1 ? 2 : 1];
+          return window.$rpcRequest("call", ["sid", "modem", "set_slot_failover_config",
+            payload], { timeout: 30000 });
+        })
+        .then(function () { self.armSwitchFallback(); })
+        .catch(function (e) {
+          // The data link drops mid-switch; a timeout here means "in progress",
+          // not "failed" — keep waiting for the websocket to confirm.
+          if (e && e.type === "timeout") { self.armSwitchFallback(); return; }
+          self.clearSwitchState();
+          self.switchErr = (e && (e.type || e.message)) || "request failed";
+        });
+    },
+    armSwitchFallback() {
+      var self = this;
+      if (this.switchTimer) clearTimeout(this.switchTimer);
+      // If the websocket never confirms (switch failed silently), stop showing
+      // "Switching…" after 90 s and let the cards tell the truth again.
+      this.switchTimer = setTimeout(function () { self.clearSwitchState(); }, 90000);
+    },
+    AUTHS() { return ["NONE", "PAP", "CHAP", "PAP/CHAP"]; },
+    simDirty(slot) {
+      var cfg = this.simCfg[slot], ed = this.simEdit[slot];
+      if (!cfg || !ed) return false;
+      return ed.apn !== (cfg.apn || "") || ed.auth !== (cfg.auth || "NONE") ||
+        ed.username !== (cfg.username || "") || ed.password !== (cfg.password || "") ||
+        Number(ed.ip_type) !== Number(cfg.ip_type || 0) || !!ed.roaming !== !!cfg.roaming;
+    },
+    applySim(slot) {
+      var self = this;
+      if (this.simApplying || typeof window === "undefined" || !window.$rpcRequest) return;
+      var card = this.slotCards[slot - 1];
+      if (!card.iccid || !this.simEdit[slot]) return;
+      this.simApplying = slot;
+      this.simApplyErr[slot] = "";
+      // Fresh read immediately before the write, so every passthrough field
+      // (band config included) is current — never write from a stale base.
+      window.$rpcRequest("call", ["sid", "modem", "get_sim_config",
+        { slot: slot, bus: this.modem.bus, iccid: card.iccid }], { timeout: 30000 })
+        .then(function (fresh) {
+          self.simCfg[slot] = fresh;
+          var payload = self.mergeSimConfig(fresh, self.simEdit[slot]);
+          payload.slot = slot;
+          payload.bus = self.modem.bus;
+          payload.iccid = card.iccid;
+          return window.$rpcRequest("call", ["sid", "modem", "set_sim_config", payload],
+            { timeout: 30000 });
+        })
+        .then(function () {
+          self.simApplying = 0;
+          self.fetchSimCfg(slot);   // re-seed edits from what actually stuck
+        })
+        .catch(function (e) {
+          self.simApplying = 0;
+          self.simApplyErr[slot] = (e && (e.type || e.message)) || "request failed";
+        });
+    },
+    applyFailover(confirmed) {
+      var self = this;
+      if (this.failoverApplying || !this.failoverEdit ||
+          typeof window === "undefined" || !window.$rpcRequest) return;
+      var ed = this.failoverEdit;
+      var base = this.failover || {};
+      var payload = {};
+      for (var k in base) payload[k] = base[k];          // esim2_enable, slot_type… intact
+      payload.bus = this.modem.bus;
+      payload.enable_switch = !!ed.enable_switch;
+      payload.slot_priority = ed.slot_priority.slice();
+      payload.enable_timing = !!ed.enable_timing;
+      payload.hour = String(ed.hour);
+      payload.min = String(ed.min);
+      // GL's invariant: with auto-switch on, the preferred slot IS the current one.
+      if (payload.enable_switch) payload.current_sim = payload.slot_priority[0];
+      // If this apply would change the selected slot, it's a switch — same
+      // consequence, same confirmation, no back door.
+      var wouldSwitch = payload.current_sim &&
+        String(payload.current_sim) !== String(this.activeSlot);
+      if (wouldSwitch && !confirmed) { this.failoverConfirm = true; return; }
+      this.failoverConfirm = false;
+      this.failoverApplying = true;
+      this.failoverErr = "";
+      if (wouldSwitch) this.switchTarget = Number(payload.current_sim);
+      window.$rpcRequest("call", ["sid", "modem", "set_slot_failover_config", payload],
+        { timeout: 30000 })
+        .then(function () {
+          self.failoverApplying = false;
+          if (wouldSwitch) self.armSwitchFallback(); else self.fetchFailover();
+        })
+        .catch(function (e) {
+          self.failoverApplying = false;
+          if (wouldSwitch && e && e.type === "timeout") { self.armSwitchFallback(); return; }
+          if (wouldSwitch) self.clearSwitchState();
+          self.failoverErr = (e && (e.type || e.message)) || "request failed";
+        });
+    },
+    renderFailoverCard(h) {
+      var self = this, ed = this.failoverEdit;
+      var kids = [h("span", { staticClass: "mm-sect" }, "Failover")];
+      if (!ed) {
+        kids.push(h("div", { staticClass: "mm-hint" },
+          this.failoverErr ? "Couldn't load failover config: " + this.failoverErr
+            : "Loading failover config…"));
+        return h("div", { staticClass: "mm-card", staticStyle: { marginTop: "11px" } }, kids);
+      }
+      var frow = function (label, ctl) {
+        return h("div", { staticClass: "mm-frow" }, [h("span", { staticClass: "k" }, label), ctl]);
+      };
+      kids.push(frow("Auto failover", h("button", {
+        staticClass: "mm-apnchip" + (ed.enable_switch ? " on" : ""),
+        attrs: { "aria-pressed": String(!!ed.enable_switch) },
+        on: { click: function () { ed.enable_switch = !ed.enable_switch; } }
+      }, ed.enable_switch ? "On" : "Off")));
+      var names = this.slotCards.map(function (c) {
+        return "Slot " + c.slot + (c.carrier ? " · " + c.carrier : "");
+      });
+      kids.push(frow("Preferred order", h("button", {
+        staticClass: "mm-apnchip",
+        attrs: { title: "Swap priority" },
+        on: { click: function () { ed.slot_priority = ed.slot_priority.slice().reverse(); } }
+      }, ed.slot_priority.map(function (s) { return names[s - 1]; }).join("  →  "))));
+      kids.push(frow("Scheduled switch to preferred", h("button", {
+        staticClass: "mm-apnchip" + (ed.enable_timing ? " on" : ""),
+        attrs: { "aria-pressed": String(!!ed.enable_timing) },
+        on: { click: function () { ed.enable_timing = !ed.enable_timing; } }
+      }, ed.enable_timing ? "On" : "Off")));
+      if (ed.enable_timing) {
+        kids.push(frow("At", h("input", {
+          staticClass: "mm-input",
+          attrs: { type: "time", value: ed.hour + ":" + ed.min },
+          on: { input: function (ev) {
+            var p = String(ev.target.value || "00:00").split(":");
+            ed.hour = p[0] || "00"; ed.min = p[1] || "00";
+          } }
+        })));
+      }
+      if (this.failoverConfirm) {
+        kids.push(h("div", { staticClass: "mm-switchbox" }, [
+          h("div", "This change makes slot " + (ed.slot_priority[0]) + " the active SIM — " +
+            "it drops connectivity for ~30 seconds."),
+          h("div", { staticStyle: { display: "flex", gap: "9px", marginTop: "7px" } }, [
+            h("button", { staticClass: "mm-apply", on: { click: function () { self.applyFailover(true); } } }, "Apply anyway"),
+            h("button", { staticClass: "mm-reveal", on: { click: function () { self.failoverConfirm = false; } } }, "Cancel")
+          ])
+        ]));
+      } else {
+        kids.push(h("button", {
+          staticClass: "mm-apply",
+          attrs: { disabled: this.failoverApplying },
+          on: { click: function () { self.applyFailover(); } }
+        }, this.failoverApplying ? "Applying…" : "Apply"));
+      }
+      if (this.failoverErr && ed) {
+        kids.push(h("div", { staticClass: "mm-hint", staticStyle: { color: "var(--error)" } },
+          "Failover apply failed: " + this.failoverErr));
+      }
+      return h("div", { staticClass: "mm-card", staticStyle: { marginTop: "11px" } }, kids);
+    },
+    maskId(v) { return v ? String(v).slice(0, 4) + "…" : "—"; },
+    renderSlotCard(h, card) {
+      var self = this, slot = card.slot;
+      var revealed = this.simReveal[slot];
+      // Fact badges: Selected (mint) and Carrying data (indigo) are different
+      // facts and never share a colour (spec §4). Registration is neutral/amber.
+      var badges = [];
+      if (card.selected) badges.push(h("span", { staticClass: "mm-badge b-sel" }, "Selected"));
+      if (card.data) badges.push(h("span", { staticClass: "mm-badge b-data" }, "Carrying data"));
+      badges.push(h("span", {
+        staticClass: "mm-badge " + (card.reg === 6 ? "b-reg" : card.reg === 5 ? "b-warn" : "b-off")
+      }, this.regLabel(card.reg)));
+
+      var idRow = function (label, val) {
+        return h("div", { staticClass: "mm-idrow" }, [
+          h("span", { staticClass: "k" }, label),
+          h("b", revealed ? (val || "—") : self.maskId(val))
+        ]);
+      };
+
+      var kids = [
+        h("div", { staticStyle: { display: "flex", justifyContent: "space-between", alignItems: "baseline" } }, [
+          h("span", { staticClass: "mm-sect" }, card.present ? (card.carrier || card.home || ("SIM " + slot)) : "Empty"),
+          h("span", { staticClass: "mm-hint" }, "Slot " + slot)
+        ]),
+        h("div", { staticClass: "mm-badges" }, badges)
+      ];
+
+      // Identity + form only when a SIM is actually present (status 5/6). A
+      // status-0 slot renders as a clean Empty card even if the modem is still
+      // reporting a stale iccid mid-rescan.
+      if (card.present) {
+        if (card.home) {
+          kids.push(h("div", { staticClass: "mm-idrow" }, [
+            h("span", { staticClass: "k" }, "Home operator"),
+            h("b", card.home)
+          ]));
+        }
+        if (card.roaming) {
+          kids.push(h("div", {
+            staticClass: "mm-hint",
+            staticStyle: { color: "var(--warning)", margin: "2px 0 6px" }
+          }, "Roaming on " + card.carrier));
+        }
+        kids.push(idRow("ICCID", card.iccid));
+        kids.push(idRow("IMSI", card.imsi));
+        if (card.phone) kids.push(idRow("Phone", card.phone));
+        kids.push(h("button", {
+          staticClass: "mm-reveal",
+          on: { click: function () { self.simReveal[slot] = !revealed; } }
+        }, revealed ? "Hide identifiers" : "Show identifiers"));
+        kids.push(h("div", { staticClass: "mm-idrow" }, [
+          h("span", { staticClass: "k" }, "APN in use"),
+          h("b", card.apn || "—")
+        ]));
+
+        var ed = self.simEdit[slot];
+        if (ed) {
+          var frow = function (label, ctl) {
+            return h("div", { staticClass: "mm-frow" }, [h("span", { staticClass: "k" }, label), ctl]);
+          };
+          var form = [
+            frow("APN", h("input", {
+              staticClass: "mm-input",
+              attrs: { value: ed.apn, maxlength: 128, placeholder: "APN" },
+              on: { input: function (ev) { ed.apn = ev.target.value; } }
+            })),
+            h("div", { staticClass: "mm-apnchips" }, card.apnList.map(function (a) {
+              return h("button", {
+                key: a,
+                staticClass: "mm-apnchip" + (ed.apn === a ? " on" : ""),
+                on: { click: function () { ed.apn = a; } }
+              }, a);
+            })),
+            frow("Auth", h("select", {
+              staticClass: "mm-select",
+              attrs: { value: ed.auth },
+              on: { change: function (ev) { ed.auth = ev.target.value; } }
+            }, self.AUTHS().map(function (a) {
+              return h("option", { key: a, attrs: { value: a, selected: ed.auth === a } }, a);
+            })))
+          ];
+          if (ed.auth !== "NONE") {
+            form.push(frow("Username", h("input", {
+              staticClass: "mm-input", attrs: { value: ed.username, placeholder: "Username" },
+              on: { input: function (ev) { ed.username = ev.target.value; } }
+            })));
+            form.push(frow("Password", h("input", {
+              staticClass: "mm-input", attrs: { value: ed.password, type: "password", placeholder: "Password" },
+              on: { input: function (ev) { ed.password = ev.target.value; } }
+            })));
+          }
+          form.push(frow("IP type", h("select", {
+            staticClass: "mm-select",
+            attrs: { value: String(ed.ip_type) },
+            on: { change: function (ev) { ed.ip_type = Number(ev.target.value); } }
+          }, self.ipTypeOptions.map(function (o) {
+            return h("option", { key: o.value, attrs: { value: String(o.value), selected: Number(ed.ip_type) === o.value } }, o.label);
+          }))));
+          form.push(frow("Data roaming", h("button", {
+            staticClass: "mm-apnchip" + (ed.roaming ? " on" : ""),
+            attrs: { "aria-pressed": String(!!ed.roaming) },
+            on: { click: function () { ed.roaming = !ed.roaming; } }
+          }, ed.roaming ? "Allowed" : "Blocked")));
+          form.push(h("button", {
+            staticClass: "mm-apply",
+            attrs: { disabled: self.simApplying === slot || !self.simDirty(slot) },
+            on: { click: function () { self.applySim(slot); } }
+          }, self.simApplying === slot ? "Applying…" : "Apply"));
+          if (self.simApplyErr[slot]) {
+            form.push(h("div", { staticClass: "mm-hint", staticStyle: { color: "var(--error)" } },
+              "Apply failed: " + self.simApplyErr[slot]));
+          }
+          kids.push(h("div", { staticClass: "mm-form" }, form));
+        }
+
+        if (!card.selected) {
+          if (self.switchConfirm === slot) {
+            kids.push(h("div", { staticClass: "mm-switchbox" }, [
+              h("div", "Switching drops connectivity for ~30 seconds while slot " + slot +
+                " connects. This admin session will stall until it does."),
+              h("div", { staticStyle: { display: "flex", gap: "9px", marginTop: "7px" } }, [
+                h("button", { staticClass: "mm-apply", on: { click: function () { self.doSwitch(slot); } } }, "Switch"),
+                h("button", { staticClass: "mm-reveal", on: { click: function () { self.switchConfirm = 0; } } }, "Cancel")
+              ])
+            ]));
+          } else {
+            kids.push(h("button", {
+              staticClass: "mm-apply",
+              staticStyle: { marginTop: "9px" },
+              attrs: { disabled: !!self.switchTarget },
+              on: { click: function () { self.askSwitch(slot); } }
+            }, self.switchTarget === slot ? "Switching…" : "Use this SIM"));
+          }
+        }
+        if (self.switchErr && !card.selected) {
+          kids.push(h("div", { staticClass: "mm-hint", staticStyle: { color: "var(--error)" } },
+            "Switch failed: " + self.switchErr));
+        }
+      }
+      if (this.simCfgErr[slot]) {
+        kids.push(h("div", { staticClass: "mm-hint", staticStyle: { color: "var(--error)" } },
+          "Couldn't load dial config: " + this.simCfgErr[slot]));
+      }
+      return h("div", { key: slot, staticClass: "mm-card mm-slot" + (card.selected ? " sel" : "") }, kids);
+    },
+    renderSim(h) {
+      var self = this;
+      return h("div", [
+        h("div", { staticClass: "mm-simgrid" },
+          this.slotCards.map(function (c) { return self.renderSlotCard(h, c); })),
+        this.renderFailoverCard(h),
+        h("div", { staticClass: "mm-hint", staticStyle: { marginTop: "9px" } },
+          "DSDS: both SIMs stay registered; exactly one carries data at a time. " +
+          "The selected slot and the data-carrying slot can differ during failover — " +
+          "both facts are shown above. (AT users: sub_id must follow the active " +
+          "subscription; sub_id=0 answers for the wrong SIM.)")
+      ]);
     },
 
     // The interactive RATs (each maps to a set_bands arg).
@@ -527,6 +1028,29 @@ module.exports = {
         '.mm-dl .k{display:block;font-size:9px;letter-spacing:.05em;text-transform:uppercase;color:var(--text-badge)}.mm-dl b{font-size:13px;font-weight:600;color:var(--text-title)}' +
         '.mm-soon{padding:26px 14px;text-align:center;color:var(--text-hint);font-size:12px;line-height:1.6}' +
         '.mm-empty{padding:30px 14px;text-align:center;color:var(--text-hint);font-size:12.5px}' +
+        // SIM tab
+        '.mm-simgrid{display:grid;grid-template-columns:1fr 1fr;gap:11px}' +
+        '@media (max-width:720px){.mm-simgrid{grid-template-columns:1fr}}' +
+        '.mm-slot.sel{box-shadow:0 0 0 1.5px var(--success) inset}' +
+        '.mm-badges{display:flex;gap:6px;flex-wrap:wrap;margin:7px 0 9px}' +
+        '.mm-badge{font-size:11px;padding:2px 8px;border-radius:9px;border:1px solid var(--divider);color:var(--text-secondary)}' +
+        '.mm-badge.b-sel{border-color:var(--success);color:var(--success)}' +
+        '.mm-badge.b-data{background:var(--primary);border-color:var(--primary);color:#fff}' +
+        '.mm-badge.b-warn{border-color:var(--warning);color:var(--warning)}' +
+        '.mm-badge.b-off{color:var(--text-hint)}' +
+        '.mm-idrow{display:flex;justify-content:space-between;gap:9px;padding:3px 0;font-size:12.5px}' +
+        '.mm-idrow .k{color:var(--text-hint)}' +
+        '.mm-reveal{background:none;border:none;color:var(--primary);font-size:12px;padding:2px 0;cursor:pointer}' +
+        '.mm-form{margin-top:9px;border-top:1px solid var(--divider);padding-top:7px}' +
+        '.mm-frow{display:flex;justify-content:space-between;align-items:center;gap:9px;padding:3px 0;font-size:12.5px}' +
+        '.mm-frow .k{color:var(--text-hint);flex:none}' +
+        '.mm-input,.mm-select{background:var(--background-title);border:1px solid var(--divider);border-radius:6px;color:var(--text-primary);font-size:12.5px;padding:4px 8px;min-width:0;flex:1;max-width:200px}' +
+        '.mm-apnchips{display:flex;gap:5px;flex-wrap:wrap;margin:3px 0 5px}' +
+        '.mm-apnchip{font-size:11px;padding:2px 8px;border-radius:9px;border:1px solid var(--divider);background:none;color:var(--text-secondary);cursor:pointer}' +
+        '.mm-apnchip.on{border-color:var(--primary);color:var(--primary)}' +
+        '.mm-apply{margin-top:7px;padding:5px 14px;border-radius:6px;border:none;background:var(--primary);color:#fff;font-size:12.5px;cursor:pointer}' +
+        '.mm-apply:disabled{opacity:.45;cursor:default}' +
+        '.mm-switchbox{margin-top:9px;padding:9px;border:1px solid var(--warning);border-radius:8px;font-size:12.5px;color:var(--text-secondary)}' +
         // band grid
         '.mm-grp{margin-bottom:15px}.mm-grp:last-child{margin-bottom:2px}' +
         '.mm-grp-h{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:7px}' +
@@ -1103,11 +1627,10 @@ module.exports = {
           this.consoleErr ? "Couldn't load the AT console: " + this.consoleErr
             : "Loading the AT console…")]);
       }
+    } else if (this.tab === "sim") {
+      panel = this.renderSim(h);
     } else {
-      var soon = {
-        sim: "SIM / APN - Phase 4."
-      }[this.tab];
-      panel = h("div", { staticClass: "mm-card" }, [h("div", { staticClass: "mm-soon" }, soon)]);
+      panel = h("div", { staticClass: "mm-card" }, [h("div", { staticClass: "mm-soon" }, "Unknown tab.")]);
     }
 
     return h("div", { staticClass: "mm" }, [strip, tabs, panel]);

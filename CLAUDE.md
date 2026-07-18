@@ -564,7 +564,7 @@ router and searchable. It's a differentiator no router UI has.
 | **1** | Read-only diagnostics tab | Now **cheaper than planned** — reads come free over `global_sockets` (§2); no backend needed except `policy_band`/`ue_capability_band` (§5a). |
 | **2** | Band grid + cell lock, auto-revert, panic restore | ✅ **2a+2b done** (band read/write/revert). ⏳ cell lock (`QNWLOCK` §6a) + durability (make `set_bands` persist via `modem.set_sim_config`) remain. |
 | **3** | AT console + community library | ✅ done (2026-07-18). Own channel via /usr/lib/mudimodem/mudimodem-at.py; gl_modem slept during sends; library at /www/mudimodem/at-library.json.gz. |
-| **4** | SIM / APN | Most overlap with GL's own pages. Slot switch = GL layer only (`mvas.switch_sim_slot`), no modem AT (reference §7/§11). |
+| **4** | SIM / APN | ✅ **done (2026-07-18)** — two DSDS slot cards (selected≠data made visible), roaming honesty, editable dial profile, slot switch, failover card. **Chunk-only, browser-direct to GL's undotted `modem.*` RPC — zero backend.** Slot switch is `modem.set_slot_failover_config {current_sim}` (verified live 1→2→1), **not** `mvas.switch_sim_slot`. |
 
 ## 11. Repo layout
 ```
@@ -617,6 +617,30 @@ MudiModem/
   watchdog (+ arm interlock + panic), `set_bands`/`confirm`/`revert_now`, interactive SA grid + C1
   countdown. Also fixed: **never `pcall` a cosocket** (crossed-yield bug), config read from raw AT,
   strip anchors on the active SIM.
+- ✅ **Phase 4 done (2026-07-18)** — SIM/APN tab, chunk-only, browser-direct to GL's undotted
+  `modem.*` RPC (no backend, no AT, no `sub_id`). Slot cards render the DSDS split
+  (`Selected`≠`Carrying data`) and roaming honesty (home PLMN from IMSI vs serving carrier). Dial
+  profile edits go through a **read-modify-write** of `modem.set_sim_config` — mandatory, because that
+  object *also* carries the band config; **verified live** the n71-era band lock survives an APN write
+  byte-for-byte. Slot switch = `modem.set_slot_failover_config {current_sim}` (verified 1→2→1 in ~2 s;
+  `mvas.switch_sim_slot` fallback unused). Spec: `docs/superpowers/specs/2026-07-18-sim-apn-tab-design.md`;
+  plan: `docs/superpowers/plans/2026-07-18-sim-apn-tab.md`. Test-only tool: `ubus call gl-session call
+  '{"module":"modem","func":..,"params":..}'` reaches `modem.so` glc methods as root, no web sid.
+- ⚠️ **Rapid slot switches can wedge GL's SIM detection (observed 2026-07-18).** Two
+  `set_slot_failover_config {current_sim}` switches seconds apart (1→2→1) left `cellular.sim` reporting
+  **`status:0` (No SIM) with garbage iccids** (`44000000003`, `E0127E0127E`) on *both* slots for 5+ min,
+  while **WAN stayed up** (radio/data path fine — it's the reporting layer, not connectivity). Recovery:
+  **`/etc/init.d/gl_cellular_manager restart`** (SIMs back to `status:6` in ~5 s; band lock survives).
+  Lesson for a real switch: **wait for the websocket to confirm before another switch** (the UI already
+  does — `switchTarget` gates re-entry). UI hardening from this: SIM cards now gate identity/form on
+  GL's **present** signal (`status` 5/6), never the iccid string, so a status-0 slot renders a clean
+  "Empty / No SIM" card instead of a stale-iccid + editable-form contradiction.
+- ⚠️ **Band config drifted off n71 (observed 2026-07-18).** `get_feature_config` now shows the full
+  6-band T-Mobile policy set (`NR-SA:[25,41,48,66,77,71]`, `NR-NSA:[2,5,41,66,77,71]`), not the
+  deliberate n71-only lock from 2026-07-15. Likely a `cellular_manager` restart re-applying stored
+  config (the §5a durability gap in action), or a manual change. Not touched — re-apply n71 via the
+  Bands tab if still wanted. This is almost certainly why `verify.sh` step 5 (backend band-model
+  assertion) now trips: it's live-state, not a Phase-4 regression (Phase 4 changed no backend files).
 - ⏭ **Next:** (a) make `set_bands` **durable** via `modem.set_sim_config` (else it reverts on
   `cellular_manager` restart — §5a durability gap); (b) cell-lock tab on `QNWLOCK` (§6a).
 - ✅ **Phase 3 done (2026-07-18)** — AT console tab (lazy chunk `mudimodem-console`) + community

@@ -51,6 +51,21 @@ function makeVm(component, statusMap) {
   return vm;
 }
 
+// Install a window.$rpcRequest stub that records calls and replies from a
+// queue of results (or rejects when an Error is queued). Returns the record.
+function stubRpc(replies) {
+  const calls = [];
+  global.window = {
+    $rpcRequest(method, params, opts) {
+      calls.push({ method, params, opts });
+      const r = replies.shift();
+      return (r instanceof Error) ? Promise.reject(r) : Promise.resolve(r);
+    }
+  };
+  return calls;
+}
+function unstubRpc() { delete global.window; }
+
 // A realistic websocket snapshot, shaped exactly like the device pushes it
 // (captured 2026-07-17; slot 1 = active T-Mobile n71).
 const LIVE = {
@@ -70,6 +85,30 @@ const LIVE = {
   'cellular.sims_status': { sims: [
     { slot: '1', carrier: 'T-Mobile', status: 6 },
     { slot: '2', carrier: 'AT&T', status: 6 }
+  ] }
+};
+
+// Failover split state, captured live 2026-07-18: slot 1 SELECTED (T-Mobile,
+// registered, no data), slot 2 (Belgian 206-01 travel SIM, roaming on AT&T)
+// CARRYING DATA. The state GL's UI cannot render.
+const SPLIT = {
+  'cellular.modems_info': LIVE['cellular.modems_info'],
+  'cellular.modems_status': { modems: [{ bus: 'cpu', current_sim_slot: '1', slot_switch_status: 0 }] },
+  'cellular.sims_info': { sims: [
+    { slot: '1', bus: 'cpu', iccid: '8901260108736235562F', imsi: '310260103623556',
+      mcc: '310', mnc: '260', phone_number: '15388500234',
+      apn_list: ['h2g2', 'fast.t-mobile.com', 'gigsky', 'gigsky'] },
+    { slot: '2', bus: 'cpu', iccid: '89320420000217304391', imsi: '206018224530439',
+      mcc: '206', mnc: '01', phone_number: '',
+      apn_list: ['bicsapn', 'internet.proximus.be'] }
+  ] },
+  'cellular.sims_status': { sims: [
+    { slot: '1', iccid: '8901260108736235562F', carrier: 'T-Mobile', status: 6, apn: 'h2g2' },
+    { slot: '2', iccid: '89320420000217304391', carrier: 'AT&T', status: 6, apn: 'internet.proximus.be' }
+  ] },
+  'cellular.networks_status': { networks: [
+    { slot: '1', iccid: '8901260108736235562F', dial_status: 0 },
+    { slot: '2', iccid: '89320420000217304391', dial_status: 1 }
   ] }
 };
 
@@ -680,4 +719,393 @@ test('AT console is an in-page tab: lazy-loads its own chunk', () => {
   vm.consoleComp = fake;
   const node = walk(c.render.call(vm, h)).find((n) => n.tag === fake);
   assert.ok(node, 'renders the loaded console component as a child vnode');
+});
+
+// ---------------------------------------------------------------------------
+// Phase 4 — SIM / APN tab
+// ---------------------------------------------------------------------------
+
+test('slotCards: merges info/status/network per slot with the DSDS facts', () => {
+  const vm = makeVm(loadChunk(), SPLIT);
+  const [s1, s2] = vm.slotCards;
+  assert.equal(vm.slotCards.length, 2);
+  // Slot 1: selected, registered, NOT carrying data.
+  assert.equal(s1.slot, 1);
+  assert.equal(s1.selected, true);
+  assert.equal(s1.data, false);
+  assert.equal(s1.reg, 6);
+  assert.equal(s1.carrier, 'T-Mobile');
+  assert.equal(s1.apn, 'h2g2');
+  // Slot 2: NOT selected, carrying data — the split state.
+  assert.equal(s2.selected, false);
+  assert.equal(s2.data, true);
+  assert.equal(s2.iccid, '89320420000217304391');
+});
+
+test('slotCards: roaming honesty — home PLMN vs serving carrier', () => {
+  const vm = makeVm(loadChunk(), SPLIT);
+  const [s1, s2] = vm.slotCards;
+  // T-Mobile SIM on T-Mobile: home operator known, not roaming.
+  assert.equal(s1.home, 'T-Mobile US');
+  assert.equal(s1.roaming, false);
+  // Belgian 206-01 SIM serving on AT&T: roaming.
+  assert.equal(s2.home, 'Proximus BE');
+  assert.equal(s2.roaming, true);
+});
+
+test('slotCards: apn_list is deduplicated', () => {
+  const vm = makeVm(loadChunk(), SPLIT);
+  assert.deepEqual(vm.slotCards[0].apnList, ['h2g2', 'fast.t-mobile.com', 'gigsky']);
+});
+
+test('slotCards: empty slot degrades to blanks, unknown PLMN to mcc-mnc', () => {
+  const empty = JSON.parse(JSON.stringify(SPLIT));
+  empty['cellular.sims_info'].sims = [
+    { slot: '1', mcc: '999', mnc: '99', iccid: 'X', imsi: 'Y', apn_list: [] }
+  ];
+  empty['cellular.sims_status'].sims = [{ slot: '1', status: 0 }];
+  empty['cellular.networks_status'].networks = [];
+  const vm = makeVm(loadChunk(), empty);
+  const [s1, s2] = vm.slotCards;
+  assert.equal(s1.home, '999-99');           // unknown PLMN: no fake name
+  assert.equal(s1.roaming, false);           // status 0 → never claim roaming
+  assert.equal(s2.iccid, '');                // absent slot → blank card, no crash
+  assert.equal(s2.reg, undefined);
+});
+
+test('regLabel maps GL sim-status codes', () => {
+  const vm = makeVm(loadChunk(), SPLIT);
+  assert.equal(vm.regLabel(6), 'Registered');
+  assert.equal(vm.regLabel(5), 'Not registered');
+  assert.equal(vm.regLabel(0), 'No SIM');
+  assert.equal(vm.regLabel(undefined), '—');
+  assert.equal(vm.regLabel(3), 'Status 3');
+});
+
+test('mergeSimConfig: dial edits land, band fields pass through untouched', () => {
+  const vm = makeVm(loadChunk(), SPLIT);
+  const fresh = {
+    protocol: 'rmnet', apn: 'old', auth: 'NONE', username: '', password: '',
+    ip_type: 0, roaming: true, network_mode: 'AUTO', ttl: '0', hl: '0', mtu: '0',
+    band_enable: true, band_filter_mode: 0,
+    band_list: { LTE: [], 'NR-NSA': [], 'NR-SA': [71] }
+  };
+  const out = vm.mergeSimConfig(fresh, {
+    apn: 'new-apn', auth: 'PAP', username: 'u', password: 'p', ip_type: 1, roaming: false
+  });
+  // Dial fields updated…
+  assert.equal(out.apn, 'new-apn');
+  assert.equal(out.auth, 'PAP');
+  assert.equal(out.ip_type, 1);
+  assert.equal(out.roaming, false);
+  // …the band lock survives verbatim…
+  assert.equal(out.band_enable, true);
+  assert.equal(out.band_filter_mode, 0);
+  assert.deepEqual(out.band_list, { LTE: [], 'NR-NSA': [], 'NR-SA': [71] });
+  // …numeric passthroughs coerced the way GL coerces them…
+  assert.strictEqual(out.ttl, 0);
+  assert.strictEqual(out.mtu, 0);
+  // …and the input object was not mutated.
+  assert.equal(fresh.apn, 'old');
+});
+
+test('fetchSimCfg: calls modem.get_sim_config with slot+bus+iccid, seeds simEdit', async () => {
+  const calls = stubRpc([{ apn: 'h2g2', auth: 'NONE', username: '', password: '',
+    ip_type: 0, roaming: true, band_enable: true }]);
+  try {
+    const vm = makeVm(loadChunk(), SPLIT);
+    vm.fetchSimCfg(1);
+    await Promise.resolve(); await Promise.resolve();
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0].params, ['sid', 'modem', 'get_sim_config',
+      { slot: 1, bus: 'cpu', iccid: '8901260108736235562F' }]);
+    assert.equal(vm.simCfg[1].apn, 'h2g2');
+    assert.deepEqual(vm.simEdit[1],
+      { apn: 'h2g2', auth: 'NONE', username: '', password: '', ip_type: 0, roaming: true });
+  } finally { unstubRpc(); }
+});
+
+test('fetchSimCfg: RPC rejection lands in simCfgErr, simEdit stays null', async () => {
+  const calls = stubRpc([Object.assign(new Error('x'), { type: 'timeout' })]);
+  try {
+    const vm = makeVm(loadChunk(), SPLIT);
+    vm.fetchSimCfg(2);
+    await Promise.resolve(); await Promise.resolve();
+    assert.equal(vm.simCfgErr[2], 'timeout');
+    assert.equal(vm.simEdit[2], null);
+  } finally { unstubRpc(); }
+});
+
+test('fetchFailover: reads config and seeds failoverEdit with string hour/min', async () => {
+  const calls = stubRpc([{ enable_switch: true, esim2_enable: false, current_sim: 1,
+    slot_priority: [1, 2], enable_timing: false, hour: '03', min: '30',
+    slot_type: [{ slot: 1, type: 0 }, { slot: 2, type: 0 }] }]);
+  try {
+    const vm = makeVm(loadChunk(), SPLIT);
+    vm.fetchFailover();
+    await Promise.resolve(); await Promise.resolve();
+    assert.deepEqual(calls[0].params, ['sid', 'modem', 'get_slot_failover_config', { bus: 'cpu' }]);
+    assert.deepEqual(vm.failoverEdit, {
+      enable_switch: true, slot_priority: [1, 2], enable_timing: false, hour: '03', min: '30'
+    });
+  } finally { unstubRpc(); }
+});
+
+test('SIM tab renders two slot cards with honest DSDS badges', () => {
+  const comp = loadChunk();
+  const vm = makeVm(comp, SPLIT);
+  vm.tab = 'sim';
+  const nodes = walk(comp.render.call(vm, h));
+  const cards = nodes.filter((n) => /mm-slot\b/.test(n.data.staticClass || ''));
+  assert.equal(cards.length, 2);
+  // Selected ring on slot 1 only.
+  assert.ok(/\bsel\b/.test(cards[0].data.staticClass));
+  assert.ok(!/\bsel\b/.test(cards[1].data.staticClass));
+  // The split state: "Selected" on card 1, "Carrying data" on card 2.
+  assert.ok(textOf(cards[0]).includes('Selected'));
+  assert.ok(!textOf(cards[0]).includes('Carrying data'));
+  assert.ok(textOf(cards[1]).includes('Carrying data'));
+  // Roaming honesty on card 2.
+  assert.ok(textOf(cards[1]).includes('Proximus BE'));
+  assert.ok(textOf(cards[1]).includes('Roaming on AT&T'));
+});
+
+test('SIM tab shows full identifiers by default, hides them on toggle', () => {
+  const comp = loadChunk();
+  const vm = makeVm(comp, SPLIT);
+  vm.tab = 'sim';
+  let text = textOf(comp.render.call(vm, h));
+  assert.ok(text.includes('8901260108736235562F'), 'full ICCID visible by default');
+  assert.ok(text.includes('Hide identifiers'), 'offers a hide toggle');
+  vm.simReveal[1] = false;                              // user hides
+  text = textOf(comp.render.call(vm, h));
+  assert.ok(!text.includes('8901260108736235562F'), 'full ICCID hidden after toggle');
+  assert.ok(text.includes('8901…'), 'masked stub shown when hidden');
+  assert.ok(text.includes('Show identifiers'));
+});
+
+test('SIM tab: empty slot renders as an empty card, no crash', () => {
+  const empty = JSON.parse(JSON.stringify(SPLIT));
+  empty['cellular.sims_info'].sims = empty['cellular.sims_info'].sims.slice(0, 1);
+  empty['cellular.sims_status'].sims = [
+    empty['cellular.sims_status'].sims[0], { slot: '2', status: 0 }
+  ];
+  const comp = loadChunk();
+  const vm = makeVm(comp, empty);
+  vm.tab = 'sim';
+  const text = textOf(comp.render.call(vm, h));
+  assert.ok(text.includes('No SIM'));
+});
+
+test('applySim: fresh read, merged write, band fields intact in the payload', async () => {
+  const FRESH = { apn: 'h2g2', auth: 'NONE', username: '', password: '', ip_type: 0,
+    roaming: true, band_enable: true, band_filter_mode: 0,
+    band_list: { LTE: [], 'NR-NSA': [], 'NR-SA': [71] } };
+  // reply 1: get_sim_config (RMW read); 2: set_sim_config; 3: post-apply re-seed read.
+  const calls = stubRpc([FRESH, {}, FRESH]);
+  try {
+    const vm = makeVm(loadChunk(), SPLIT);
+    vm.simEdit[1] = { apn: 'fast.t-mobile.com', auth: 'NONE', username: '', password: '',
+      ip_type: 0, roaming: true };
+    vm.applySim(1);
+    await new Promise((r) => setImmediate(r));
+    assert.equal(calls[0].params[2], 'get_sim_config');
+    assert.equal(calls[1].params[2], 'set_sim_config');
+    assert.equal(calls[2].params[2], 'get_sim_config');   // re-seeds edits after write
+    const payload = calls[1].params[3];
+    assert.equal(payload.slot, 1);
+    assert.equal(payload.bus, 'cpu');
+    assert.equal(payload.iccid, '8901260108736235562F');
+    assert.equal(payload.apn, 'fast.t-mobile.com');
+    // The band lock rides through untouched — the whole point of RMW.
+    assert.equal(payload.band_enable, true);
+    assert.deepEqual(payload.band_list, { LTE: [], 'NR-NSA': [], 'NR-SA': [71] });
+  } finally { unstubRpc(); }
+});
+
+test('applySim: failure surfaces in simApplyErr and clears the in-flight flag', async () => {
+  const calls = stubRpc([Object.assign(new Error('x'), { type: 'accessDenied' })]);
+  try {
+    const vm = makeVm(loadChunk(), SPLIT);
+    vm.simEdit[1] = { apn: 'a', auth: 'NONE', username: '', password: '', ip_type: 0, roaming: true };
+    vm.applySim(1);
+    await new Promise((r) => setImmediate(r));
+    assert.equal(vm.simApplying, 0);
+    assert.equal(vm.simApplyErr[1], 'accessDenied');
+  } finally { unstubRpc(); }
+});
+
+test('simDirty: true only when an edit differs from the loaded config', () => {
+  const vm = makeVm(loadChunk(), SPLIT);
+  vm.simCfg[1] = { apn: 'h2g2', auth: 'NONE', username: '', password: '', ip_type: 0, roaming: true };
+  vm.simEdit[1] = { apn: 'h2g2', auth: 'NONE', username: '', password: '', ip_type: 0, roaming: true };
+  assert.equal(vm.simDirty(1), false);
+  vm.simEdit[1].apn = 'other';
+  assert.equal(vm.simDirty(1), true);
+});
+
+test('dial form renders APN chips from apn_list and an Apply button', () => {
+  const comp = loadChunk();
+  const vm = makeVm(comp, SPLIT);
+  vm.tab = 'sim';
+  vm.simEdit[1] = { apn: 'h2g2', auth: 'NONE', username: '', password: '', ip_type: 0, roaming: true };
+  const nodes = walk(comp.render.call(vm, h));
+  const chips = nodes.filter((n) => /mm-apnchip/.test(n.data.staticClass || ''));
+  assert.ok(chips.length >= 3);                       // deduped apn_list for slot 1
+  assert.ok(chips.some((c) => textOf(c) === 'fast.t-mobile.com'));
+  const applies = nodes.filter((n) => /mm-apply/.test(n.data.staticClass || '') && textOf(n) === 'Apply');
+  assert.equal(applies.length, 1);                    // only the loaded slot has a form Apply
+});
+
+test('auth != NONE reveals username/password inputs', () => {
+  const comp = loadChunk();
+  const vm = makeVm(comp, SPLIT);
+  vm.tab = 'sim';
+  vm.simEdit[1] = { apn: 'h2g2', auth: 'PAP', username: '', password: '', ip_type: 0, roaming: true };
+  const nodes = walk(comp.render.call(vm, h));
+  const inputs = nodes.filter((n) => n.tag === 'input' &&
+    ((n.data.attrs || {}).placeholder === 'Username' || (n.data.attrs || {}).placeholder === 'Password'));
+  assert.equal(inputs.length, 2);
+});
+
+test('doSwitch: RMW on failover config, sets current_sim, reorders priority when auto-switch on', async () => {
+  const FCFG = { enable_switch: true, esim2_enable: false, current_sim: 1,
+    slot_priority: [1, 2], enable_timing: false, hour: '00', min: '00',
+    slot_type: [{ slot: 1, type: 0 }, { slot: 2, type: 0 }] };
+  const calls = stubRpc([FCFG, {}]);
+  try {
+    const vm = makeVm(loadChunk(), SPLIT);
+    vm.doSwitch(2);
+    await new Promise((r) => setImmediate(r));
+    assert.equal(calls[0].params[2], 'get_slot_failover_config');
+    assert.equal(calls[1].params[2], 'set_slot_failover_config');
+    const p = calls[1].params[3];
+    assert.equal(p.bus, 'cpu');
+    assert.equal(p.current_sim, 2);
+    assert.deepEqual(p.slot_priority, [2, 1]);          // manual pick becomes the preference
+    assert.equal(p.esim2_enable, false);                // passthrough intact
+    assert.deepEqual(p.slot_type, FCFG.slot_type);
+    assert.equal(vm.switchTarget, 2);
+  } finally { unstubRpc(); }
+});
+
+test('doSwitch: timeout is EXPECTED (link drops), not an error', async () => {
+  const FCFG = { enable_switch: false, current_sim: 1, slot_priority: [1, 2] };
+  const calls = stubRpc([FCFG, Object.assign(new Error('t'), { type: 'timeout' })]);
+  let vm;
+  try {
+    vm = makeVm(loadChunk(), SPLIT);
+    vm.doSwitch(2);
+    await new Promise((r) => setImmediate(r));
+    assert.equal(vm.switchErr, '');                     // no error shown
+    assert.equal(vm.switchTarget, 2);                   // still waiting on the websocket
+  } finally { vm.clearSwitchState(); unstubRpc(); }      // kill the 90s fallback timer
+});
+
+test('switch confirm: button on non-selected card only, confirm box states the cost', () => {
+  const comp = loadChunk();
+  const vm = makeVm(comp, SPLIT);
+  vm.tab = 'sim';
+  let nodes = walk(comp.render.call(vm, h));
+  const useBtns = nodes.filter((n) => textOf(n) === 'Use this SIM' && n.tag === 'button');
+  assert.equal(useBtns.length, 1);                      // only on slot 2 (non-selected)
+  vm.switchConfirm = 2;
+  nodes = walk(comp.render.call(vm, h));
+  const box = nodes.filter((n) => /mm-switchbox/.test(n.data.staticClass || ''));
+  assert.equal(box.length, 1);
+  assert.ok(textOf(box[0]).includes('drops connectivity'));
+});
+
+test('applyFailover: full passthrough payload; enable_switch forces current_sim = priority[0]', async () => {
+  const FCFG = { enable_switch: false, esim2_enable: false, current_sim: 1,
+    slot_priority: [1, 2], enable_timing: false, hour: '00', min: '00',
+    slot_type: [{ slot: 1, type: 0 }, { slot: 2, type: 0 }] };
+  const calls = stubRpc([{}]);
+  try {
+    const vm = makeVm(loadChunk(), SPLIT);
+    vm.failover = FCFG;
+    vm.failoverEdit = { enable_switch: true, slot_priority: [1, 2],
+      enable_timing: true, hour: '03', min: '30' };
+    vm.applyFailover(true);
+    await new Promise((r) => setImmediate(r));
+    const p = calls[0].params[3];
+    assert.equal(calls[0].params[2], 'set_slot_failover_config');
+    assert.equal(p.enable_switch, true);
+    assert.equal(p.current_sim, 1);                    // priority[0], GL's invariant
+    assert.deepEqual(p.slot_priority, [1, 2]);
+    assert.equal(p.enable_timing, true);
+    assert.strictEqual(p.hour, '03');                  // strings, as GL sends them
+    assert.equal(p.esim2_enable, false);               // passthrough intact
+    assert.deepEqual(p.slot_type, FCFG.slot_type);
+  } finally { unstubRpc(); }
+});
+
+test('applyFailover: a config that would change the active slot demands confirmation', async () => {
+  const calls = stubRpc([{}]);
+  let vm;
+  try {
+    vm = makeVm(loadChunk(), SPLIT);   // active slot is 1
+    vm.failover = { enable_switch: false, current_sim: 1, slot_priority: [1, 2] };
+    vm.failoverEdit = { enable_switch: true, slot_priority: [2, 1],
+      enable_timing: false, hour: '00', min: '00' };
+    vm.applyFailover();                       // not confirmed
+    await new Promise((r) => setImmediate(r));
+    assert.equal(calls.length, 0);            // nothing sent
+    assert.equal(vm.failoverConfirm, true);   // confirm UI armed instead
+    vm.applyFailover(true);                   // user confirmed
+    await new Promise((r) => setImmediate(r));
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].params[3].current_sim, 2);
+  } finally { vm && vm.clearSwitchState && vm.clearSwitchState(); unstubRpc(); }
+});
+
+test('failover card renders toggle, priority order and time picker when timing on', () => {
+  const comp = loadChunk();
+  const vm = makeVm(comp, SPLIT);
+  vm.tab = 'sim';
+  vm.failover = { enable_switch: true, current_sim: 1, slot_priority: [1, 2] };
+  vm.failoverEdit = { enable_switch: true, slot_priority: [1, 2],
+    enable_timing: true, hour: '03', min: '30' };
+  const text = textOf(comp.render.call(vm, h));
+  assert.ok(text.includes('Auto failover'));
+  assert.ok(text.includes('Preferred order'));
+  assert.ok(text.includes('Scheduled switch'));
+});
+
+test('status-0 slot renders clean Empty/No SIM — no garbage iccid, no form, no switch', () => {
+  // Modem glitch (seen live 2026-07-18 after rapid slot switches): iccid present
+  // but status 0 (No SIM). The card must render as a clean empty slot — never the
+  // "Empty title + No SIM badge + fake ICCID + editable form" contradiction.
+  const g = JSON.parse(JSON.stringify(SPLIT));
+  g['cellular.sims_status'].sims = [
+    { slot: '1', iccid: '44000000003', carrier: '', status: 0 },
+    { slot: '2', iccid: 'E0127E0127E', carrier: '', status: 0 }
+  ];
+  const comp = loadChunk();
+  const vm = makeVm(comp, g);
+  vm.tab = 'sim';
+  // Even if edits somehow got seeded, a not-present slot must show no form.
+  vm.simEdit[1] = { apn: 'x', auth: 'NONE', username: '', password: '', ip_type: 0, roaming: true };
+  const nodes = walk(comp.render.call(vm, h));
+  const text = textOf(nodes);
+  assert.ok(!text.includes('44000000003'), 'garbage ICCID must not render');
+  assert.ok(!text.includes('Show identifiers'), 'no identity block for an absent SIM');
+  assert.ok(text.includes('No SIM'), 'still shows the No SIM badge');
+  const forms = nodes.filter((n) => /mm-form/.test(n.data.staticClass || ''));
+  assert.equal(forms.length, 0, 'no dial form for an absent SIM');
+  const useBtns = nodes.filter((n) => textOf(n) === 'Use this SIM');
+  assert.equal(useBtns.length, 0, 'no switch button for an absent SIM');
+});
+
+test('present-but-unregistered slot (status 5) still shows identity + form', () => {
+  const g = JSON.parse(JSON.stringify(SPLIT));
+  g['cellular.sims_status'].sims[0] = { slot: '1', iccid: '8901260108736235562F',
+    carrier: '', status: 5, apn: 'h2g2' };   // present, searching
+  const comp = loadChunk();
+  const vm = makeVm(comp, g);
+  vm.tab = 'sim';
+  vm.simEdit[1] = { apn: 'h2g2', auth: 'NONE', username: '', password: '', ip_type: 0, roaming: true };
+  const text = textOf(comp.render.call(vm, h));
+  assert.ok(text.includes('8901260108736235562F'), 'present SIM shows identity even if unregistered');
+  assert.ok(text.includes('Not registered'), 'honest not-registered badge');
 });
