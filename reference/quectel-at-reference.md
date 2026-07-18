@@ -371,21 +371,44 @@ AT+QNWLOCK="save_ctrl"   → +QNWLOCK: "save_ctrl",0,0
 - 🟢 Current state on this box: **both locks `0` (unlocked).** The n71 lock is a *band* lock
   (`QNWPREFCFG`), a different mechanism. Serving PCI 721 is a free choice, not pinned.
 
-### `save_ctrl` — cell-lock persistence 🟢(exists) ❓(semantics)
-Two `(0,1)` flags, currently `0,0`. Very likely "persist LTE lock / persist NR lock across reboot"
-(or lock-vs-save). **This is the confirm-or-revert lever for cell lock** — unlike band lock, cell
-lock appears to have a non-persist option, so a bad lock could be made to clear on reboot. ❓ Confirm
-the two flags' exact meaning before relying on it.
+### ⭐ Set-side semantics — SOLVED 2026-07-18 from GL's own firmware, zero probing 🟢
+Extracted from `strings /usr/lib/libcm_modem.so` (GL's cellular_manager modem lib — the code that
+drives `modem.set_cell_tower`) and `/lib/functions/modem.sh`. On-box evidence, no set forms fired:
 
-### ❓ Still unknown (set-side — do NOT probe blind; a bad lock drops the link)
-- What `<mode 0-10>` means for `common/4g` (frequency-only vs freq+PCI vs PCI-only lock strength?).
-- `<scs>` encoding for NR (subcarrier spacing — 15/30/60 kHz as an index?).
-- How to **clear** a lock. MudiUI/community lore says `"common/4g",0` — plausibly consistent with the
-  query returning `,0`, but **unverified for the set direction.**
-- Whether a lock persists automatically or needs `save_ctrl`.
+```
+AT+QNWLOCK="common/5g",%d,%d,%d,%d     ← lock NR:  pci, arfcn, scs, band (order per =? above)
+AT+QNWLOCK="common/4g",1,%d,%d         ← lock LTE: GL hardcodes MODE 1; then earfcn, pci
+AT+QNWLOCK="common/4g",0               ← CLEAR (community lore confirmed)
+AT+QNWLOCK="common/5g",0               ← CLEAR
+AT+QNWLOCK="save_ctrl",1,1             ← GL sets on lock; flags are per-RAT (4g,5g) persistence
+AT+QNWLOCK="save_ctrl",0,0             ← GL sets on unlock; 0 = lock gone on reboot
+```
+- **Side effects (GL always does these with the lock):** locking 5G forces `mode_pref=NR5G`;
+  locking LTE forces `mode_pref=LTE:NR5G` + `nr5g_disable_mode=1`. Unlock must restore them.
+- **Query response when locked** (from modem.sh's awk parsing): `common/4g` → `,<mode>,<freq>,<pci>`;
+  `common/5g` → `,<pci>,<freq>,<scs>,<band>`.
+- GL's unlock flow: query state → skip if `,0` → clear → delete its stored tower config.
+- GL refuses a tower lock while an **operator lock** exists (and vice versa) — mutual exclusion.
+- `<mode>` values other than 0/1 for `common/4g`: GL never uses them; semantics still unknown and
+  irrelevant to us.
 
-**Status: capability + syntax SOLVED (🟢). Set-side parameter semantics still open** — but these are
-now "read the value ranges off the box", not "does this command even exist".
+### ❓ Still unknown
+- **`<scs>` encoding** — GL copies it verbatim from `AT+QSCAN=3,1` results (QSCAN absent from the
+  5-series manual too). Resolved by the first supervised lock: query `common/5g` while locked and
+  read the field. n71 is 15 kHz in practice.
+
+### Related findings 2026-07-18 🟢
+- **`AT+QENG="neighbourcell"` returns bare `OK` on NR5G-SA** — no neighbour list exists; the only
+  free lockable target is the serving cell. Full lists need GL's disruptive `AT+QSCAN=3,1` scan
+  (`modem.scan_cell_tower`, up to 10 min offline).
+- **`AT+QNWCFG="nr5g_earfcn_lock"` / `"lte_earfcn_lock"`** exist (`=?` verified) — frequency-only
+  lock lists; a softer future alternative to full PCI locks.
+- The UCI path `glmodem.tower_sim<slot>` + `modem_AT_lock_cell_tower()` (modem.sh) is **dead code
+  on fw 4.8.5** — nothing calls it; GL's live store is behind `modem.get/set_cell_tower`.
+- Crossed AT replies on `modem.CPU.AT` reproduced again (§10) — a query answered with the *next*
+  query's payload. Validate reply prefixes.
+
+**Design consuming all this:** `docs/superpowers/specs/2026-07-18-cell-lock-tab-design.md`.
 
 ---
 
