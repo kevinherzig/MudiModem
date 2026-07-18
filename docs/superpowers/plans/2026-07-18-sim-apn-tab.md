@@ -66,20 +66,20 @@ const SPLIT = {
   'cellular.modems_info': LIVE['cellular.modems_info'],
   'cellular.modems_status': { modems: [{ bus: 'cpu', current_sim_slot: '1', slot_switch_status: 0 }] },
   'cellular.sims_info': { sims: [
-    { slot: '1', bus: 'cpu', iccid: '8901260108736235562F', imsi: '310260103623556',
-      mcc: '310', mnc: '260', phone_number: '15388500234',
+    { slot: '1', bus: 'cpu', iccid: '89012601000000000001', imsi: '310260000000001',
+      mcc: '310', mnc: '260', phone_number: '15550001234',
       apn_list: ['h2g2', 'fast.t-mobile.com', 'gigsky', 'gigsky'] },
-    { slot: '2', bus: 'cpu', iccid: '89320420000217304391', imsi: '206018224530439',
+    { slot: '2', bus: 'cpu', iccid: '89320420000000000002', imsi: '206018000000002',
       mcc: '206', mnc: '01', phone_number: '',
       apn_list: ['bicsapn', 'internet.proximus.be'] }
   ] },
   'cellular.sims_status': { sims: [
-    { slot: '1', iccid: '8901260108736235562F', carrier: 'T-Mobile', status: 6, apn: 'h2g2' },
-    { slot: '2', iccid: '89320420000217304391', carrier: 'AT&T', status: 6, apn: 'internet.proximus.be' }
+    { slot: '1', iccid: '89012601000000000001', carrier: 'T-Mobile', status: 6, apn: 'h2g2' },
+    { slot: '2', iccid: '89320420000000000002', carrier: 'AT&T', status: 6, apn: 'internet.proximus.be' }
   ] },
   'cellular.networks_status': { networks: [
-    { slot: '1', iccid: '8901260108736235562F', dial_status: 0 },
-    { slot: '2', iccid: '89320420000217304391', dial_status: 1 }
+    { slot: '1', iccid: '89012601000000000001', dial_status: 0 },
+    { slot: '2', iccid: '89320420000000000002', dial_status: 1 }
   ] }
 };
 ```
@@ -101,7 +101,7 @@ test('slotCards: merges info/status/network per slot with the DSDS facts', () =>
   // Slot 2: NOT selected, carrying data — the split state.
   assert.equal(s2.selected, false);
   assert.equal(s2.data, true);
-  assert.equal(s2.iccid, '89320420000217304391');
+  assert.equal(s2.iccid, '89320420000000000002');
 });
 
 test('slotCards: roaming honesty — home PLMN vs serving carrier', () => {
@@ -315,7 +315,7 @@ test('fetchSimCfg: calls modem.get_sim_config with slot+bus+iccid, seeds simEdit
     await Promise.resolve(); await Promise.resolve();
     assert.equal(calls.length, 1);
     assert.deepEqual(calls[0].params, ['sid', 'modem', 'get_sim_config',
-      { slot: 1, bus: 'cpu', iccid: '8901260108736235562F' }]);
+      { slot: 1, bus: 'cpu', iccid: '89012601000000000001' }]);
     assert.equal(vm.simCfg[1].apn, 'h2g2');
     assert.deepEqual(vm.simEdit[1],
       { apn: 'h2g2', auth: 'NONE', username: '', password: '', ip_type: 0, roaming: true });
@@ -511,11 +511,11 @@ test('SIM tab masks identity until revealed', () => {
   const vm = makeVm(comp, SPLIT);
   vm.tab = 'sim';
   let text = textOf(comp.render.call(vm, h));
-  assert.ok(!text.includes('8901260108736235562F'));   // full ICCID hidden
+  assert.ok(!text.includes('89012601000000000001'));   // full ICCID hidden
   assert.ok(text.includes('8901…'));                   // masked stub shown
   vm.simReveal[1] = true;
   text = textOf(comp.render.call(vm, h));
-  assert.ok(text.includes('8901260108736235562F'));
+  assert.ok(text.includes('89012601000000000001'));
 });
 
 test('SIM tab: empty slot renders as an empty card, no crash', () => {
@@ -691,7 +691,7 @@ test('applySim: fresh read, merged write, band fields intact in the payload', as
     const payload = calls[1].params[3];
     assert.equal(payload.slot, 1);
     assert.equal(payload.bus, 'cpu');
-    assert.equal(payload.iccid, '8901260108736235562F');
+    assert.equal(payload.iccid, '89012601000000000001');
     assert.equal(payload.apn, 'fast.t-mobile.com');
     // The band lock rides through untouched — the whole point of RMW.
     assert.equal(payload.band_enable, true);
