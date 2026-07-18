@@ -119,19 +119,32 @@ PIN management, eSIM management (`esim2_enable` displayed if present but not edi
 caps, TTL/MTU/dial-number/protocol/network-mode advanced fields (pass through untouched in RMW;
 GL's dialogs remain the place to edit them).
 
-## 7. Build-time probe tasks (before code — plan must front-load these)
+## 7. Build-time probe tasks — ✅ ALL RESOLVED (live, 2026-07-18)
 
-1. Exact `modem.get_sim_config` request args (iccid? bus? slot?) — read the call site in the
-   internet chunk; confirm with one live authenticated call.
-2. Does `set_sim_config` always trigger a redial, or only when dial fields change? (GL shows a
-   warning only while `dialing`.)
-3. Confirm `set_slot_failover_config {current_sim}` performs the switch on this firmware
-   (vs `mvas.switch_sim_slot`) — one live test at a moment a dropped link is acceptable.
-4. `ip_type` int → v4/v6/v4v6 mapping (from GL's select options in the chunk).
-5. Where the Auto/Manual APN flag lives in `modem.get/set_sim_config` (ubus
-   `cellular.sim get_config` returns `manual: true`; the GL drawer model shows no such field —
-   it may be implied by `protocol` or handled elsewhere). If it isn't representable via
-   `modem.set_sim_config`, drop the toggle rather than adding a backend method.
+Probed on the live box by dispatching the GL RPC methods through
+`ubus call gl-session call '{"module":"modem","func":"...","params":{...}}'` — a root-only
+on-device path that reaches the same `modem.so` glc methods the browser hits via `/rpc`, with no
+web sid needed. Handy for future testing without the admin password.
+
+1. ✅ **`modem.get_sim_config` args = `{slot:Number, bus:"cpu", iccid}`.** Returns MORE fields than
+   GL's drawer model exposed: also `cid, manual, pincode, protocol, device, network_mode`. The RMW
+   `for..in` passthrough preserves every one of them.
+2. ⚠️ **Redial on `set_sim_config`: no forced redial observed**, but not conclusively isolated —
+   during the test slot 1 (the edited SIM) was the *selected* slot while slot 2 carried the data,
+   so a slot-1 redial would not have shown as a data drop. Treat "Apply may redial" as still
+   possible; the UI copy makes no promise either way.
+3. ✅ **`set_slot_failover_config {current_sim}` IS the switch path on this firmware.** Live:
+   `current_sim_slot` flipped 1→2 in ~2 s, and 2→1 to restore. **No `mvas.switch_sim_slot` fallback
+   needed.**
+4. ✅ **`ip_type`: 0 = IPv4&IPv6, 1 = IPv4, 2 = IPv6** (from the modem's own `supports_ip_type`).
+5. ✅ **`manual` (Auto/Manual APN flag) IS present in `modem.get_sim_config`** (`manual:true` on the
+   live box) — but it is *not* in GL's own editable drawer model, so the tab **passes it through
+   untouched via RMW and exposes no toggle** (spec decision upheld; no backend method added).
+
+**Band-lock integrity (the core safety proof) — ✅ verified live.** Changed slot 1 APN
+`h2g2 → fast.t-mobile.com → h2g2` via the exact `mergeSimConfig` RMW path; `get_feature_config`
+band config was byte-identical before, between, and after both writes
+(`NR-SA:[25,41,48,66,77,71]`, `NR-NSA:[2,5,41,66,77,71]`, `enable:true`, `filter:0`).
 
 ## 8. Testing
 
