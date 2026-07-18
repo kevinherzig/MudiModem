@@ -562,3 +562,74 @@ test('SIM tab: empty slot renders as an empty card, no crash', () => {
   const text = textOf(comp.render.call(vm, h));
   assert.ok(text.includes('No SIM'));
 });
+
+test('applySim: fresh read, merged write, band fields intact in the payload', async () => {
+  const FRESH = { apn: 'h2g2', auth: 'NONE', username: '', password: '', ip_type: 0,
+    roaming: true, band_enable: true, band_filter_mode: 0,
+    band_list: { LTE: [], 'NR-NSA': [], 'NR-SA': [71] } };
+  // reply 1: get_sim_config (RMW read); 2: set_sim_config; 3: post-apply re-seed read.
+  const calls = stubRpc([FRESH, {}, FRESH]);
+  try {
+    const vm = makeVm(loadChunk(), SPLIT);
+    vm.simEdit[1] = { apn: 'fast.t-mobile.com', auth: 'NONE', username: '', password: '',
+      ip_type: 0, roaming: true };
+    vm.applySim(1);
+    await new Promise((r) => setImmediate(r));
+    assert.equal(calls[0].params[2], 'get_sim_config');
+    assert.equal(calls[1].params[2], 'set_sim_config');
+    assert.equal(calls[2].params[2], 'get_sim_config');   // re-seeds edits after write
+    const payload = calls[1].params[3];
+    assert.equal(payload.slot, 1);
+    assert.equal(payload.bus, 'cpu');
+    assert.equal(payload.iccid, '8901260108736235562F');
+    assert.equal(payload.apn, 'fast.t-mobile.com');
+    // The band lock rides through untouched — the whole point of RMW.
+    assert.equal(payload.band_enable, true);
+    assert.deepEqual(payload.band_list, { LTE: [], 'NR-NSA': [], 'NR-SA': [71] });
+  } finally { unstubRpc(); }
+});
+
+test('applySim: failure surfaces in simApplyErr and clears the in-flight flag', async () => {
+  const calls = stubRpc([Object.assign(new Error('x'), { type: 'accessDenied' })]);
+  try {
+    const vm = makeVm(loadChunk(), SPLIT);
+    vm.simEdit[1] = { apn: 'a', auth: 'NONE', username: '', password: '', ip_type: 0, roaming: true };
+    vm.applySim(1);
+    await new Promise((r) => setImmediate(r));
+    assert.equal(vm.simApplying, 0);
+    assert.equal(vm.simApplyErr[1], 'accessDenied');
+  } finally { unstubRpc(); }
+});
+
+test('simDirty: true only when an edit differs from the loaded config', () => {
+  const vm = makeVm(loadChunk(), SPLIT);
+  vm.simCfg[1] = { apn: 'h2g2', auth: 'NONE', username: '', password: '', ip_type: 0, roaming: true };
+  vm.simEdit[1] = { apn: 'h2g2', auth: 'NONE', username: '', password: '', ip_type: 0, roaming: true };
+  assert.equal(vm.simDirty(1), false);
+  vm.simEdit[1].apn = 'other';
+  assert.equal(vm.simDirty(1), true);
+});
+
+test('dial form renders APN chips from apn_list and an Apply button', () => {
+  const comp = loadChunk();
+  const vm = makeVm(comp, SPLIT);
+  vm.tab = 'sim';
+  vm.simEdit[1] = { apn: 'h2g2', auth: 'NONE', username: '', password: '', ip_type: 0, roaming: true };
+  const nodes = walk(comp.render.call(vm, h));
+  const chips = nodes.filter((n) => /mm-apnchip/.test(n.data.staticClass || ''));
+  assert.ok(chips.length >= 3);                       // deduped apn_list for slot 1
+  assert.ok(chips.some((c) => textOf(c) === 'fast.t-mobile.com'));
+  const applies = nodes.filter((n) => /mm-apply/.test(n.data.staticClass || ''));
+  assert.equal(applies.length, 1);                    // only the loaded slot has a form
+});
+
+test('auth != NONE reveals username/password inputs', () => {
+  const comp = loadChunk();
+  const vm = makeVm(comp, SPLIT);
+  vm.tab = 'sim';
+  vm.simEdit[1] = { apn: 'h2g2', auth: 'PAP', username: '', password: '', ip_type: 0, roaming: true };
+  const nodes = walk(comp.render.call(vm, h));
+  const inputs = nodes.filter((n) => n.tag === 'input' &&
+    ((n.data.attrs || {}).placeholder === 'Username' || (n.data.attrs || {}).placeholder === 'Password'));
+  assert.equal(inputs.length, 2);
+});

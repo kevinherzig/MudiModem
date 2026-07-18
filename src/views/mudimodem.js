@@ -168,6 +168,9 @@ module.exports = {
         };
       });
     },
+    // IP-type labels come from the modem itself over the websocket — never
+    // hardcoded (supports_ip_type: 0 IPv4&IPv6 · 1 IPv4 · 2 IPv6 on this box).
+    ipTypeOptions() { return this.modem.supports_ip_type || []; },
     hasData() { return this.serving.rsrp !== undefined && this.serving.rsrp !== null; },
     isNR() { return /NR5G/.test(this.serving.mode || ""); },
     bandLabel() {
@@ -368,6 +371,43 @@ module.exports = {
           self.failoverErr = (e && (e.type || e.message)) || "request failed";
         });
     },
+    AUTHS() { return ["NONE", "PAP", "CHAP", "PAP/CHAP"]; },
+    simDirty(slot) {
+      var cfg = this.simCfg[slot], ed = this.simEdit[slot];
+      if (!cfg || !ed) return false;
+      return ed.apn !== (cfg.apn || "") || ed.auth !== (cfg.auth || "NONE") ||
+        ed.username !== (cfg.username || "") || ed.password !== (cfg.password || "") ||
+        Number(ed.ip_type) !== Number(cfg.ip_type || 0) || !!ed.roaming !== !!cfg.roaming;
+    },
+    applySim(slot) {
+      var self = this;
+      if (this.simApplying || typeof window === "undefined" || !window.$rpcRequest) return;
+      var card = this.slotCards[slot - 1];
+      if (!card.iccid || !this.simEdit[slot]) return;
+      this.simApplying = slot;
+      this.simApplyErr[slot] = "";
+      // Fresh read immediately before the write, so every passthrough field
+      // (band config included) is current — never write from a stale base.
+      window.$rpcRequest("call", ["sid", "modem", "get_sim_config",
+        { slot: slot, bus: this.modem.bus, iccid: card.iccid }], { timeout: 30000 })
+        .then(function (fresh) {
+          self.simCfg[slot] = fresh;
+          var payload = self.mergeSimConfig(fresh, self.simEdit[slot]);
+          payload.slot = slot;
+          payload.bus = self.modem.bus;
+          payload.iccid = card.iccid;
+          return window.$rpcRequest("call", ["sid", "modem", "set_sim_config", payload],
+            { timeout: 30000 });
+        })
+        .then(function () {
+          self.simApplying = 0;
+          self.fetchSimCfg(slot);   // re-seed edits from what actually stuck
+        })
+        .catch(function (e) {
+          self.simApplying = 0;
+          self.simApplyErr[slot] = (e && (e.type || e.message)) || "request failed";
+        });
+    },
     maskId(v) { return v ? String(v).slice(0, 4) + "…" : "—"; },
     renderSlotCard(h, card) {
       var self = this, slot = card.slot;
@@ -421,6 +461,66 @@ module.exports = {
           h("span", { staticClass: "k" }, "APN in use"),
           h("b", card.apn || "—")
         ]));
+
+        var ed = self.simEdit[slot];
+        if (ed) {
+          var frow = function (label, ctl) {
+            return h("div", { staticClass: "mm-frow" }, [h("span", { staticClass: "k" }, label), ctl]);
+          };
+          var form = [
+            frow("APN", h("input", {
+              staticClass: "mm-input",
+              attrs: { value: ed.apn, maxlength: 128, placeholder: "APN" },
+              on: { input: function (ev) { ed.apn = ev.target.value; } }
+            })),
+            h("div", { staticClass: "mm-apnchips" }, card.apnList.map(function (a) {
+              return h("button", {
+                key: a,
+                staticClass: "mm-apnchip" + (ed.apn === a ? " on" : ""),
+                on: { click: function () { ed.apn = a; } }
+              }, a);
+            })),
+            frow("Auth", h("select", {
+              staticClass: "mm-select",
+              attrs: { value: ed.auth },
+              on: { change: function (ev) { ed.auth = ev.target.value; } }
+            }, self.AUTHS().map(function (a) {
+              return h("option", { key: a, attrs: { value: a, selected: ed.auth === a } }, a);
+            })))
+          ];
+          if (ed.auth !== "NONE") {
+            form.push(frow("Username", h("input", {
+              staticClass: "mm-input", attrs: { value: ed.username, placeholder: "Username" },
+              on: { input: function (ev) { ed.username = ev.target.value; } }
+            })));
+            form.push(frow("Password", h("input", {
+              staticClass: "mm-input", attrs: { value: ed.password, type: "password", placeholder: "Password" },
+              on: { input: function (ev) { ed.password = ev.target.value; } }
+            })));
+          }
+          form.push(frow("IP type", h("select", {
+            staticClass: "mm-select",
+            attrs: { value: String(ed.ip_type) },
+            on: { change: function (ev) { ed.ip_type = Number(ev.target.value); } }
+          }, self.ipTypeOptions.map(function (o) {
+            return h("option", { key: o.value, attrs: { value: String(o.value), selected: Number(ed.ip_type) === o.value } }, o.label);
+          }))));
+          form.push(frow("Data roaming", h("button", {
+            staticClass: "mm-apnchip" + (ed.roaming ? " on" : ""),
+            attrs: { "aria-pressed": String(!!ed.roaming) },
+            on: { click: function () { ed.roaming = !ed.roaming; } }
+          }, ed.roaming ? "Allowed" : "Blocked")));
+          form.push(h("button", {
+            staticClass: "mm-apply",
+            attrs: { disabled: self.simApplying === slot || !self.simDirty(slot) },
+            on: { click: function () { self.applySim(slot); } }
+          }, self.simApplying === slot ? "Applying…" : "Apply"));
+          if (self.simApplyErr[slot]) {
+            form.push(h("div", { staticClass: "mm-hint", staticStyle: { color: "var(--error)" } },
+              "Apply failed: " + self.simApplyErr[slot]));
+          }
+          kids.push(h("div", { staticClass: "mm-form" }, form));
+        }
       }
       if (this.simCfgErr[slot]) {
         kids.push(h("div", { staticClass: "mm-hint", staticStyle: { color: "var(--error)" } },
@@ -614,6 +714,15 @@ module.exports = {
         '.mm-idrow{display:flex;justify-content:space-between;gap:9px;padding:3px 0;font-size:12.5px}' +
         '.mm-idrow .k{color:var(--text-hint)}' +
         '.mm-reveal{background:none;border:none;color:var(--primary);font-size:12px;padding:2px 0;cursor:pointer}' +
+        '.mm-form{margin-top:9px;border-top:1px solid var(--divider);padding-top:7px}' +
+        '.mm-frow{display:flex;justify-content:space-between;align-items:center;gap:9px;padding:3px 0;font-size:12.5px}' +
+        '.mm-frow .k{color:var(--text-hint);flex:none}' +
+        '.mm-input,.mm-select{background:var(--background-title);border:1px solid var(--divider);border-radius:6px;color:var(--text-primary);font-size:12.5px;padding:4px 8px;min-width:0;flex:1;max-width:200px}' +
+        '.mm-apnchips{display:flex;gap:5px;flex-wrap:wrap;margin:3px 0 5px}' +
+        '.mm-apnchip{font-size:11px;padding:2px 8px;border-radius:9px;border:1px solid var(--divider);background:none;color:var(--text-secondary);cursor:pointer}' +
+        '.mm-apnchip.on{border-color:var(--primary);color:var(--primary)}' +
+        '.mm-apply{margin-top:7px;padding:5px 14px;border-radius:6px;border:none;background:var(--primary);color:#fff;font-size:12.5px;cursor:pointer}' +
+        '.mm-apply:disabled{opacity:.45;cursor:default}' +
         // band grid
         '.mm-grp{margin-bottom:15px}.mm-grp:last-child{margin-bottom:2px}' +
         '.mm-grp-h{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:7px}' +
