@@ -635,21 +635,23 @@ test('lock tab: scan card empty state is honest about SA + disruption', () => {
   assert.match(text, /Scan for cells/);
 });
 
-test('lock tab: scan results render rows sorted by strength with Lock buttons', () => {
+test('lock tab: scan results sort by carrier (A–Z) then strongest RSRP', () => {
   const component = loadChunk();
   const vm = makeVm(component, LIVE);
   vm.tab = 'lock';
   vm.lockData = JSON.parse(JSON.stringify(LOCKDATA_UNLOCKED));
   vm.scan = { running: false, error: '', ts: 1, towers: [
-    { network_type: 'NR5G', pci: 99, freq: 520000, band: 41, scs: 30, cellid: 'A', strength: 2, rsrp: -101 },
-    { network_type: 'NR5G', pci: 516, freq: 127490, band: 71, scs: 15, cellid: 'B', strength: 4, rsrp: -98 }
+    // T-Mobile is stronger overall, but AT&T sorts first (carrier A–Z).
+    { network_type: 'LTE', carrier: 'T-Mobile', pci: 115, freq: 5035, band: 12, cellid: 'TMO1', strength: 4, rsrp: -96 },
+    // Within AT&T, the RSRP value (not the coarse strength bucket) breaks the tie.
+    { network_type: 'LTE', carrier: 'AT&T', pci: 4,  freq: 975,  band: 12, cellid: 'ATT_LO', strength: 3, rsrp: -102 },
+    { network_type: 'LTE', carrier: 'AT&T', pci: 89, freq: 5330, band: 66, cellid: 'ATT_HI', strength: 3, rsrp: -91 }
   ] };
-  const tree = component.render.call(vm, h);
-  const text = textOf(tree);
-  // strongest first
-  assert.ok(text.indexOf('516') < text.indexOf('99'), 'rows must sort by strength desc');
-  const lockBtns = walk(tree).filter((n) => n.tag === 'button' && textOf(n) === 'Lock');
-  assert.equal(lockBtns.length, 2);
+  const text = textOf(component.render.call(vm, h));
+  assert.ok(text.indexOf('ATT_HI') < text.indexOf('TMO1'), 'AT&T group precedes T-Mobile (carrier A–Z)');
+  assert.ok(text.indexOf('ATT_HI') < text.indexOf('ATT_LO'), 'within a carrier, strongest RSRP first');
+  const lockBtns = walk(component.render.call(vm, h)).filter((n) => n.tag === 'button' && textOf(n) === 'Lock');
+  assert.equal(lockBtns.length, 3);
 });
 
 test('lock tab: pending interlock disables Scan and every scan-row Lock button', () => {
@@ -704,7 +706,8 @@ test('lock tab: 5G scan row without a confirmed scs cannot be locked; a row with
   const tree = component.render.call(vm, h);
   const lockBtns = walk(tree).filter((n) => n.tag === 'button' && textOf(n) === 'Lock');
   assert.equal(lockBtns.length, 2);
-  // Rows render sorted by strength desc, so HASSCS (516, strength 4) is first.
+  // Both rows lack a carrier, so they share a group and RSRP desc orders them:
+  // HASSCS (516, -98) before NOSCS (77, -100).
   assert.ok(!(lockBtns[0].data.attrs && lockBtns[0].data.attrs.disabled),
     'row with a confirmed scs must be lockable (falsy disabled)');
   assert.ok(lockBtns[1].data.attrs && lockBtns[1].data.attrs.disabled,

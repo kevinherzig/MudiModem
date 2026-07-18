@@ -1513,8 +1513,19 @@ module.exports = {
         body = h("div", { staticClass: "mm-empty" },
           "Scanning... the modem is offline until this finishes (up to ~10 minutes). Watch the strip.");
       } else if (this.scan.towers.length) {
+        // Group by carrier (A–Z), then strongest RSRP within each carrier; cells
+        // with no RSRP sink to the bottom of their group. Carrier key mirrors the
+        // row's own display fallback (carrier name, else mcc-mnc).
+        var ckey = function (t) {
+          return (t.carrier || ((t.mcc || "") + "-" + (t.mnc || ""))).toLowerCase();
+        };
         var sorted = this.scan.towers.slice().sort(function (a, b) {
-          return (b.strength || 0) - (a.strength || 0);
+          var ca = ckey(a), cb = ckey(b);
+          if (ca !== cb) return ca < cb ? -1 : 1;
+          if (a.rsrp === undefined && b.rsrp === undefined) return 0;
+          if (a.rsrp === undefined) return 1;
+          if (b.rsrp === undefined) return -1;
+          return b.rsrp - a.rsrp;   // -84 before -95 (strongest first)
         });
         var rows = sorted.map(function (tw, i) {
           var q = tw.rsrp !== undefined ? (tw.rsrp >= -95 ? "good" : (tw.rsrp >= -105 ? "fair" : "poor")) : "none";
