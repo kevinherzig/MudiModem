@@ -46,6 +46,24 @@ module.exports = {
       trackingComp: null,   // the loaded tracking component options, once fetched
       trackingLoading: false,
       trackingErr: "",
+      // ---- SIM tab (Phase 4) — all writes browser-direct to GL's own undotted
+      // RPC (modem.*); zero mudimodem-backend involvement. Keys 1/2 are the two
+      // physical slots, predeclared so plain assignment stays reactive.
+      simCfg: { 1: null, 2: null },      // fresh get_sim_config per slot (the RMW base)
+      simCfgErr: { 1: "", 2: "" },
+      simEdit: { 1: null, 2: null },     // editable dial-profile fields per slot
+      simReveal: { 1: false, 2: false }, // identity fields unmasked per card
+      simApplying: 0,                    // slot with an Apply in flight, else 0
+      simApplyErr: { 1: "", 2: "" },
+      switchConfirm: 0,                  // slot awaiting "Use this SIM" confirm, else 0
+      switchTarget: 0,                   // slot a switch is moving to, else 0
+      switchErr: "",
+      switchTimer: null,                 // fallback timer clearing the switching state
+      failover: null,                    // get_slot_failover_config result (passthrough base)
+      failoverEdit: null,                // editable copy
+      failoverErr: "",
+      failoverApplying: false,
+      failoverConfirm: false,            // failover Apply would switch slots — confirm first
       // Approximate downlink centre freq (MHz) per band, for spectrum ordering
       // and labels. Source: 3GPP TS 38.101-1 (NR) / 36.101 (LTE), rounded to the
       // marketing figure. Labels only — the modem is never sent a frequency.
@@ -197,6 +215,7 @@ module.exports = {
     },
     tab(t) {
       if (t === "bands" && !this.bands && !this.bandsLoading) this.fetchBands();
+      if (t === "sim") this.loadSimTab();
     }
   },
 
@@ -282,6 +301,72 @@ module.exports = {
       var cfg = (this.bands.config && this.bands.config[group]) || [];
       var pol = (this.bands.policy && this.bands.policy[group]) || [];
       return (cfg.length ? cfg : pol).slice();
+    },
+
+    // ---- SIM tab (Phase 4) ----
+    // Refetch on every tab entry: cheap, and the RMW base must be fresh anyway.
+    loadSimTab() {
+      this.fetchFailover();
+      this.fetchSimCfg(1);
+      this.fetchSimCfg(2);
+    },
+    fetchSimCfg(slot) {
+      var self = this;
+      if (typeof window === "undefined" || !window.$rpcRequest) return;
+      var card = this.slotCards[slot - 1];
+      if (!card.iccid) { this.simCfgErr[slot] = ""; return; }   // empty slot: nothing to fetch
+      window.$rpcRequest("call", ["sid", "modem", "get_sim_config",
+        { slot: slot, bus: this.modem.bus, iccid: card.iccid }], { timeout: 30000 })
+        .then(function (cfg) {
+          self.simCfg[slot] = cfg;
+          self.simEdit[slot] = {
+            apn: cfg.apn || "", auth: cfg.auth || "NONE",
+            username: cfg.username || "", password: cfg.password || "",
+            ip_type: Number(cfg.ip_type || 0), roaming: !!cfg.roaming
+          };
+          self.simCfgErr[slot] = "";
+        })
+        .catch(function (e) {
+          self.simCfgErr[slot] = (e && (e.type || e.message)) || "request failed";
+        });
+    },
+    // RMW guard — the ONLY way a set_sim_config payload may be built. The same
+    // object carries the band config (band_enable/band_filter_mode/band_list);
+    // merging into a fresh read is what keeps the n71 lock unclobberable.
+    mergeSimConfig(fresh, edits) {
+      var out = {};
+      for (var k in fresh) out[k] = fresh[k];
+      out.apn = edits.apn;
+      out.auth = edits.auth;
+      out.username = edits.username;
+      out.password = edits.password;
+      out.ip_type = Number(edits.ip_type);
+      out.roaming = !!edits.roaming;
+      // GL coerces these to Number on its own writes; mirror it.
+      if (out.ttl !== undefined) out.ttl = Number(out.ttl || 0);
+      if (out.hl !== undefined) out.hl = Number(out.hl || 0);
+      if (out.mtu !== undefined) out.mtu = Number(out.mtu || 0);
+      return out;
+    },
+    fetchFailover() {
+      var self = this;
+      if (typeof window === "undefined" || !window.$rpcRequest) return;
+      window.$rpcRequest("call", ["sid", "modem", "get_slot_failover_config",
+        { bus: this.modem.bus }], { timeout: 30000 })
+        .then(function (cfg) {
+          self.failover = cfg;
+          self.failoverEdit = {
+            enable_switch: !!cfg.enable_switch,
+            slot_priority: (cfg.slot_priority || [1, 2]).slice(),
+            enable_timing: !!cfg.enable_timing,
+            hour: cfg.hour != null ? String(cfg.hour) : "00",
+            min: cfg.min != null ? String(cfg.min) : "00"
+          };
+          self.failoverErr = "";
+        })
+        .catch(function (e) {
+          self.failoverErr = (e && (e.type || e.message)) || "request failed";
+        });
     },
 
     // The interactive RATs (each maps to a set_bands arg).

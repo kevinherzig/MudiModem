@@ -51,6 +51,21 @@ function makeVm(component, statusMap) {
   return vm;
 }
 
+// Install a window.$rpcRequest stub that records calls and replies from a
+// queue of results (or rejects when an Error is queued). Returns the record.
+function stubRpc(replies) {
+  const calls = [];
+  global.window = {
+    $rpcRequest(method, params, opts) {
+      calls.push({ method, params, opts });
+      const r = replies.shift();
+      return (r instanceof Error) ? Promise.reject(r) : Promise.resolve(r);
+    }
+  };
+  return calls;
+}
+function unstubRpc() { delete global.window; }
+
 // A realistic websocket snapshot, shaped exactly like the device pushes it
 // (captured 2026-07-17; slot 1 = active T-Mobile n71).
 const LIVE = {
@@ -433,4 +448,73 @@ test('regLabel maps GL sim-status codes', () => {
   assert.equal(vm.regLabel(0), 'No SIM');
   assert.equal(vm.regLabel(undefined), '—');
   assert.equal(vm.regLabel(3), 'Status 3');
+});
+
+test('mergeSimConfig: dial edits land, band fields pass through untouched', () => {
+  const vm = makeVm(loadChunk(), SPLIT);
+  const fresh = {
+    protocol: 'rmnet', apn: 'old', auth: 'NONE', username: '', password: '',
+    ip_type: 0, roaming: true, network_mode: 'AUTO', ttl: '0', hl: '0', mtu: '0',
+    band_enable: true, band_filter_mode: 0,
+    band_list: { LTE: [], 'NR-NSA': [], 'NR-SA': [71] }
+  };
+  const out = vm.mergeSimConfig(fresh, {
+    apn: 'new-apn', auth: 'PAP', username: 'u', password: 'p', ip_type: 1, roaming: false
+  });
+  // Dial fields updated…
+  assert.equal(out.apn, 'new-apn');
+  assert.equal(out.auth, 'PAP');
+  assert.equal(out.ip_type, 1);
+  assert.equal(out.roaming, false);
+  // …the band lock survives verbatim…
+  assert.equal(out.band_enable, true);
+  assert.equal(out.band_filter_mode, 0);
+  assert.deepEqual(out.band_list, { LTE: [], 'NR-NSA': [], 'NR-SA': [71] });
+  // …numeric passthroughs coerced the way GL coerces them…
+  assert.strictEqual(out.ttl, 0);
+  assert.strictEqual(out.mtu, 0);
+  // …and the input object was not mutated.
+  assert.equal(fresh.apn, 'old');
+});
+
+test('fetchSimCfg: calls modem.get_sim_config with slot+bus+iccid, seeds simEdit', async () => {
+  const calls = stubRpc([{ apn: 'h2g2', auth: 'NONE', username: '', password: '',
+    ip_type: 0, roaming: true, band_enable: true }]);
+  try {
+    const vm = makeVm(loadChunk(), SPLIT);
+    vm.fetchSimCfg(1);
+    await Promise.resolve(); await Promise.resolve();
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0].params, ['sid', 'modem', 'get_sim_config',
+      { slot: 1, bus: 'cpu', iccid: '8901260108736235562F' }]);
+    assert.equal(vm.simCfg[1].apn, 'h2g2');
+    assert.deepEqual(vm.simEdit[1],
+      { apn: 'h2g2', auth: 'NONE', username: '', password: '', ip_type: 0, roaming: true });
+  } finally { unstubRpc(); }
+});
+
+test('fetchSimCfg: RPC rejection lands in simCfgErr, simEdit stays null', async () => {
+  const calls = stubRpc([Object.assign(new Error('x'), { type: 'timeout' })]);
+  try {
+    const vm = makeVm(loadChunk(), SPLIT);
+    vm.fetchSimCfg(2);
+    await Promise.resolve(); await Promise.resolve();
+    assert.equal(vm.simCfgErr[2], 'timeout');
+    assert.equal(vm.simEdit[2], null);
+  } finally { unstubRpc(); }
+});
+
+test('fetchFailover: reads config and seeds failoverEdit with string hour/min', async () => {
+  const calls = stubRpc([{ enable_switch: true, esim2_enable: false, current_sim: 1,
+    slot_priority: [1, 2], enable_timing: false, hour: '03', min: '30',
+    slot_type: [{ slot: 1, type: 0 }, { slot: 2, type: 0 }] }]);
+  try {
+    const vm = makeVm(loadChunk(), SPLIT);
+    vm.fetchFailover();
+    await Promise.resolve(); await Promise.resolve();
+    assert.deepEqual(calls[0].params, ['sid', 'modem', 'get_slot_failover_config', { bus: 'cpu' }]);
+    assert.deepEqual(vm.failoverEdit, {
+      enable_switch: true, slot_priority: [1, 2], enable_timing: false, hour: '03', min: '30'
+    });
+  } finally { unstubRpc(); }
 });
