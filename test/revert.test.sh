@@ -15,7 +15,8 @@ fail() { echo "  FAIL- $1"; FAILED=1; }
 run() {  # runs the watchdog with isolated env; extra env in $EXTRA
   P="$WORK/pending"; L="$WORK/log"
   env MUDIMODEM_DRY=1 MUDIMODEM_PENDING="$P" MUDIMODEM_LOG="$L" \
-      MUDIMODEM_ARMED="$WORK/armed" MUDIMODEM_WINDOW="${WIN:-1}" sh "$SCRIPT" "$@"
+      MUDIMODEM_ARMED="$WORK/armed" MUDIMODEM_WINDOW="${WIN:-1}" \
+      MUDIMODEM_STALE="$WORK/stale" sh "$SCRIPT" "$@"
 }
 mkpending() { printf 'SUB_ID=1\nPREV_nr5g_band=%s\n' "$1" > "$WORK/pending"; }
 inlog() { grep -q "$1" "$WORK/log" 2>/dev/null; }
@@ -59,6 +60,30 @@ inlog 'nr5g_band\\",2:5:7:12:13:14:25:26:29:30:38:41:48:66:70:71:77:78' \
 inlog 'QNWLOCK=\\"common/4g\\",0' && pass "cleared 4g lock" || fail "did not clear 4g lock"
 inlog 'QNWLOCK=\\"common/5g\\",0' && pass "cleared 5g lock" || fail "did not clear 5g lock"
 [ ! -f "$WORK/pending" ]          && pass "pending cleared" || fail "pending not cleared"
+
+echo "6. watch (KIND=cell): reverts by raw-AT unlock + restores prefs + marks stale"
+rm -f "$WORK/log" "$WORK/stale"
+printf 'KIND=cell\nSUB_ID=1\nSLOT=1\nRAT=5g\nPREV_SAVE_CTRL=0,0\nPREV_mode_pref=NR5G\nPREV_nr5g_disable_mode=0\n' > "$WORK/pending"
+WIN=1 run watch
+inlog 'QNWLOCK=\\"common/5g\\",0'      && pass "unlocked 5g" || fail "no 5g unlock"
+inlog 'QNWLOCK=\\"save_ctrl\\",0,0'    && pass "restored save_ctrl" || fail "no save_ctrl restore"
+inlog 'mode_pref\\",NR5G'              && pass "restored mode_pref" || fail "no mode_pref restore"
+inlog 'nr5g_disable_mode\\",0'         && pass "restored nr5g_disable_mode" || fail "no disable_mode restore"
+[ -f "$WORK/stale" ]                   && pass "stale marker dropped" || fail "no stale marker"
+[ ! -f "$WORK/pending" ]               && pass "pending cleared" || fail "pending not cleared"
+
+echo "7. watch (KIND=cell, 4g): unlocks the right RAT"
+rm -f "$WORK/log" "$WORK/stale"
+printf 'KIND=cell\nSUB_ID=1\nSLOT=1\nRAT=4g\nPREV_SAVE_CTRL=0,0\nPREV_mode_pref=AUTO\nPREV_nr5g_disable_mode=\n' > "$WORK/pending"
+WIN=1 run watch
+inlog 'QNWLOCK=\\"common/4g\\",0'      && pass "unlocked 4g" || fail "no 4g unlock"
+inlog 'QNWLOCK=\\"common/5g\\",0'      && fail "touched 5g needlessly" || pass "left 5g alone"
+
+echo "8. panic: also resets save_ctrl and mode_pref"
+rm -f "$WORK/log"
+run panic 1
+inlog 'QNWLOCK=\\"save_ctrl\\",0,0'    && pass "save_ctrl reset" || fail "no save_ctrl reset"
+inlog 'mode_pref\\",AUTO'              && pass "mode_pref AUTO" || fail "no mode_pref reset"
 
 echo
 if [ "$FAILED" = "0" ]; then echo "ALL REVERT TESTS PASSED"; else echo "REVERT TESTS FAILED"; exit 1; fi

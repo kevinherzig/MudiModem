@@ -12,8 +12,9 @@
 #   boot-check         run from init at boot; if a pending revert survived a
 #                      reboot (file still present), restore now — the NV lock
 #                      would otherwise outlive the (dead) watchdog.
-#   panic [sub_id]     immediate restore to the known-good full band lists and
-#                      clear cell locks. ssh-callable when the web UI is down:
+#   panic [sub_id]     immediate restore to the known-good full band lists,
+#                      clear cell locks, and reset save_ctrl + mode_pref to
+#                      AUTO. ssh-callable when the web UI is down:
 #                        ssh root@mudi /usr/sbin/mudimodem-revert panic
 #
 # Safety:
@@ -33,6 +34,7 @@ LOG="${MUDIMODEM_LOG:-/var/log/mudimodem-revert.log}"
 WINDOW="${MUDIMODEM_WINDOW:-60}"
 DRY="${MUDIMODEM_DRY:-0}"
 HIST_DIR="${MUDIMODEM_HIST:-/tmp/mudimodem}"
+STALE="${MUDIMODEM_STALE:-/etc/mudimodem/gl-stale}"
 
 # Append a "dog" event to the Tracking telemetry log when we auto-revert, so the
 # timeline shows the watchdog firing even with no browser open (spec §4.1).
@@ -69,13 +71,25 @@ set_band() {  # $1 = param (e.g. nr5g_band), $2 = colon list, $3 = sub_id
 
 restore_from_pending() {
   if [ ! -f "$PENDING" ]; then log "no pending file; nothing to restore"; return 0; fi
-  SUB_ID=1; PREV_nr5g_band=""; PREV_nsa_nr5g_band=""; PREV_lte_band=""; PREV_mode_pref=""
+  KIND=""; SUB_ID=1; RAT=""; PREV_SAVE_CTRL=""; PREV_mode_pref=""; PREV_nr5g_disable_mode=""
+  PREV_nr5g_band=""; PREV_nsa_nr5g_band=""; PREV_lte_band=""
   # shellcheck disable=SC1090
   . "$PENDING"
-  [ -n "${PREV_nr5g_band:-}" ]     && set_band "nr5g_band"     "$PREV_nr5g_band"     "${SUB_ID:-1}"
-  [ -n "${PREV_nsa_nr5g_band:-}" ] && set_band "nsa_nr5g_band" "$PREV_nsa_nr5g_band" "${SUB_ID:-1}"
-  [ -n "${PREV_lte_band:-}" ]      && set_band "lte_band"      "$PREV_lte_band"      "${SUB_ID:-1}"
-  [ -n "${PREV_mode_pref:-}" ]     && { log "restore mode_pref -> $PREV_mode_pref"; at "AT+QNWPREFCFG=\"mode_pref\",$PREV_mode_pref" "${SUB_ID:-1}"; }
+  if [ "$KIND" = "cell" ]; then
+    # Cell lock: raw-AT unlock saves the LINK now; GL's store is reconciled by
+    # the backend once the page can reach it again (the stale marker drives that).
+    log "cell revert: unlock common/${RAT:-5g} (sub_id ${SUB_ID:-1})"
+    at "AT+QNWLOCK=\"common/${RAT:-5g}\",0" "${SUB_ID:-1}"
+    [ -n "$PREV_SAVE_CTRL" ]        && at "AT+QNWLOCK=\"save_ctrl\",$PREV_SAVE_CTRL" "${SUB_ID:-1}"
+    [ -n "$PREV_mode_pref" ]        && at "AT+QNWPREFCFG=\"mode_pref\",$PREV_mode_pref" "${SUB_ID:-1}"
+    [ -n "$PREV_nr5g_disable_mode" ] && at "AT+QNWPREFCFG=\"nr5g_disable_mode\",$PREV_nr5g_disable_mode" "${SUB_ID:-1}"
+    : > "$STALE" 2>/dev/null
+  else
+    [ -n "${PREV_nr5g_band:-}" ]     && set_band "nr5g_band"     "$PREV_nr5g_band"     "${SUB_ID:-1}"
+    [ -n "${PREV_nsa_nr5g_band:-}" ] && set_band "nsa_nr5g_band" "$PREV_nsa_nr5g_band" "${SUB_ID:-1}"
+    [ -n "${PREV_lte_band:-}" ]      && set_band "lte_band"      "$PREV_lte_band"      "${SUB_ID:-1}"
+    [ -n "${PREV_mode_pref:-}" ]     && { log "restore mode_pref -> $PREV_mode_pref"; at "AT+QNWPREFCFG=\"mode_pref\",$PREV_mode_pref" "${SUB_ID:-1}"; }
+  fi
   rm -f "$PENDING"
   log "revert complete; pending cleared"
 }
@@ -108,10 +122,12 @@ case "${1:-}" in
     SUB="${2:-1}"
     log "PANIC restore -> known-good SA (sub_id $SUB)"
     set_band "nr5g_band" "$KG_SA" "$SUB"
-    # Clear cell locks. Set-side QNWLOCK is unverified (reference §6a) but panic
-    # is a recovery action of last resort, so clearing is the right default.
+    # Clear cell locks and reset the prefs a lock can leave behind, so panic
+    # returns the modem to a fully open, auto-selecting state.
     at 'AT+QNWLOCK="common/4g",0' "$SUB"
     at 'AT+QNWLOCK="common/5g",0' "$SUB"
+    at 'AT+QNWLOCK="save_ctrl",0,0' "$SUB"
+    at 'AT+QNWPREFCFG="mode_pref",AUTO' "$SUB"
     rm -f "$PENDING"
     log "panic complete"
     ;;
