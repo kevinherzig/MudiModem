@@ -16,58 +16,11 @@
 // All colour is GL theme tokens (var(--success) etc.), so light/dark/classic
 // all work with zero extra code.
 //
-// A hidden sibling page (/mudimodem-tracking) reads a window-scoped in-memory
-// history that THIS page also feeds (spec §10.6). The recorder factory below is
-// an IDENTICAL copy of the one in src/views/mudimodem-tracking.js — the two
-// chunks can't require() each other and the repo is toolchain-free, so it is
-// kept verbatim in both; test/chunk.test.js asserts they match byte-for-byte.
-function makeMMHist() {
-    var SAMPLES_MAX = 5000, MIN_SPACING_MS = 5000, EVENTS_MAX = 500, RECENT_USER_MS = 8000;
-    var samples = [], events = [], last = null;
-    function now() { return Date.now(); }
-    function recentUser(t) {
-      for (var i = events.length - 1; i >= 0; i--) {
-        if (t - events[i].t > RECENT_USER_MS) break;
-        if (events[i].kind === "user" || events[i].kind === "dog") return true;
-      }
-      return false;
-    }
-    function pushEvent(e) {
-      e.t = (e.t == null) ? now() : e.t;
-      events.push(e);
-      if (events.length > EVENTS_MAX) events.shift();
-      return e;
-    }
-    function record(s) {
-      var t = now();
-      // network-event detection vs the last state we saw (independent of storage)
-      if (last && !recentUser(t)) {
-        if (String(s.slot) !== String(last.slot)) {
-          pushEvent({ t: t, kind: "net", label: "Failover",
-            detail: "Data now on SIM " + s.slot + (s.carrier ? " · " + s.carrier : "") });
-        } else if (s.id != null && last.id != null && String(s.id) !== String(last.id)) {
-          pushEvent({ t: t, kind: "net", label: "Handover",
-            detail: "Cell " + last.id + " → " + s.id + (s.band != null ? " (" + s.band + ")" : "") });
-        }
-      }
-      var changed = !last || String(s.slot) !== String(last.slot) ||
-        String(s.id) !== String(last.id) || String(s.band) !== String(last.band) ||
-        String(s.mode) !== String(last.mode);
-      last = { slot: s.slot, id: s.id, band: s.band, mode: s.mode };
-      var prev = samples[samples.length - 1];
-      if (prev && !changed && (t - prev.t) < MIN_SPACING_MS) return null;  // spacing: drop
-      var rec = { t: t, slot: s.slot, id: s.id, band: s.band, mode: s.mode,
-        rsrp: s.rsrp, sinr: s.sinr, rsrq: s.rsrq, rssi: s.rssi,
-        dl_bandwidth: s.dl_bandwidth, tx_channel: s.tx_channel,
-        rsrp_level: s.rsrp_level, sinr_level: s.sinr_level, rsrq_level: s.rsrq_level,
-        carrier: s.carrier };
-      samples.push(rec);
-      if (samples.length > SAMPLES_MAX) samples.shift();
-      return rec;
-    }
-    return { samples: samples, events: events, startedAt: now(),
-      record: record, pushEvent: pushEvent };
-}
+// A hidden sibling page (/mudimodem-tracking) shows history gathered by the
+// device-side collector (mudimodem-collectd) — this page only links to it via
+// the strip's "History ->". User/watchdog events for that timeline are persisted
+// server-side by the backend (set_bands/confirm/revert_now) + the watchdog, so
+// nothing is recorded here.
 module.exports = {
   name: "mudimodem",
 
@@ -86,6 +39,13 @@ module.exports = {
       cdTimer: null,        // countdown interval handle
       applying: false,      // Apply in flight
       applyError: "",
+      // Tracking tab: the graph lives in its OWN chunk (gl-sdk4-ui-mudimodem-
+      // tracking). Rather than route away (which hides our strip + tab bar), we
+      // lazy-load that chunk on first open and render it as an in-page child
+      // component, exactly as the SPA's own loader evals a view chunk.
+      trackingComp: null,   // the loaded tracking component options, once fetched
+      trackingLoading: false,
+      trackingErr: "",
       // Approximate downlink centre freq (MHz) per band, for spectrum ordering
       // and labels. Source: 3GPP TS 38.101-1 (NR) / 36.101 (LTE), rounded to the
       // marketing figure. Labels only — the modem is never sent a frequency.
@@ -186,7 +146,6 @@ module.exports = {
         if (isNaN(n)) return;
         this.trace.push(n);
         if (this.trace.length > this.TRACE_MAX) this.trace.shift();
-        this.recordSample();
       }
     },
     tab(t) {
@@ -198,23 +157,6 @@ module.exports = {
   beforeDestroy() { this.clearCountdown(); },
 
   methods: {
-    // In-memory history shared with the Tracking page (spec §10.6). hist() lazily
-    // creates the window singleton; recordSample() feeds it on every rsrp push.
-    hist() {
-      if (typeof window === "undefined") return null;
-      return window.__mmHist || (window.__mmHist = makeMMHist());
-    },
-    numOf(v) { var n = parseFloat(v); return isNaN(n) ? null : n; },
-    recordSample() {
-      var H = this.hist(); if (!H) return;
-      var c = this.serving;
-      if (c.rsrp === undefined || c.rsrp === null || c.rsrp === "") return;
-      H.record({ slot: this.activeSlot, id: c.id, band: c.band, mode: c.mode,
-        rsrp: this.numOf(c.rsrp), sinr: this.numOf(c.sinr), rsrq: this.numOf(c.rsrq),
-        rssi: this.numOf(c.rssi), dl_bandwidth: c.dl_bandwidth, tx_channel: c.tx_channel,
-        rsrp_level: c.rsrp_level, sinr_level: c.sinr_level, rsrq_level: c.rsrq_level,
-        carrier: this.servingCarrier });
-    },
     qFromLevel(lvl) {
       return ({ 1: "poor", 2: "fair", 3: "good", 4: "excellent" })[lvl] || "none";
     },
@@ -229,6 +171,29 @@ module.exports = {
       return t[b];
     },
     prefixOf(group) { return group === "LTE" ? "B" : "n"; },
+
+    // Open the in-page Tracking tab, lazy-loading its chunk on first use.
+    openTracking() { this.tab = "tracking"; this.loadTracking(); },
+    // Fetch + eval the tracking chunk the same way the SPA's route loader does
+    // (axios GET, then `eval` with `module` in scope → the component object).
+    // Cached on the instance; a failed load shows a message and can be retried.
+    loadTracking() {
+      var self = this;
+      if (this.trackingComp || this.trackingLoading) return;
+      if (typeof window === "undefined" || !window.$axios) return;
+      this.trackingLoading = true; this.trackingErr = "";
+      window.$axios.get("/views/gl-sdk4-ui-mudimodem-tracking.common.js?_t=" + Date.now())
+        .then(function (res) {
+          var module = { exports: {} };            // eslint-disable-line no-unused-vars
+          var comp = eval(res.data);               // chunk is `module.exports = {...}`
+          if (!comp || typeof comp.render !== "function") throw new Error("bad chunk");
+          self.trackingComp = comp; self.trackingLoading = false;
+        })
+        .catch(function (e) {
+          self.trackingLoading = false;
+          self.trackingErr = (e && (e.message || e.type)) || "could not load the graph";
+        });
+    },
 
     // Fetch the three-layer band model from our backend.
     fetchBands() {
@@ -331,15 +296,6 @@ module.exports = {
         .then(function (res) {
           if (!res || res.error) { self.applyError = (res && res.error) || "apply failed"; return; }
           self.startCountdown(res.window || 60, res.applied);
-          var H = self.hist();
-          if (H) {
-            var b = res.applied || {}, d = [];
-            if (b.sa) d.push("SA " + b.sa.split(":").map(function (x) { return "n" + x; }).join(" "));
-            if (b.nsa) d.push("NSA " + b.nsa.split(":").map(function (x) { return "n" + x; }).join(" "));
-            if (b.lte) d.push("LTE " + b.lte.split(":").map(function (x) { return "B" + x; }).join(" "));
-            if (b.mode) d.push("mode " + b.mode);
-            H.pushEvent({ kind: "user", label: "Bands applied", detail: d.join("; ") || "band change" });
-          }
         })
         .catch(function (e) { self.applyError = (e && (e.type || e.message)) || "apply failed"; })
         .then(function () { self.applying = false; });
@@ -355,9 +311,6 @@ module.exports = {
           // The watchdog has reverted server-side. Reflect it and re-read.
           self.clearCountdown();
           self.pending = { done: true, reverted: true };
-          var H = self.hist();
-          if (H) H.pushEvent({ kind: "dog", label: "Auto-revert fired",
-            detail: "No confirm in " + window_s + "s — previous bands restored" });
           self.fetchBands();
           setTimeout(function () { self.pending = null; }, 4000);
         }
@@ -369,8 +322,6 @@ module.exports = {
     keepBands() {
       var self = this;
       this.clearCountdown();
-      var H = this.hist();
-      if (H) H.pushEvent({ kind: "user", label: "Kept", detail: "Change confirmed" });
       window.$rpcRequest("call", ["sid", "mudimodem", "confirm", {}])
         .then(function () {}).catch(function () {})
         .then(function () { self.pending = null; self.fetchBands(); });
@@ -379,8 +330,6 @@ module.exports = {
       var self = this;
       this.clearCountdown();
       this.pending = { done: true, reverting: true };
-      var H = this.hist();
-      if (H) H.pushEvent({ kind: "user", label: "Reverted", detail: "Restored previous bands" });
       window.$rpcRequest("call", ["sid", "mudimodem", "revert_now", {}], { timeout: 20000 })
         .then(function () {}).catch(function () {})
         .then(function () { self.pending = null; self.fetchBands(); });
@@ -679,20 +628,27 @@ module.exports = {
 
   render(h) {
     var self = this, c = this.serving;
+    // Open the in-page Tracking tab (lazy-loads the graph chunk). Shared by the
+    // Tracking tab button and the strip's live sparkline.
+    var openTracking = function () { self.openTracking(); };
 
     // ---- status strip ----
     var stripKids;
     if (this.hasData) {
       var rsrpColor = this.qColor(this.rsrpQ);
       stripKids = [
-        h("div", { staticClass: "mm-trace" }, [
+        h("div", {
+          staticClass: "mm-trace",
+          staticStyle: { cursor: "pointer" },
+          attrs: { title: "Open Tracking" },
+          on: { click: openTracking }
+        }, [
           h("div", { staticStyle: { display: "flex", justifyContent: "space-between", alignItems: "baseline" } }, [
             h("span", { staticClass: "mm-eyebrow" }, "RSRP live"),
-            h("button", {
-              staticClass: "mm-tab",
-              staticStyle: { fontSize: "10.5px", padding: "0", borderBottom: "0", letterSpacing: ".03em" },
-              on: { click: function () { if (self.$router) self.$router.push("/mudimodem-tracking"); } }
-            }, "History →")
+            h("span", {
+              staticClass: "mm-eyebrow",
+              staticStyle: { color: "var(--primary)", letterSpacing: ".03em" }
+            }, "Tracking ↗")
           ]),
           h("div", { staticClass: "mm-plot" }, [
             h("svg", { attrs: { viewBox: "0 0 320 40", preserveAspectRatio: "none" } }, [
@@ -733,12 +689,14 @@ module.exports = {
     var strip = h("div", { staticClass: "mm-strip" }, stripKids);
 
     // ---- tabs ----
+    // "tracking" is an in-page tab like the rest — the strip + tab bar stay put;
+    // its graph chunk is lazy-loaded into the panel on first open.
     var TABS = [["diag", "Diagnostics"], ["bands", "Bands"], ["lock", "Cell lock"],
-      ["at", "AT console"], ["sim", "SIM"]];
+      ["at", "AT console"], ["sim", "SIM"], ["tracking", "Tracking"]];
     var tabs = h("div", { staticClass: "mm-tabs" }, TABS.map(function (t) {
       return h("button", {
         key: t[0], staticClass: "mm-tab" + (self.tab === t[0] ? " on" : ""),
-        on: { click: function () { self.tab = t[0]; } }
+        on: { click: function () { if (t[0] === "tracking") self.openTracking(); else self.tab = t[0]; } }
       }, t[1]);
     }));
 
@@ -759,6 +717,16 @@ module.exports = {
       ]);
     } else if (this.tab === "bands") {
       panel = this.renderBands(h);
+    } else if (this.tab === "tracking") {
+      if (this.trackingComp) {
+        // Render the lazy-loaded graph as a child component. `embedded` tells it
+        // to drop its own "← Modem" breadcrumb (redundant inside our tab bar).
+        panel = h(this.trackingComp, { props: { embedded: true } });
+      } else {
+        panel = h("div", { staticClass: "mm-card" }, [h("div", { staticClass: "mm-soon" },
+          this.trackingErr ? "Couldn't load the graph: " + this.trackingErr
+            : "Loading the signal graph…")]);
+      }
     } else {
       var soon = {
         lock: "Cell lock - Phase 2.",

@@ -307,50 +307,36 @@ test('revert countdown banner renders with Keep/Revert and locks chips', () => {
     'Apply hidden during pending');
 });
 
-test('both chunks carry a byte-identical makeMMHist factory', () => {
-  const a = fs.readFileSync(SRC, 'utf8');
-  const b = fs.readFileSync(path.join(__dirname, '..', 'src', 'views', 'mudimodem-tracking.js'), 'utf8');
-  const grab = (s) => {
-    const i = s.indexOf('function makeMMHist()');
-    assert.ok(i >= 0, 'makeMMHist present');
-    let d = 0, j = i;
-    for (; j < s.length; j++) {
-      if (s[j] === '{') d++;
-      else if (s[j] === '}') { d--; if (d === 0) { j++; break; } }
-    }
-    return s.slice(i, j).replace(/\s+/g, ' ').trim();
-  };
-  assert.strictEqual(grab(a), grab(b), 'the two makeMMHist copies must match');
-});
-
-test('the rsrp watcher records a sample into window.__mmHist', () => {
-  const c = loadChunk();
-  global.window = { __mmHist: null };
-  const vm = makeVm(c, LIVE);
-  vm.recordSample();
-  assert.ok(window.__mmHist && window.__mmHist.samples.length === 1, 'sample recorded');
-  assert.strictEqual(window.__mmHist.samples[0].rsrp, -101);
-  assert.strictEqual(window.__mmHist.samples[0].id, '187461035', 'records the active-slot cell id');
-  delete global.window;
-});
-
-test('hist() lazily creates the window singleton and pushEvent lands', () => {
-  const c = loadChunk();
-  global.window = { __mmHist: null };
-  const vm = makeVm(c, LIVE);
-  const H = vm.hist();
-  assert.ok(H && Array.isArray(H.events), 'recorder created');
-  H.pushEvent({ kind: 'user', label: 'Bands applied', detail: 'SA n71' });
-  assert.strictEqual(window.__mmHist.events[0].kind, 'user');
-  delete global.window;
-});
-
-test('strip shows a History link routing to /mudimodem-tracking', () => {
+test('Tracking is an in-page tab (lazy-loaded graph), not a route change', () => {
   const src = fs.readFileSync(SRC, 'utf8');
-  assert.match(src, /\/mudimodem-tracking/, 'History link targets the tracking route');
+  assert.match(src, /gl-sdk4-ui-mudimodem-tracking\.common\.js/, 'lazy-loads the tracking chunk');
+  assert.doesNotMatch(src, /\$router\.push\(\s*["']\/mudimodem-tracking/,
+    'no longer routes away to the tracking page');
   const c = loadChunk();
   const vm = makeVm(c, LIVE);
-  assert.match(textOf(c.render.call(vm, h)), /History/, 'History affordance rendered');
+  const txt = textOf(c.render.call(vm, h));
+  assert.match(txt, /Tracking/, 'Tracking tab rendered');
+  assert.doesNotMatch(txt, /History/, 'the old "History →" link is removed');
+  // Selecting it makes it the active in-page tab, exactly like the others.
+  vm.tab = 'tracking';
+  const on = walk(c.render.call(vm, h))
+    .filter((n) => n.data.staticClass && /\bmm-tab\b/.test(n.data.staticClass)
+      && /\bon\b/.test(n.data.staticClass))
+    .map(textOf);
+  assert.deepStrictEqual(on, ['Tracking'], 'Tracking shows as the active tab (stays in-page)');
+  // Before the chunk loads, the panel shows a loading placeholder (no navigation).
+  assert.match(textOf(c.render.call(vm, h)), /Loading the signal graph/, 'loading state pre-load');
+});
+
+test('loaded tracking chunk renders as an embedded child component', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, LIVE);
+  vm.tab = 'tracking';
+  const fake = { name: 'mudimodem-tracking', render() {} };
+  vm.trackingComp = fake;                 // as loadTracking would set it
+  const node = walk(c.render.call(vm, h)).find((n) => n.tag === fake);
+  assert.ok(node, 'renders the loaded component object as a child vnode');
+  assert.strictEqual(node.data.props.embedded, true, 'passes embedded:true to drop its breadcrumb');
 });
 
 test('the write calls target the watchdog-protected methods only', () => {

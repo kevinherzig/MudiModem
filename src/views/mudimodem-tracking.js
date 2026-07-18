@@ -1,119 +1,69 @@
 // MudiModem — Tracking (the uber graph). A hidden /mudimodem-tracking route.
 //
 // Loaded by GL's SPA via eval(): the file is ONE expression whose value is the
-// component. Vue is runtime-only -> render(h) only, never template:. History is
-// kept in a window-scoped ring buffer (window.__mmHist) fed by whichever
-// MudiModem page is mounted; it is session-scoped and lost on reload (spec §10.6).
+// component. Vue is runtime-only -> render(h) only, never template:.
+//
+// History comes from the device-side collector (mudimodem-collectd), read via a
+// SILENT POST to /rpc (window.$axios directly, NOT $rpcRequest) so a failed
+// background poll can't trigger GL's global "Unknown error" banner — see
+// rpcSilent(). -> { samples:[...], events:[...], now }. The page fetches the full
+// 24h once on mount, then polls incrementally with `since`.
+// Handover/failover ticks are DERIVED here from the sample stream (net events
+// aren't persisted); user/watchdog events come from the server.
+//
+// Times are the box clock (os.time()*1000). We render relative to a skew-
+// corrected box-now so the axis doesn't jump if the browser clock differs.
 //
 // The middle bus is CELL ID (cell_info.id) + ARFCN — the box carries NO PCI over
-// the websocket; PCI is AT-only. Handover = a change in id; failover = a change
-// in the active slot. Metrics arrive as strings with _level (1-4) buckets, reused
-// for the GL quality ramp exactly as the main page's strip does. All colour is GL
-// theme tokens, so light/dark/classic work with zero extra code.
+// ubus. Metrics arrive as numbers already (parsed by the collector); _level
+// buckets drive the GL quality ramp. All colour is GL theme tokens.
 module.exports = (function () {
   "use strict";
 
-  // ---- the in-memory recorder (IDENTICAL copy lives in mudimodem.js) ----
-  // Kept verbatim in both chunks: chunks can't require() each other and the repo
-  // is toolchain-free. test/chunk.test.js asserts the two copies are identical.
-  function makeMMHist() {
-    var SAMPLES_MAX = 5000, MIN_SPACING_MS = 5000, EVENTS_MAX = 500, RECENT_USER_MS = 8000;
-    var samples = [], events = [], last = null;
-    function now() { return Date.now(); }
-    function recentUser(t) {
-      for (var i = events.length - 1; i >= 0; i--) {
-        if (t - events[i].t > RECENT_USER_MS) break;
-        if (events[i].kind === "user" || events[i].kind === "dog") return true;
-      }
-      return false;
-    }
-    function pushEvent(e) {
-      e.t = (e.t == null) ? now() : e.t;
-      events.push(e);
-      if (events.length > EVENTS_MAX) events.shift();
-      return e;
-    }
-    function record(s) {
-      var t = now();
-      // network-event detection vs the last state we saw (independent of storage)
-      if (last && !recentUser(t)) {
-        if (String(s.slot) !== String(last.slot)) {
-          pushEvent({ t: t, kind: "net", label: "Failover",
-            detail: "Data now on SIM " + s.slot + (s.carrier ? " · " + s.carrier : "") });
-        } else if (s.id != null && last.id != null && String(s.id) !== String(last.id)) {
-          pushEvent({ t: t, kind: "net", label: "Handover",
-            detail: "Cell " + last.id + " → " + s.id + (s.band != null ? " (" + s.band + ")" : "") });
-        }
-      }
-      var changed = !last || String(s.slot) !== String(last.slot) ||
-        String(s.id) !== String(last.id) || String(s.band) !== String(last.band) ||
-        String(s.mode) !== String(last.mode);
-      last = { slot: s.slot, id: s.id, band: s.band, mode: s.mode };
-      var prev = samples[samples.length - 1];
-      if (prev && !changed && (t - prev.t) < MIN_SPACING_MS) return null;  // spacing: drop
-      var rec = { t: t, slot: s.slot, id: s.id, band: s.band, mode: s.mode,
-        rsrp: s.rsrp, sinr: s.sinr, rsrq: s.rsrq, rssi: s.rssi,
-        dl_bandwidth: s.dl_bandwidth, tx_channel: s.tx_channel,
-        rsrp_level: s.rsrp_level, sinr_level: s.sinr_level, rsrq_level: s.rsrq_level,
-        carrier: s.carrier };
-      samples.push(rec);
-      if (samples.length > SAMPLES_MAX) samples.shift();
-      return rec;
-    }
-    return { samples: samples, events: events, startedAt: now(),
-      record: record, pushEvent: pushEvent };
-  }
-
-  // ---- lane geometry + constants ----
+  // Three metrics OVERLAID in one plot. Each keeps its own domain (`dom`) but
+  // maps into the same shared rectangle (PLOT_H) — a normalized overlay, so the
+  // lines are comparable in shape. Fixed GL-token colour per metric keeps them
+  // apart: RSRP=primary(blue), SINR=success(mint), RSRQ=error(rose). (GL ships no
+  // saturated purple that survives the dark theme — its --gl-purple ramp is the
+  // desaturated text ramp — so rose is the third distinct hue.) Signal QUALITY is
+  // no longer painted on the lines; it lives in the hover readout + the strip.
+  // `lvl` is retained for the readout's quality colouring.
   var LINES = [
-    { key: "rsrp", label: "RSRP · dBm", h: 120, dom: [-120, -80], mid: -100, lvl: "rsrp_level" },
-    { key: "sinr", label: "SINR · dB",  h: 84,  dom: [-10, 30],   mid: 13,  lvl: "sinr_level" },
-    { key: "rsrq", label: "RSRQ · dB",  h: 84,  dom: [-20, -3],   mid: -15, lvl: "rsrq_level" }
+    { key: "rsrp", label: "RSRP · dBm", dom: [-120, -80], color: "var(--primary)", lvl: "rsrp_level" },
+    { key: "sinr", label: "SINR · dB",  dom: [-10, 30],   color: "var(--success)", lvl: "sinr_level" },
+    { key: "rsrq", label: "RSRQ · dB",  dom: [-20, -3],   color: "var(--error)",   lvl: "rsrq_level" }
   ];
   var BUSES = [{ key: "band", label: "BAND" }, { key: "id", label: "CELL" }, { key: "sim", label: "SIM" }];
   var FREQ_N = { 2:1900,5:850,7:2600,12:700,13:750,14:700,25:1900,26:850,29:700,30:2300,
     38:2600,41:2500,48:3500,66:1700,70:1700,71:600,77:3700,78:3500,79:4700 };
   var RANGES = [[15,"15 m"],[60,"1 h"],[360,"6 h"],[1440,"24 h"]];
   var TICKSTEP = { 15:2, 60:10, 360:60, 1440:240 };
-  var PADL = 46, PADR = 12, BUS_H = 20;
+  var RECENT_USER_MS = 8000;
+  var PADL = 30, PADR = 12, BUS_H = 20, PLOT_H = 230;
 
   var component = {
     name: "mudimodem-tracking",
 
+    // `embedded` is set when the main Modem page renders us inside its own
+    // "Tracking" tab (vs. the standalone /mudimodem-tracking route). When
+    // embedded we drop the "← Modem" breadcrumb — the tab bar is right above us.
+    props: { embedded: { type: Boolean, default: false } },
+
     data: function () {
       return { winW: 60, pinnedM: null, tick: 0, live: true, width: 900,
-        styleId: "mmt-css", cursor: null, poll: null };
+        styleId: "mmt-css", cursor: null, poll: null,
+        samples: [], events: [], lastT: 0, serverNow: 0, serverNowAt: 0,
+        loading: true, err: "" };
     },
 
     computed: {
-      ms: function () {
-        var s = this.$store && this.$store.getters;
-        return (s && s.moduleStatus) ? s.moduleStatus : function () { return {}; };
-      },
-      modem: function () {
-        var modems = this.ms("cellular.modems_info").modems || [];
-        return modems.filter(function (m) { return m.type === 0; })[0] || modems[0] || {};
-      },
-      modemStatus: function () {
-        var self = this, modems = this.ms("cellular.modems_status").modems || [];
-        return modems.filter(function (m) { return m.bus === self.modem.bus; })[0] || modems[0] || {};
-      },
-      activeSlot: function () { return this.modemStatus.current_sim_slot; },
-      serving: function () {
-        var self = this, bus = this.modem.bus;
-        var nets = (this.ms("cellular.networks_info").networks || [])
-          .filter(function (n) { return !bus || n.bus == null || n.bus === bus; });
-        var net = nets.filter(function (n) { return String(n.slot) === String(self.activeSlot); })[0] || {};
-        return net.cell_info || {};
-      },
-      carrier: function () {
-        var self = this, sims = this.ms("cellular.sims_status").sims || [];
-        var s = sims.filter(function (x) { return String(x.slot) === String(self.activeSlot); })[0] || {};
-        return s.carrier || "";
-      },
-      // Reading `tick` here makes render() depend on our 1 Hz poll, so the
-      // (non-reactive) window ring buffer is re-read every second while live.
-      H: function () { this.tick; return (typeof window !== "undefined" && window.__mmHist) || null; }
+      // handover/failover ticks derived from the sample stream, merged with the
+      // server's user/watchdog events, newest last. Depends on `tick` for polling.
+      allEvents: function () {
+        this.tick;
+        var derived = this.deriveNetEvents(this.samples, this.events);
+        return this.events.concat(derived).sort(function (a, b) { return a.t - b.t; });
+      }
     },
 
     created: function () { this.injectStyle(); },
@@ -124,37 +74,99 @@ module.exports = (function () {
       this.parseHash();
       this._onResize = function () { self.measure(); };
       window.addEventListener("resize", this._onResize);
-      this.poll = setInterval(function () {
-        if (!self.live) return;
-        self.recordSample();
-        self.tick++;   // force re-render off the (non-reactive) ring buffer
-      }, 1000);
+      this.fetchHistory(false);
+      this.poll = setInterval(function () { if (self.live) self.fetchHistory(true); }, 10000);
     },
+    // Keep the viewBox width in sync with the rendered width. At mount the lanes
+    // element is usually absent (loading state), so the initial measure() no-ops
+    // and this.width stays at its default until data arrives and the SVG renders.
+    // Re-measuring here makes the SVG scale ≈ 1 (no stretched text) and keeps the
+    // pointer→time mapping exact. measure() only sets when clientWidth is truthy,
+    // and Vue skips the reactive write when unchanged, so this converges — no loop.
+    updated: function () { this.measure(); },
     beforeDestroy: function () {
       if (this.poll) clearInterval(this.poll);
       if (typeof window !== "undefined" && this._onResize) window.removeEventListener("resize", this._onResize);
     },
 
     methods: {
-      hist: function () {
-        if (typeof window === "undefined") return null;
-        return window.__mmHist || (window.__mmHist = makeMMHist());
+      // ---- data ----
+      // Post to /rpc via $axios DIRECTLY, not $rpcRequest. $rpcRequest's axios
+      // interceptor pops GL's global "Unknown error" banner on any 500 or
+      // JSON-RPC error BEFORE our .catch can run — unacceptable for a silent 10s
+      // background poll on a flaky cellular link (GL exempts only its own "alive"
+      // heartbeat). We handle the envelope ourselves and fail silently: a bad
+      // poll just retries next tick. Returns the result object, or null.
+      rpcSilent: function (method, params) {
+        if (typeof window === "undefined" || !window.$axios) return Promise.resolve(null);
+        var sid = (window.$getCookie && window.$getCookie("Admin-Token")) || "";
+        return window.$axios.post("/rpc", {
+          jsonrpc: "2.0", id: 1, method: "call",
+          params: [sid, "mudimodem", method, params || {}]
+        }, { timeout: 20000 })
+          .then(function (r) { return (r && r.data && r.data.result) || null; })
+          .catch(function () { return null; });
       },
+      fetchHistory: function (incremental) {
+        var self = this;
+        if (typeof window === "undefined" || !window.$axios) { self.loading = false; return; }
+        var since = incremental ? self.lastT : 0;
+        this.rpcSilent("get_history", { since: since })
+          .then(function (res) {
+            if (!res) { self.loading = false; if (!incremental) self.err = ""; return; }
+            var ns = res.samples || [], ne = res.events || [];
+            if (incremental) {
+              if (ns.length) self.samples = self.samples.concat(ns);
+              if (ne.length) self.events = self.events.concat(ne);
+            } else { self.samples = ns; self.events = ne; }
+            self.serverNow = res.now || Date.now();
+            self.serverNowAt = Date.now();
+            var cut = self.serverNow - 24 * 3600 * 1000;
+            self.samples = self.samples.filter(function (s) { return s.t >= cut; });
+            self.events = self.events.filter(function (e) { return e.t >= cut; });
+            if (self.samples.length) self.lastT = self.samples[self.samples.length - 1].t;
+            self.err = ""; self.loading = false; self.tick++;
+          })
+          .catch(function (e) {
+            self.err = (e && (e.type || e.message)) || "couldn't load history"; self.loading = false;
+          });
+      },
+      // pure: derive net (handover/failover) events from consecutive samples,
+      // suppressing any within RECENT_USER_MS of a known user/watchdog event so a
+      // change WE applied isn't double-counted as a network event.
+      deriveNetEvents: function (samples, known) {
+        var out = [], last = null;
+        var recentUser = function (t) {
+          for (var i = 0; i < known.length; i++)
+            if (Math.abs(known[i].t - t) <= RECENT_USER_MS &&
+                (known[i].kind === "user" || known[i].kind === "dog")) return true;
+          return false;
+        };
+        for (var i = 0; i < samples.length; i++) {
+          var s = samples[i];
+          if (last && !recentUser(s.t)) {
+            if (String(s.slot) !== String(last.slot)) {
+              out.push({ t: s.t, kind: "net", label: "Failover",
+                detail: "Data now on SIM " + s.slot + (s.carrier ? " · " + s.carrier : "") });
+            } else if (s.id != null && last.id != null && String(s.id) !== String(last.id)) {
+              out.push({ t: s.t, kind: "net", label: "Handover",
+                detail: "Cell " + last.id + " → " + s.id + (s.band != null ? " (" + s.band + ")" : "") });
+            }
+          }
+          last = s;
+        }
+        return out;
+      },
+
       measure: function () {
         if (this.$refs && this.$refs.lanes && this.$refs.lanes.clientWidth)
           this.width = this.$refs.lanes.clientWidth;
       },
-      nowMs: function () { return (typeof window !== "undefined") ? Date.now() : 0; },
-      num: function (v) { var n = parseFloat(v); return isNaN(n) ? null : n; },
-      recordSample: function () {
-        var H = this.hist(); if (!H) return;
-        var c = this.serving;
-        if (c.rsrp === undefined || c.rsrp === null || c.rsrp === "") return;
-        H.record({ slot: this.activeSlot, id: c.id, band: c.band, mode: c.mode,
-          rsrp: this.num(c.rsrp), sinr: this.num(c.sinr), rsrq: this.num(c.rsrq), rssi: this.num(c.rssi),
-          dl_bandwidth: c.dl_bandwidth, tx_channel: c.tx_channel,
-          rsrp_level: c.rsrp_level, sinr_level: c.sinr_level, rsrq_level: c.rsrq_level,
-          carrier: this.carrier });
+      // skew-corrected box-now: server clock advanced by browser elapsed time.
+      // Before the first fetch, fall back to the local clock (Date is universal).
+      nowMs: function () {
+        if (this.serverNow) return this.serverNow + (Date.now() - this.serverNowAt);
+        return Date.now();
       },
       qFromLevel: function (l) { return ({1:"poor",2:"fair",3:"good",4:"excellent"})[l] || "none"; },
       qColor: function (q) {
@@ -171,23 +183,19 @@ module.exports = (function () {
         return (s.band == null || s.band === "") ? "—" : pre + s.band;
       },
 
-      // absolute epoch-ms -> minute offset relative to now (<=0, now=0)
       mOf: function (t) { return -((this.nowMs() - t) / 60000); },
-      // minute offset -> x pixel
       xOf: function (m) {
         var plotW = this.width - PADL - PADR;
         return PADL + (m + this.winW) / this.winW * plotW;
       },
       winSamples: function () {
-        var H = this.H; if (!H) return [];
         var cutoff = this.nowMs() - this.winW * 60000, self = this;
-        return H.samples.filter(function (s) { return s.t >= cutoff; })
+        return this.samples.filter(function (s) { return s.t >= cutoff; })
           .map(function (s) { return Object.assign({ m: self.mOf(s.t) }, s); });
       },
       winEvents: function () {
-        var H = this.H; if (!H) return [];
         var cutoff = this.nowMs() - this.winW * 60000, self = this;
-        return H.events.filter(function (e) { return e.t >= cutoff; })
+        return this.allEvents.filter(function (e) { return e.t >= cutoff; })
           .map(function (e) { return Object.assign({ m: self.mOf(e.t) }, e); });
       },
       nearestSample: function (m) {
@@ -197,7 +205,6 @@ module.exports = (function () {
           if (Math.abs(ss[i].m - m) < Math.abs(best.m - m)) best = ss[i];
         return best;
       },
-      // contiguous runs of a bus key across the windowed samples
       busRuns: function (key) {
         var ss = this.winSamples(), runs = [], self = this;
         var label = function (s) {
@@ -210,15 +217,23 @@ module.exports = (function () {
           if (lastRun && lastRun.v === v) lastRun.m1 = ss[i].m;
           else { if (lastRun) lastRun.m1 = ss[i].m; runs.push({ v: v, m0: ss[i].m, m1: ss[i].m, s: ss[i] }); }
         }
-        if (runs.length) runs[runs.length - 1].m1 = 0;   // extend last run to now
+        if (runs.length) runs[runs.length - 1].m1 = 0;
         return runs;
       },
 
       // ---- interaction ----
       mFromEvent: function (e) {
         var el = this.$refs.lanes; if (!el) return null;
-        var r = el.getBoundingClientRect(), plotW = this.width - PADL - PADR;
-        return -this.winW + (e.clientX - r.left - PADL) / plotW * this.winW;
+        var r = el.getBoundingClientRect(); if (!r.width) return null;
+        // clientX is CSS px within the container; the SVG scales its viewBox
+        // (this.width user-units) to the container's rendered width (width:100%).
+        // Convert CSS px -> viewBox units before applying the plot geometry, so
+        // the cursor tracks the mouse even when this.width != rendered width
+        // (e.g. embedded, before measure() catches up). Otherwise the drawn line
+        // (xOf, in viewBox units) drifts right of the pointer.
+        var ux = (e.clientX - r.left) * this.width / r.width;
+        var plotW = this.width - PADL - PADR;
+        return -this.winW + (ux - PADL) / plotW * this.winW;
       },
       clampM: function (m) { return Math.max(-this.winW, Math.min(0, m)); },
       onMove: function (e) {
@@ -247,45 +262,52 @@ module.exports = (function () {
 
       // ---- render helpers ----
       renderLanes: function (h) {
-        var self = this, W = this.width, kids = [], y = 16, laneY = {};
+        var self = this, W = this.width, kids = [];
         var ss = this.winSamples();
+
+        // ---- legend: one swatch + name + domain range per metric. A single
+        // shared Y-axis can't label three scales, so the ranges live here; exact
+        // per-sample values are in the hover readout.
+        var lx = PADL;
         LINES.forEach(function (L) {
-          laneY[L.key] = y;
+          var lab = L.label + "  " + L.dom[0] + "…" + L.dom[1];
+          kids.push(h("rect", { attrs: { x: lx, y: 3, width: 13, height: 3, rx: 1.5, fill: L.color } }));
+          kids.push(h("text", { attrs: { x: lx + 18, y: 9, "font-size": 9.5,
+            fill: "var(--text-badge)" } }, lab));
+          lx += 18 + String(lab).length * 5.7 + 20;
+        });
+
+        // ---- one shared plot rectangle; each metric normalized into it.
+        var plotTop = 22, plotBot = plotTop + PLOT_H;
+        [plotTop, plotBot].forEach(function (yy) {
+          kids.push(h("line", { attrs: { x1: PADL, x2: W - PADR, y1: yy, y2: yy,
+            stroke: "var(--divider)", "stroke-width": 1 } }));
+        });
+        kids.push(h("line", { attrs: { x1: PADL, x2: W - PADR,
+          y1: plotTop + PLOT_H / 2, y2: plotTop + PLOT_H / 2,
+          stroke: "var(--divider)", "stroke-width": 1, "stroke-dasharray": "2 3" } }));
+
+        LINES.forEach(function (L) {
           var d0 = L.dom[0], d1 = L.dom[1];
-          var yv = function (v) { return y + L.h - (Math.max(d0, Math.min(d1, v)) - d0) / (d1 - d0) * L.h; };
-          kids.push(h("text", { attrs: { x: 8, y: y - 5, "font-size": 9, fill: "var(--text-badge)" } }, L.label));
-          [y, y + L.h].forEach(function (yy) {
-            kids.push(h("line", { attrs: { x1: PADL, x2: W - PADR, y1: yy, y2: yy,
-              stroke: "var(--divider)", "stroke-width": 1 } }));
-          });
-          kids.push(h("line", { attrs: { x1: PADL, x2: W - PADR, y1: yv(L.mid), y2: yv(L.mid),
-            stroke: "var(--divider)", "stroke-width": 1, "stroke-dasharray": "2 3" } }));
-          [[d1, y], [d0, y + L.h], [L.mid, yv(L.mid)]].forEach(function (p) {
-            kids.push(h("text", { attrs: { x: PADL - 4, y: p[1] + 3, "text-anchor": "end",
-              "font-size": 8, fill: "var(--text-hint)" } }, String(p[0])));
-          });
-          var run = [], runQ = null;
-          var flush = function () {
-            if (run.length > 1) kids.push(h("path", { attrs: { fill: "none", stroke: self.qColor(runQ),
-              "stroke-width": 1.75, "stroke-linejoin": "round", "stroke-linecap": "round",
-              d: "M" + run.join("L") } }));
-            run = [];
+          var yv = function (v) {
+            return plotBot - (Math.max(d0, Math.min(d1, v)) - d0) / (d1 - d0) * PLOT_H;
           };
+          var d = "", pen = false;                       // one path per metric
           ss.forEach(function (s) {
             var v = s[L.key];
-            if (v == null) { flush(); runQ = null; return; }
-            var q = self.qFromLevel(s[L.lvl]);
-            var pt = self.xOf(s.m).toFixed(1) + " " + yv(v).toFixed(1);
-            if (runQ !== null && q !== runQ) { run.push(pt); flush(); }
-            runQ = q; run.push(pt);
+            if (v == null) { pen = false; return; }       // break into a gap
+            d += (pen ? "L" : "M") + self.xOf(s.m).toFixed(1) + " " + yv(v).toFixed(1) + " ";
+            pen = true;
           });
-          flush();
-          y += L.h + 22;
+          if (d) kids.push(h("path", { attrs: { fill: "none", stroke: L.color,
+            "stroke-width": 1.75, "stroke-linejoin": "round", "stroke-linecap": "round",
+            d: d.trim() } }));
         });
-        y += 2;
+
+        // ---- buses below the plot (unchanged layout, new origin).
+        var y = plotBot + 12;
         BUSES.forEach(function (B) {
-          laneY[B.key] = y;
-          kids.push(h("text", { attrs: { x: 8, y: y + BUS_H / 2 + 3, "font-size": 9,
+          kids.push(h("text", { attrs: { x: 6, y: y + BUS_H / 2 + 3, "font-size": 9,
             fill: "var(--text-badge)" } }, B.label));
           self.busRuns(B.key).forEach(function (r) {
             var x0 = Math.max(PADL, self.xOf(r.m0)), x1 = Math.min(W - PADR, self.xOf(r.m1));
@@ -301,7 +323,7 @@ module.exports = (function () {
           });
           y += BUS_H + 7;
         });
-        var evTop = laneY.rsrp, evBot = y - 7;
+        var evTop = plotTop, evBot = y - 7;
         this.winEvents().forEach(function (e) {
           var col = e.kind === "user" ? "var(--primary)" : e.kind === "dog" ? "var(--warning)" : "var(--text-hint)";
           var ex = self.xOf(e.m);
@@ -324,7 +346,14 @@ module.exports = (function () {
             stroke: this.pinnedM != null ? "var(--primary)" : "var(--text-weak)",
             "stroke-width": this.pinnedM != null ? 1.25 : 1 } }));
         }
-        return h("svg", { ref: "svg", attrs: { viewBox: "0 0 " + W + " " + y, width: W, height: y } }, kids);
+        // preserveAspectRatio:none — STRETCH the viewBox to fill the container
+        // width (CSS width:100%). The default "meet" would uniformly scale and
+        // CENTRE the content (elemH == viewBox H makes its scale 1), so whenever
+        // this.width != the rendered width the cursor line lags the pointer
+        // toward both edges. "none" keeps X mapping = rendered/viewBox, matching
+        // mFromEvent's inverse. (Y is unaffected: elemH == viewBox H already.)
+        return h("svg", { ref: "svg", attrs: { viewBox: "0 0 " + W + " " + y,
+          width: W, height: y, preserveAspectRatio: "none" } }, kids);
       },
       sliceReadout: function (h) {
         var s = this.nearestSample(this.cursor); if (!s) return null;
@@ -357,8 +386,8 @@ module.exports = (function () {
         return h("div", { staticClass: "mmt-tip", staticStyle: { left: Math.max(4, left) + "px" } }, kids);
       },
       renderLog: function (h) {
-        var self = this, H = this.H;
-        var evs = (H ? H.events.slice() : []).reverse();
+        var self = this;
+        var evs = this.allEvents.slice().reverse();
         var rows = evs.map(function (e, i) {
           var src = { user: "You", dog: "Watchdog", net: "Network" }[e.kind];
           return h("tr", { key: i }, [
@@ -381,13 +410,13 @@ module.exports = (function () {
         ]);
       },
       renderPage: function (h) {
-        var self = this, H = this.H;
-        var hasData = !!(H && this.winSamples().length > 0);
+        var self = this;
+        var hasData = this.winSamples().length > 0;
         var head = h("div", { staticClass: "mmt-head" }, [
-          h("button", { staticClass: "mmt-crumb", on: { click: function () {
+          this.embedded ? null : h("button", { staticClass: "mmt-crumb", on: { click: function () {
             if (self.$router) self.$router.push("/mudimodem"); } } }, "← Modem"),
           h("span", { staticClass: "mmt-title" }, "Tracking"),
-          h("span", { staticClass: "mmt-hint" }, "one clock, every lane — hover for a slice, click to pin"),
+          h("span", { staticClass: "mmt-hint" }, "one clock, all three metrics — hover for a slice, click to pin"),
           h("span", { staticClass: "mmt-sp" }),
           h("span", { staticClass: "mmt-seg" }, RANGES.map(function (r) {
             return h("button", { key: r[0], staticClass: self.winW === r[0] ? "on" : "",
@@ -397,13 +426,18 @@ module.exports = (function () {
             on: { click: function () { self.live = !self.live; } } },
             [h("span", { staticClass: "d" }), self.live ? "LIVE" : "PAUSED"])
         ]);
-        var body = hasData
-          ? h("div", { ref: "lanes", staticClass: "mmt-lanes",
-              on: { mousemove: this.onMove, mouseleave: this.onLeave, click: this.onClick } },
-              [this.renderLanes(h), this.cursor != null ? this.sliceReadout(h) : null])
-          : h("div", { staticClass: "mmt-empty" }, [
-              "Collecting modem history in this browser session.", h("br"),
-              (H ? "Since " + this.clock(H.startedAt) + " · " : ""), "reloading the page clears it."]);
+        var body;
+        if (hasData) {
+          body = h("div", { ref: "lanes", staticClass: "mmt-lanes",
+            on: { mousemove: this.onMove, mouseleave: this.onLeave, click: this.onClick } },
+            [this.renderLanes(h), this.cursor != null ? this.sliceReadout(h) : null]);
+        } else {
+          var msg = this.err ? "Couldn't load history: " + this.err
+            : this.loading ? "Loading history from the router…"
+            : "No samples yet. The collector runs on the router and gathers continuously — "
+              + "check back in a minute, or confirm the mudimodem-collectd service is running.";
+          body = h("div", { staticClass: "mmt-empty" }, msg);
+        }
         var foot = h("div", { staticClass: "mmt-foot" }, [
           h("span", { staticClass: "mmt-lg" }, "■ You"),
           h("span", { staticClass: "mmt-lg" }, "▲ Watchdog"),
@@ -458,6 +492,5 @@ module.exports = (function () {
 
     render: function (h) { return this.renderPage(h); }
   };
-  component.makeMMHist = makeMMHist;   // exposed for tests (harmless Vue option)
   return component;
 })();
