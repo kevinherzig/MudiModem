@@ -128,6 +128,13 @@ class ATChannel:
                         self.lockf = None
                         raise ChannelBusy()
                     time.sleep(0.2)
+            # Only NOW do we exclusively hold the lock, so any gl_modem still
+            # in state T is provably stale (a live holder would be inside its
+            # own GlModemSleep, and a dead one's flock auto-releases on close)
+            # — this is the only safe moment to recover it. Recovering before
+            # acquiring the lock would race a legitimately-stopped gl_modem
+            # under another worker's in-flight send.
+            recover_stopped()
         # BLOCKING open (non-blocking writes return EBUSY on this SMD channel);
         # reads are gated by select() for the timeout.
         try:
@@ -217,7 +224,6 @@ def main(argv):
               " [--lock PATH] [--lock-wait S] [--no-glsleep] CMD...", file=sys.stderr)
         return 1
 
-    recover_stopped()
     t0 = time.time()
 
     def ms():
@@ -239,18 +245,31 @@ def main(argv):
         return 3
 
     try:
-        with GlModemSleep(glsleep):
-            if envelope:
-                resp, ok = ch.send(cmds[0], timeout)
-                print("MM-AT:%s:%d" % ("ok" if ok else "timeout", ms()))
-                sys.stdout.write(resp)
+        try:
+            with GlModemSleep(glsleep):
+                if envelope:
+                    resp, ok = ch.send(cmds[0], timeout)
+                    print("MM-AT:%s:%d" % ("ok" if ok else "timeout", ms()))
+                    sys.stdout.write(resp)
+                    return 0
+                for cmd in cmds:
+                    t1 = time.time()
+                    for l in ch.lines(cmd, timeout):
+                        print("    " + l)
+                    print(">>> %s   (%.2fs)" % (cmd, time.time() - t1))
                 return 0
-            for cmd in cmds:
-                t1 = time.time()
-                for l in ch.lines(cmd, timeout):
-                    print("    " + l)
-                print(">>> %s   (%.2fs)" % (cmd, time.time() - t1))
-            return 0
+        except OSError as e:
+            # e.g. os.write() failing mid-send (port yanked, EIO, ...). The
+            # GlModemSleep context above has already unwound (its __exit__
+            # ran and resumed gl_modem) by the time we get here, since it
+            # does not suppress the exception. Still must yield a defined
+            # envelope line + an exit code in {0,2,3} — never let a bare
+            # traceback replace stdout line 1 that Task 2's Lua parses.
+            if envelope:
+                print("MM-AT:openfail:%d" % ms())
+            else:
+                print("send failed: %s" % e, file=sys.stderr)
+            return 3
     finally:
         ch.close()
 

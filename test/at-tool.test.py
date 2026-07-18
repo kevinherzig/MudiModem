@@ -2,7 +2,7 @@
 """Local tests for tools/mudimodem-at.py. No modem needed: a pty plays the
 modem (raw mode, so no line-discipline mangling; the tool never does termios,
 matching the real /dev/at_mdm0 which is not a tty)."""
-import importlib.util, os, subprocess, sys, tempfile, threading, time, tty, unittest
+import contextlib, importlib.util, io, os, subprocess, sys, tempfile, threading, time, tty, unittest
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
 TOOL = os.path.join(ROOT, "tools", "mudimodem-at.py")
@@ -116,6 +116,71 @@ class ATToolTest(unittest.TestCase):
             holder.close()
         self.assertEqual(r.returncode, 2)
         self.assertRegex(r.stdout.splitlines()[0], r"^MM-AT:busy:\d+$")
+
+    def test_recover_stopped_runs_only_after_lock_acquired(self):
+        """Fix 1: recovering a stale-stopped gl_modem must happen only once
+        THIS process exclusively holds the flock — not before contending for
+        it. Recovering earlier would race a legitimately-stopped gl_modem
+        that another worker has SIGSTOPped for its own in-flight send."""
+        fm = FakeModem()
+        calls = []
+        orig_pids, orig_state, orig_kill = mm.gl_modem_pids, mm.proc_state, mm.os.kill
+        mm.gl_modem_pids = lambda: [4242]
+        mm.proc_state = lambda pid: "T"
+        mm.os.kill = lambda pid, sig: calls.append((pid, sig))
+        try:
+            # (a) Opening the FIRST channel acquires the lock -> recovery
+            # of the (faked) stale-stopped gl_modem must run.
+            ch = mm.ATChannel(port=fm.path, lock=self.lock)
+            try:
+                self.assertIn((4242, mm.signal.SIGCONT), calls,
+                              "lock holder must recover a stale-stopped gl_modem")
+            finally:
+                ch.close()
+
+            # (b) While a holder legitimately has the lock, a contending
+            # open must fail with ChannelBusy and must NEVER have issued
+            # SIGCONT during its own failed attempt — only the process that
+            # actually acquires the lock may recover.
+            holder = mm.ATChannel(port=fm.path, lock=self.lock)
+            try:
+                calls.clear()
+                with self.assertRaises(mm.ChannelBusy):
+                    mm.ATChannel(port=fm.path, lock=self.lock, lock_wait=0.3)
+                self.assertEqual(calls, [],
+                                  "a busy/failed open must not SIGCONT gl_modem")
+            finally:
+                holder.close()
+        finally:
+            mm.gl_modem_pids, mm.proc_state, mm.os.kill = orig_pids, orig_state, orig_kill
+
+    def test_write_failure_yields_defined_envelope(self):
+        """Fix 2: an OSError from the initial os.write() inside send() must
+        not escape main() as a bare traceback — it must still print a
+        parseable MM-AT: line and return an exit code in {0,2,3}, and
+        specifically openfail/3 since the command was never actually sent."""
+        fm = FakeModem()
+        orig_write = mm.os.write
+
+        def boom(fd, data):
+            raise OSError("simulated write failure")
+
+        mm.os.write = boom
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = mm.main(["--envelope", "--timeout", "2",
+                              "--port", fm.path, "--lock", self.lock,
+                              "--no-glsleep", "AT"])
+        finally:
+            mm.os.write = orig_write
+        out = buf.getvalue()
+        lines = out.splitlines()
+        self.assertTrue(lines, "must still print an MM-AT: envelope line")
+        self.assertRegex(lines[0], r"^MM-AT:(ok|timeout|busy|openfail):\d+$")
+        self.assertIn(rc, (0, 2, 3))
+        self.assertEqual(rc, 3, "unsendable command must be openfail, not a silent 0")
+        self.assertTrue(lines[0].startswith("MM-AT:openfail:"))
 
 
 if __name__ == "__main__":
