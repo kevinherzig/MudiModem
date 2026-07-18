@@ -349,3 +349,18 @@ test('the write calls target the watchdog-protected methods only', () => {
   assert.doesNotMatch(src, /get_result_AT|modem\.CPU\.AT|QNWPREFCFG/,
     'the chunk must never issue raw AT — writes go through the backend');
 });
+
+test('AT console is an in-page tab: lazy-loads its own chunk', () => {
+  const src = fs.readFileSync(SRC, 'utf8');
+  assert.match(src, /gl-sdk4-ui-mudimodem-console\.common\.js/, 'lazy-loads the console chunk');
+  const c = loadChunk();
+  const vm = makeVm(c, LIVE);
+  vm.tab = 'at';
+  const txt = textOf(c.render.call(vm, h));
+  assert.match(txt, /Loading the AT console/, 'loading state before the chunk arrives');
+  assert.doesNotMatch(txt, /Phase 3/, 'placeholder copy is gone');
+  const fake = { name: 'mudimodem-console', render() {} };
+  vm.consoleComp = fake;
+  const node = walk(c.render.call(vm, h)).find((n) => n.tag === fake);
+  assert.ok(node, 'renders the loaded console component as a child vnode');
+});
