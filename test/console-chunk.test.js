@@ -230,6 +230,92 @@ test('arrow-up recalls history', () => {
   assert.strictEqual(vm.prompt, 'AT');
 });
 
+test('send(): resolved {error} is treated as failure, not success', async () => {
+  const c = loadChunk();
+  const vm = makeVm(c, {});
+  vm.lib = LIB;
+  const saved = global.window;
+  try {
+    global.window = { $rpcRequest: () => Promise.resolve({ error: 'channel busy - another command in flight' }) };
+    vm.prompt = 'ATI'; vm.selId = null;
+    vm.send();
+    await new Promise((r) => setTimeout(r, 0));   // let the .then microtask drain
+    const last = vm.lines[vm.lines.length - 1];
+    assert.strictEqual(last.kind, 'err');
+    assert.match(last.text, /channel busy/);
+    // must NOT have pushed a resp/ok line for a resolved {error}
+    assert.ok(!vm.lines.some((l) => l.kind === 'ok' || l.kind === 'resp'));
+  } finally { global.window = saved; }
+});
+
+test('send(): success response is classified into resp/ok lines', async () => {
+  const c = loadChunk();
+  const vm = makeVm(c, {});
+  vm.lib = LIB;
+  const saved = global.window;
+  try {
+    global.window = {
+      $rpcRequest: () => Promise.resolve({
+        ok: true, status: 'ok', response: '+QSPN: "T-Mobile"\r\nOK\r\n', elapsed_ms: 12
+      })
+    };
+    vm.prompt = 'AT+QSPN?'; vm.selId = null;
+    vm.send();
+    await new Promise((r) => setTimeout(r, 0));
+    assert.ok(vm.lines.some((l) => l.kind === 'resp' && /\+QSPN/.test(l.text)),
+      'response line classified as resp');
+    assert.ok(vm.lines.some((l) => l.kind === 'ok' && l.text === 'OK'),
+      'OK line classified as ok');
+    assert.ok(!vm.lines.some((l) => l.kind === 'err'), 'no error line on success');
+  } finally { global.window = saved; }
+});
+
+test('send(): status "timeout" pushes a "no terminator" error line', async () => {
+  const c = loadChunk();
+  const vm = makeVm(c, {});
+  vm.lib = LIB;
+  const saved = global.window;
+  try {
+    global.window = {
+      $rpcRequest: () => Promise.resolve({ ok: true, status: 'timeout', response: '' })
+    };
+    vm.prompt = 'AT+SOMETHINGSLOW'; vm.selId = null;
+    vm.send();
+    await new Promise((r) => setTimeout(r, 0));
+    const err = vm.lines.find((l) => l.kind === 'err');
+    assert.ok(err, 'timeout produced an error line');
+    assert.match(err.text, /no terminator/);
+  } finally { global.window = saved; }
+});
+
+test('send(): a rejected RPC promise surfaces an error line', async () => {
+  const c = loadChunk();
+  const vm = makeVm(c, {});
+  vm.lib = LIB;
+  const saved = global.window;
+  try {
+    global.window = { $rpcRequest: () => Promise.reject({ type: 'accessDenied' }) };
+    vm.prompt = 'ATI'; vm.selId = null;
+    vm.send();
+    await new Promise((r) => setTimeout(r, 0));
+    const last = vm.lines[vm.lines.length - 1];
+    assert.strictEqual(last.kind, 'err');
+    assert.match(last.text, /accessDenied/);
+  } finally { global.window = saved; }
+});
+
+test('onPromptInput: hand-editing away from the picked entry drops selId to free-typed', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, {});
+  vm.lib = LIB;
+  vm.pick(LIB[0]);                        // no-param entry: prompt filled with its cmd
+  assert.strictEqual(vm.selId, LIB[0].id);
+  vm.onPromptInput(LIB[0].cmd);           // unchanged text — still the entry's own command
+  assert.strictEqual(vm.selId, LIB[0].id, 'selection kept while text matches the entry cmd');
+  vm.onPromptInput('AT+SOMETHINGELSE');   // hand-edited away
+  assert.strictEqual(vm.selId, null, 'edited away from the entry cmd -> free-typed');
+});
+
 test('the chunk speaks only at_console — never GL AT paths', () => {
   const src = fs.readFileSync(SRC, 'utf8');
   assert.match(src, /"at_console"/, 'sends via mudimodem.at_console');
