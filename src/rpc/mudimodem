@@ -757,37 +757,67 @@ end
 local AT_TOOL = os.getenv("MUDIMODEM_AT_TOOL") or "/usr/lib/mudimodem/mudimodem-at.py"
 
 function M.at_console(args)
-  local cmd = args and args.cmd
-  if type(cmd) ~= "string" then return { error = "cmd required" } end
-  -- One command per send: collapse CR/LF, trim. Raw otherwise (it's a console).
-  cmd = cmd:gsub("[\r\n]+", " "):match("^%s*(.-)%s*$")
-  if cmd == "" then return { error = "cmd required" } end
-  if #cmd > 256 then return { error = "command too long (max 256 chars)" } end
+  local raw = args and args.cmd
+  if type(raw) ~= "string" then return { error = "cmd required" } end
+  -- Split into steps on newlines; trim each, drop blanks. (Was: collapse to a
+  -- space. Now each line is its own AT command in one held channel window.)
+  local steps = {}
+  for line in (raw .. "\n"):gmatch("(.-)\n") do
+    line = line:gsub("[\r]+", ""):match("^%s*(.-)%s*$")
+    if line ~= "" then steps[#steps + 1] = line end
+  end
+  if #steps == 0 then return { error = "cmd required" } end
+  if #steps > 8 then return { error = "too many steps (max 8)" } end
+  for _, s in ipairs(steps) do
+    if #s > 256 then return { error = "command too long (max 256 chars)" } end
+  end
+
   local timeout = tonumber(args and args.timeout) or 8
   if timeout < 1 then timeout = 1 end
   if timeout > 60 then timeout = 60 end
   timeout = math.floor(timeout)
 
-  -- POSIX shell single-quote escaping: ' -> '\''. AT_TOOL is operator config,
-  -- not request input, so this isn't exploitable — quoted for consistency.
-  local quoted = "'" .. cmd:gsub("'", "'\\''") .. "'"
-  local quoted_tool = "'" .. AT_TOOL:gsub("'", "'\\''") .. "'"
-  local f = io.popen("python3 " .. quoted_tool .. " --envelope --timeout " ..
-                     timeout .. " " .. quoted .. " 2>/dev/null")
+  -- POSIX single-quote escaping: ' -> '\''. Build one invocation, all steps.
+  local function q(s) return "'" .. s:gsub("'", "'\\''") .. "'" end
+  local parts = { "python3", q(AT_TOOL), "--envelope", "--timeout", tostring(timeout) }
+  for _, s in ipairs(steps) do parts[#parts + 1] = q(s) end
+  local f = io.popen(table.concat(parts, " ") .. " 2>/dev/null")
   if not f then return { error = "failed to spawn the AT tool" } end
   local out = f:read("*a") or ""
   f:close()
 
-  local status, ms, rest = out:match("^MM%-AT:(%w+):(%d+)\r?\n?(.*)$")
-  if not status then
+  -- Channel-level failure: a 2-field frame (no /count) as the first line.
+  local cstatus = out:match("^MM%-AT:(%w+):%d+%s*\n") or out:match("^MM%-AT:(%w+):%d+%s*$")
+  if cstatus == "busy" then return { error = "channel busy - another command in flight" } end
+  if cstatus == "openfail" then return { error = "cannot open the AT port (/dev/at_mdm0)" } end
+
+  -- Parse per-step frames: header line then response lines up to the next header.
+  local out_steps, cur = {}, nil
+  for line in (out .. "\n"):gmatch("(.-)\n") do
+    local st, msv, idx, cnt = line:match("^MM%-AT:(%w+):(%d+):(%d+)/(%d+)$")
+    if st then
+      cur = { status = st, elapsed_ms = tonumber(msv), idx = tonumber(idx),
+              count = tonumber(cnt), response = "" }
+      out_steps[#out_steps + 1] = cur
+    elseif cur then
+      cur.response = cur.response .. line .. "\n"
+    end
+  end
+
+  if #out_steps == 0 then
     return { error = "AT tool returned no envelope (is " .. AT_TOOL .. " deployed?)" }
   end
-  if status == "busy" then return { error = "channel busy - another command in flight" } end
-  if status == "openfail" then return { error = "cannot open the AT port (/dev/at_mdm0)" } end
-  if status == "ok" or status == "timeout" then
-    return { ok = true, status = status, response = rest, elapsed_ms = tonumber(ms) }
+
+  local result = { ok = true, requested = #steps, ran = #out_steps,
+                   aborted = (#out_steps < #steps), steps = {} }
+  for i, s in ipairs(out_steps) do
+    if s.status ~= "ok" and s.status ~= "error" and s.status ~= "timeout" then
+      return { error = "AT tool returned unexpected status: " .. s.status }
+    end
+    result.steps[i] = { cmd = steps[i] or "", status = s.status,
+                        response = s.response, elapsed_ms = s.elapsed_ms }
   end
-  return { error = "AT tool returned unexpected status: " .. status }
+  return result
 end
 
 return M
