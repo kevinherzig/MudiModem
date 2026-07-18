@@ -348,6 +348,112 @@ function M.get_lock(args)
   }
 end
 
+-- SCAN: GL's full network scan (AT+QSCAN under the hood). DISRUPTIVE — the
+-- modem leaves the serving cell for up to ~10 minutes. The UI gates this
+-- behind an explicit warning; never call it as part of a read.
+function M.scan_cells(args)
+  local _, _, _, slot = resolve_active()
+  local res, err = glc("modem", "scan_cell_tower", { bus = "cpu", slot = tonumber(slot) or 1 })
+  if not res then return { error = "scan failed: " .. tostring(err) } end
+  append_event("user", "Cell scan", "")
+  return { towers = arr(res.towers or {}), ts = os.time() * 1000 }
+end
+
+-- WRITE: lock to one cell via GL's stack, protected by confirm-or-revert.
+-- args = { rat="4g"|"5g", pci, freq, scs?, band?, extra? } — extra is an
+-- optional table of passthrough tower fields (cellid, carrier, mcc, mnc, …)
+-- from a scan row, forwarded verbatim so GL stores what it scanned.
+function M.set_cell_lock(args)
+  local rat = args and args.rat
+  if rat ~= "4g" and rat ~= "5g" then return { error = "rat must be '4g' or '5g'" } end
+  local function int(v)
+    local n = tonumber(v)
+    if n and n >= 0 and n == math.floor(n) then return n end
+  end
+  local pci, freq = int(args.pci), int(args.freq)
+  if not pci or not freq then return { error = "pci and freq are required integers" } end
+  local scs, band = int(args.scs), int(args.band)
+  if rat == "5g" and (not scs or not band) then
+    return { error = "a 5g lock needs scs and band" }
+  end
+  if file_exists(PENDING) then
+    return { error = "another change is pending; keep or revert it first" }
+  end
+
+  local sub_id, _, _, slot = resolve_active()
+
+  -- One lock at a time (keeps the revert target = "unlocked", always).
+  local l4 = parse_qnwlock4(at_expect('AT+QNWLOCK="common/4g"', '"common/4g"', sub_id))
+  local l5 = parse_qnwlock5(at_expect('AT+QNWLOCK="common/5g"', '"common/5g"', sub_id))
+  if (l4 and l4.locked) or (l5 and l5.locked) then
+    return { error = "a cell lock is already set; unlock first" }
+  end
+
+  -- Snapshot the revert target: current save_ctrl + mode prefs (GL's lock
+  -- changes mode_pref / nr5g_disable_mode as a side effect — spec §0).
+  local sc = parse_savectrl(at_expect('AT+QNWLOCK="save_ctrl"', '"save_ctrl"', sub_id))
+  local mblob = at('AT+QNWPREFCFG="mode_pref"', sub_id)
+  local pmode = (mblob and mblob:match('"mode_pref",([%w:]+)')) or ""
+  local dblob = at('AT+QNWPREFCFG="nr5g_disable_mode"', sub_id)
+  local pdis = (dblob and dblob:match('"nr5g_disable_mode",(%d+)')) or ""
+
+  os.execute("mkdir -p /etc/mudimodem 2>/dev/null")
+  local f = io.open(PENDING, "w")
+  if not f then return { error = "cannot write pending state" } end
+  f:write(table.concat({
+    "KIND=cell", "SUB_ID=" .. sub_id, "SLOT=" .. tostring(slot), "RAT=" .. rat,
+    "PREV_SAVE_CTRL=" .. ((sc and sc.raw) or ""),
+    "PREV_mode_pref=" .. pmode,
+    "PREV_nr5g_disable_mode=" .. pdis,
+  }, "\n") .. "\n")
+  f:close()
+
+  -- Arm the watchdog; no arm, no write (same interlock as set_bands).
+  os.remove(ARMED)
+  os.execute(REVERT_BIN .. " watch >/dev/null 2>&1 &")
+  os.execute("sleep 1")
+  if not file_exists(ARMED) then
+    os.remove(PENDING)
+    return { error = "revert watchdog failed to arm; no change written" }
+  end
+
+  -- Write through GL so its store and the modem agree (spec §3).
+  local payload = { bus = "cpu", slot = tonumber(slot) or 1, lock = true,
+                    network_type = (rat == "5g") and "NR5G" or "LTE",
+                    pci = pci, freq = freq }
+  if rat == "5g" then payload.scs = scs; payload.band = band
+  elseif band then payload.band = band end
+  if type(args.extra) == "table" then
+    for k, v in pairs(args.extra) do
+      if payload[k] == nil then payload[k] = v end
+    end
+  end
+  local res, err = glc("modem", "set_cell_tower", payload)
+  if not res then
+    os.remove(PENDING)          -- nothing was written; stand the watchdog down
+    return { error = "GL lock call failed: " .. tostring(err) }
+  end
+
+  append_event("user", "Cell lock applied",
+    rat .. " pci " .. pci .. " freq " .. freq .. (band and (" band " .. band) or ""))
+  return { ok = true, window = 60, sub_id = sub_id,
+           applied = { rat = rat, pci = pci, freq = freq, scs = scs, band = band } }
+end
+
+-- Unlock (risk-reducing — no revert window). Also the stale-store reconciler.
+function M.clear_cell_lock(args)
+  local _, _, _, slot = resolve_active()
+  local gl = glc("modem", "get_cell_tower", { bus = "cpu" })
+  local tower = (gl and gl["slot" .. tostring(slot)]) or {}
+  local payload = { bus = "cpu", slot = tonumber(slot) or 1, lock = false }
+  for k, v in pairs(tower) do if payload[k] == nil then payload[k] = v end end
+  local res, err = glc("modem", "set_cell_tower", payload)
+  if not res then return { error = "GL unlock failed: " .. tostring(err) } end
+  os.remove(STALE)
+  append_event("user", "Cell lock cleared", "")
+  return { ok = true }
+end
+
 -- WRITE: set band allowlists and/or the network mode, protected by
 -- confirm-or-revert. args = { sa={..}, nsa={..}, lte={..}, mode="AUTO"|"NR5G"|"LTE" }
 -- — each optional; any provided band list must be non-empty. Returns
@@ -377,6 +483,10 @@ function M.set_bands(args)
     return { error = "invalid mode: " .. tostring(mode) }
   end
   if #changes == 0 and not mode then return { error = "no changes provided" } end
+
+  if file_exists(PENDING) then
+    return { error = "another change is pending; keep or revert it first" }
+  end
 
   local sub_id, _, _, slot = resolve_active()
 
@@ -463,6 +573,14 @@ end
 --      (reference §11). Our raw-AT write already made it live, so nothing
 --      re-registers here.
 function M.confirm(args)
+  if pending_get("KIND") == "cell" then
+    -- GL wrote its own store when the lock was applied; keeping it needs no
+    -- Path-B commit — just stand the watchdog down.
+    os.remove(PENDING)
+    append_event("user", "Kept", "Cell lock confirmed")
+    return { ok = true, confirmed = true, durable = true }
+  end
+
   local slot = pending_get("SLOT")
   local durable = false
 
@@ -519,6 +637,27 @@ end
 -- nothing to do. Same restore the watchdog would perform on timeout.
 function M.revert_now(args)
   if not file_exists(PENDING) then return { ok = true, note = "nothing pending" } end
+
+  if pending_get("KIND") == "cell" then
+    local slot = tonumber(pending_get("SLOT")) or 1
+    local sub  = tonumber(pending_get("SUB_ID")) or 1
+    local gl = glc("modem", "get_cell_tower", { bus = "cpu" })
+    local tower = (gl and gl["slot" .. slot]) or {}
+    local payload = { bus = "cpu", slot = slot, lock = false }
+    for k, v in pairs(tower) do if payload[k] == nil then payload[k] = v end end
+    glc("modem", "set_cell_tower", payload)          -- clean GL-level unlock
+    local pm = pending_get("PREV_mode_pref")
+    if pm and pm ~= "" then at('AT+QNWPREFCFG="mode_pref",' .. pm, sub) end
+    local pd = pending_get("PREV_nr5g_disable_mode")
+    if pd and pd ~= "" then at('AT+QNWPREFCFG="nr5g_disable_mode",' .. pd, sub) end
+    local psc = pending_get("PREV_SAVE_CTRL")
+    if psc and psc ~= "" then at('AT+QNWLOCK="save_ctrl",' .. psc, sub) end
+    os.remove(PENDING)
+    os.remove(ARMED)
+    append_event("user", "Reverted", "Cell lock removed")
+    return { ok = true, reverted = true }
+  end
+
   local sub = tonumber(pending_get("SUB_ID")) or 1
   local restored = {}
   for _, rat in ipairs(RATS) do
