@@ -153,6 +153,10 @@ module.exports = {
           selected: String(self.activeSlot) === String(slot),
           data: net.dial_status === 1,
           reg: st.status,
+          // A SIM is PRESENT per GL's own status codes (5 searching / 6 registered).
+          // status 0 = No SIM: the modem may still report a stale/garbage iccid
+          // during a re-scan, so never key identity/form off the iccid string.
+          present: st.status === 5 || st.status === 6,
           carrier: st.carrier || "",
           home: home,
           // Roaming claim only when confident: registered, home PLMN known, and
@@ -326,7 +330,8 @@ module.exports = {
       var self = this;
       if (typeof window === "undefined" || !window.$rpcRequest) return;
       var card = this.slotCards[slot - 1];
-      if (!card.iccid) { this.simCfgErr[slot] = ""; return; }   // empty slot: nothing to fetch
+      // No SIM (or stale garbage during a rescan): nothing to fetch or edit.
+      if (!card.present || !card.iccid) { this.simCfgErr[slot] = ""; this.simEdit[slot] = null; return; }
       window.$rpcRequest("call", ["sid", "modem", "get_sim_config",
         { slot: slot, bus: this.modem.bus, iccid: card.iccid }], { timeout: 30000 })
         .then(function (cfg) {
@@ -580,14 +585,16 @@ module.exports = {
 
       var kids = [
         h("div", { staticStyle: { display: "flex", justifyContent: "space-between", alignItems: "baseline" } }, [
-          h("span", { staticClass: "mm-sect" }, card.carrier || (card.reg === 0 || card.reg === undefined ? "Empty" : "SIM")),
+          h("span", { staticClass: "mm-sect" }, card.present ? (card.carrier || card.home || ("SIM " + slot)) : "Empty"),
           h("span", { staticClass: "mm-hint" }, "Slot " + slot)
         ]),
         h("div", { staticClass: "mm-badges" }, badges)
       ];
 
-      // Identity: home operator + roaming honesty, then masked identifiers.
-      if (card.iccid) {
+      // Identity + form only when a SIM is actually present (status 5/6). A
+      // status-0 slot renders as a clean Empty card even if the modem is still
+      // reporting a stale iccid mid-rescan.
+      if (card.present) {
         if (card.home) {
           kids.push(h("div", { staticClass: "mm-idrow" }, [
             h("span", { staticClass: "k" }, "Home operator"),

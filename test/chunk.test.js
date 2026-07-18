@@ -737,3 +737,41 @@ test('failover card renders toggle, priority order and time picker when timing o
   assert.ok(text.includes('Preferred order'));
   assert.ok(text.includes('Scheduled switch'));
 });
+
+test('status-0 slot renders clean Empty/No SIM — no garbage iccid, no form, no switch', () => {
+  // Modem glitch (seen live 2026-07-18 after rapid slot switches): iccid present
+  // but status 0 (No SIM). The card must render as a clean empty slot — never the
+  // "Empty title + No SIM badge + fake ICCID + editable form" contradiction.
+  const g = JSON.parse(JSON.stringify(SPLIT));
+  g['cellular.sims_status'].sims = [
+    { slot: '1', iccid: '44000000003', carrier: '', status: 0 },
+    { slot: '2', iccid: 'E0127E0127E', carrier: '', status: 0 }
+  ];
+  const comp = loadChunk();
+  const vm = makeVm(comp, g);
+  vm.tab = 'sim';
+  // Even if edits somehow got seeded, a not-present slot must show no form.
+  vm.simEdit[1] = { apn: 'x', auth: 'NONE', username: '', password: '', ip_type: 0, roaming: true };
+  const nodes = walk(comp.render.call(vm, h));
+  const text = textOf(nodes);
+  assert.ok(!text.includes('44000000003'), 'garbage ICCID must not render');
+  assert.ok(!text.includes('Show identifiers'), 'no identity block for an absent SIM');
+  assert.ok(text.includes('No SIM'), 'still shows the No SIM badge');
+  const forms = nodes.filter((n) => /mm-form/.test(n.data.staticClass || ''));
+  assert.equal(forms.length, 0, 'no dial form for an absent SIM');
+  const useBtns = nodes.filter((n) => textOf(n) === 'Use this SIM');
+  assert.equal(useBtns.length, 0, 'no switch button for an absent SIM');
+});
+
+test('present-but-unregistered slot (status 5) still shows identity + form', () => {
+  const g = JSON.parse(JSON.stringify(SPLIT));
+  g['cellular.sims_status'].sims[0] = { slot: '1', iccid: '8901260108736235562F',
+    carrier: '', status: 5, apn: 'h2g2' };   // present, searching
+  const comp = loadChunk();
+  const vm = makeVm(comp, g);
+  vm.tab = 'sim';
+  vm.simEdit[1] = { apn: 'h2g2', auth: 'NONE', username: '', password: '', ip_type: 0, roaming: true };
+  const text = textOf(comp.render.call(vm, h));
+  assert.ok(text.includes('Show identifiers'), 'present SIM shows identity even if unregistered');
+  assert.ok(text.includes('Not registered'), 'honest not-registered badge');
+});
