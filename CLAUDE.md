@@ -178,8 +178,20 @@ return { get_config = function(args) ... end, set_config = function(args) ... en
 | `/usr/share/oui/menu.d/mudimodem.json` | menu registration **+ `global_sockets`** (§2) — the read path |
 | `/usr/sbin/mudimodem-revert` | detached auto-revert watchdog + ssh panic-restore |
 | `/www/mudimodem/at-library.json.gz` | community AT command library (§7a); static, axios-fetched |
+| `/usr/lib/mudimodem/mudimodem-at.py` | our own AT channel on `/dev/at_mdm0` (§7a); backend spawns it |
+| `/www/views/gl-sdk4-ui-mudimodem-console.common.js.gz` | the AT-console tab chunk (lazy-loaded) |
+| **`/usr/share/gl-validator.d/mudimodem.lua`** | **arg validator — REQUIRED for the AT console (§3), not optional** |
 
-Optional: `/usr/share/gl-validator.d/mudimodem.lua` (arg validation).
+⚠️ **The validator is NOT optional once a method takes free-form input.** oui applies a **default
+string-arg allowlist** (`^[%w%.%s%-_:#/]-$`) to every param when no per-object validator exists —
+and that set has **no `+ = " , ( )`**, so every real AT command (`AT+CSQ`, `AT+QENG="servingcell"`)
+is rejected with **-32602 "Invalid params of cmd"** *before the backend runs*; only bare `ATI`/`AT`
+slip through. Ship `mudimodem.lua` returning `{ at_console = { cmd = '.-' } }` (mirrors GL's own
+`modem.lua`, which uses `'.-'` for `send_at_command`'s `command`). Safe because the backend caps
+length, strips CR/LF, and shell-escapes. ⚠️ **Our on-device backend tests `dofile` the plugin and
+call the method directly — they BYPASS this /rpc validation layer, so they can't catch a -32602. Any
+new free-form param needs a validator entry AND a `/rpc` round-trip test** (verify.sh §9). Same
+stub-vs-real-path trap as the `pcall` cosocket bug (§8).
 
 **Frontend decision: native oui view, hand-written, no toolchain.** The chunk is a webpack UMD
 bundle exporting a Vue component (GL's are ~41 KB, core-js polyfills included). We hand-write plain
