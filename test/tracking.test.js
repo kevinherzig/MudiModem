@@ -242,6 +242,35 @@ test('render-only: no template, render is a function', () => {
   assert.strictEqual(c.name, 'mudimodem-tracking');
 });
 
+// ---- hover readout: fixed position + fixed size (no jitter) ----
+// The readout used min-width (not a fixed width) with nowrap value cells, so its
+// width tracked the widest content and jittered every pixel as the values, cell
+// id, and optional event row changed. It also followed the cursor (left = cx+12,
+// flipping sides near the right edge). It now sits fixed at the plot's top-left.
+
+test('slice readout stays put and does not follow the cursor', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, { samples: seedSamples(), events: [], winW: 60, width: 900 });
+  const leftOf = (t) => (t.data.staticStyle && t.data.staticStyle.left) || null;
+  vm.cursor = -55;                       // far left
+  const a = vm.sliceReadout(h);
+  vm.cursor = -3;                        // far right
+  const b = vm.sliceReadout(h);
+  assert.strictEqual(leftOf(a), leftOf(b), 'tip position must not change with the cursor');
+});
+
+test('slice readout CSS is fixed-size and left-anchored (no resize jitter)', () => {
+  const src = fs.readFileSync(SRC, 'utf8');
+  const m = src.match(/\.mmt-tip\{([^}]*)\}/);
+  assert.ok(m, '.mmt-tip rule present');
+  const rule = m[1];
+  assert.match(rule, /left:\s*\d/, 'anchored at a fixed left');
+  assert.match(rule, /width:\s*\d+px/, 'fixed width');
+  assert.match(rule, /height:\s*\d+px/, 'fixed height');
+  assert.match(rule, /overflow:\s*hidden/, 'clips so content never resizes the box');
+  assert.doesNotMatch(rule, /min-width/, 'no content-driven min-width');
+});
+
 // ---- in-memory sample ordering (the "line across the whole graph" bug) ----
 // The draw + bus code walk winSamples() in array order, drawing one polyline per
 // metric. Incremental polling builds this.samples with .concat(), which does NOT

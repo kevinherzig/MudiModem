@@ -412,7 +412,7 @@ module.exports = (function () {
       },
       sliceReadout: function (h) {
         var s = this.nearestSample(this.cursor); if (!s) return null;
-        var self = this, W = this.width, cx = this.xOf(s.m), near = null, evs = this.winEvents();
+        var self = this, cx = this.xOf(s.m), near = null, evs = this.winEvents();
         for (var i = 0; i < evs.length; i++)
           if (Math.abs(this.xOf(evs[i].m) - cx) < 6) near = evs[i];
         var val = function (v) { return (v == null) ? "—" : String(v); };
@@ -436,9 +436,9 @@ module.exports = (function () {
             : near.kind === "dog" ? "var(--warning-hover,#c4851c)" : "var(--text-weak)" } },
           near.label + " — " + near.detail));
         kids.push(h("table", rows));
-        var tw = 180, left = cx + 12;
-        if (left + tw > W - 4) left = cx - tw - 12;
-        return h("div", { staticClass: "mmt-tip", staticStyle: { left: Math.max(4, left) + "px" } }, kids);
+        // Fixed at the plot's top-left with a fixed size (see .mmt-tip CSS) — it no
+        // longer follows the cursor or resizes to its content, so it can't jitter.
+        return h("div", { staticClass: "mmt-tip" }, kids);
       },
       renderLog: function (h) {
         var self = this;
@@ -523,9 +523,9 @@ module.exports = (function () {
           '.mmt-lanes{position:relative;padding:2px 0 6px;cursor:crosshair}.mmt-lanes svg{display:block;width:100%;overflow:visible}' +
           '.mmt-foot{display:flex;align-items:center;gap:16px;flex-wrap:wrap;padding:8px 14px 11px;border-top:1px solid var(--divider);font-size:11px;color:var(--text-badge)}' +
           '.mmt-lg{display:inline-flex;align-items:center;gap:5px}' +
-          '.mmt-tip{position:absolute;top:8px;pointer-events:none;z-index:5;background:var(--background-card);border:1px solid var(--border);border-radius:4px;box-shadow:0 2px 8px rgba(0,0,0,.12);padding:8px 10px;min-width:170px}' +
+          '.mmt-tip{position:absolute;top:26px;left:8px;pointer-events:none;z-index:5;background:var(--background-card);border:1px solid var(--border);border-radius:4px;box-shadow:0 2px 8px rgba(0,0,0,.12);padding:8px 10px;width:184px;height:158px;overflow:hidden}' +
           '.mmt-tip .t{font-size:10.5px;color:var(--text-badge);margin-bottom:5px}' +
-          '.mmt-tip .e{font-size:11px;font-weight:600;margin:-1px 0 5px;padding-bottom:5px;border-bottom:1px solid var(--divider)}' +
+          '.mmt-tip .e{font-size:11px;font-weight:600;margin:-1px 0 5px;padding-bottom:5px;border-bottom:1px solid var(--divider);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
           '.mmt-tip table{border-collapse:collapse;width:100%}.mmt-tip td{padding:1px 0;font-size:11.5px}' +
           '.mmt-tip td.k{color:var(--text-badge);font-size:10px;text-transform:uppercase;letter-spacing:.04em;padding-right:10px}' +
           '.mmt-tip td.v{font-weight:600;color:var(--text-title);text-align:right;white-space:nowrap}' +
