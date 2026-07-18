@@ -79,11 +79,29 @@ WIN=1 run watch
 inlog 'QNWLOCK=\\"common/4g\\",0'      && pass "unlocked 4g" || fail "no 4g unlock"
 inlog 'QNWLOCK=\\"common/5g\\",0'      && fail "touched 5g needlessly" || pass "left 5g alone"
 
-echo "8. panic: also resets save_ctrl and mode_pref"
+echo "8. panic: also resets save_ctrl, mode_pref, and nr5g_disable_mode"
 rm -f "$WORK/log"
 run panic 1
 inlog 'QNWLOCK=\\"save_ctrl\\",0,0'    && pass "save_ctrl reset" || fail "no save_ctrl reset"
 inlog 'mode_pref\\",AUTO'              && pass "mode_pref AUTO" || fail "no mode_pref reset"
+inlog 'nr5g_disable_mode\\",0'         && pass "nr5g_disable_mode reset (M1)" || fail "no nr5g_disable_mode reset"
+
+echo "9. watch (I1): a superseded watchdog (arm nonce no longer ours) stands down"
+# W1 arms for pending A with a long window. Mid-window a NEWER watchdog is
+# simulated by overwriting the arm marker with a different nonce (as a real
+# new experiment's watchdog would). W1 must NOT revert and must NOT delete the
+# newer arm marker.
+rm -f "$WORK/log"; mkpending "71"
+WIN=3 run watch &
+WPID=$!
+sleep 1
+[ -f "$WORK/armed" ]              && pass "W1 armed (nonce present)" || fail "W1 never armed"
+echo 999999 > "$WORK/armed"       # simulate a newer watchdog taking over the arm
+wait "$WPID"
+inlog "superseded"               && pass "W1 logged stand-down" || fail "W1 did not detect supersede"
+inlog "reverting"                && fail "superseded W1 reverted anyway!" || pass "superseded W1 did not revert"
+[ -f "$WORK/pending" ]           && pass "pending left intact for the new owner" || fail "W1 wrongly cleared pending"
+[ "$(cat "$WORK/armed" 2>/dev/null)" = "999999" ] && pass "newer arm marker left intact" || fail "W1 stomped the newer arm marker"
 
 echo
 if [ "$FAILED" = "0" ]; then echo "ALL REVERT TESTS PASSED"; else echo "REVERT TESTS FAILED"; exit 1; fi

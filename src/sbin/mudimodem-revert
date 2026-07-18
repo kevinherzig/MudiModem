@@ -96,19 +96,29 @@ restore_from_pending() {
 
 case "${1:-}" in
   watch)
-    # Drop the arm marker BEFORE sleeping so set_bands can confirm the safety
-    # net is live before it writes the (potentially link-dropping) new bands.
-    : > "$ARMED" 2>/dev/null
-    log "watch armed; window ${WINDOW}s; pending=$PENDING"
+    # Ownership nonce (Finding I1): stamp the arm marker with THIS process's
+    # pid and act only while the marker still holds it. Without this, a prior
+    # watchdog that is still sleeping when a NEW experiment starts would wake,
+    # see the new PENDING, and revert it prematurely. A new experiment does
+    # `os.remove(ARMED)` then launches a new watchdog which stamps its own
+    # nonce, so the old watchdog's nonce no longer matches and it stands down.
+    # Drop the marker BEFORE sleeping so set_bands/set_cell_lock can confirm
+    # the safety net is live before writing the (potentially link-dropping) change.
+    MYNONCE=$$
+    echo "$MYNONCE" > "$ARMED" 2>/dev/null
+    log "watch armed (nonce $MYNONCE); window ${WINDOW}s; pending=$PENDING"
     sleep "$WINDOW"
-    if [ -f "$PENDING" ]; then
-      log "window elapsed, still pending -> reverting"
-      restore_from_pending
-      append_event "dog" "Auto-revert fired" "No confirm in ${WINDOW}s — previous bands restored"
-    else
+    if [ ! -f "$PENDING" ]; then
       log "confirmed within window; no revert"
+    elif [ "$(cat "$ARMED" 2>/dev/null)" != "$MYNONCE" ]; then
+      log "superseded by a newer watchdog (arm no longer ours); no revert"
+    else
+      log "window elapsed, still pending and arm is ours -> reverting"
+      restore_from_pending
+      append_event "dog" "Auto-revert fired" "No confirm in ${WINDOW}s — previous config restored"
     fi
-    rm -f "$ARMED"
+    # Clear the marker only if it is still ours (don't stomp a newer watchdog).
+    [ "$(cat "$ARMED" 2>/dev/null)" = "$MYNONCE" ] && rm -f "$ARMED"
     ;;
   boot-check)
     if [ -f "$PENDING" ]; then
@@ -128,6 +138,9 @@ case "${1:-}" in
     at 'AT+QNWLOCK="common/5g",0' "$SUB"
     at 'AT+QNWLOCK="save_ctrl",0,0' "$SUB"
     at 'AT+QNWPREFCFG="mode_pref",AUTO' "$SUB"
+    # A 4G lock forces nr5g_disable_mode=1; clear it (Finding M1) so panic
+    # actually returns to a fully open, NR5G-capable state rather than 4G-only.
+    at 'AT+QNWPREFCFG="nr5g_disable_mode",0' "$SUB"
     rm -f "$PENDING"
     log "panic complete"
     ;;

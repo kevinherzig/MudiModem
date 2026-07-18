@@ -650,17 +650,37 @@ function M.revert_now(args)
   if pending_get("KIND") == "cell" then
     local slot = tonumber(pending_get("SLOT")) or 1
     local sub  = tonumber(pending_get("SUB_ID")) or 1
-    local gl = glc("modem", "get_cell_tower", { bus = "cpu" })
-    local tower = (gl and gl["slot" .. slot]) or {}
-    local payload = { bus = "cpu", slot = slot, lock = false }
-    for k, v in pairs(tower) do if payload[k] == nil then payload[k] = v end end
-    glc("modem", "set_cell_tower", payload)          -- clean GL-level unlock
+    local rat  = pending_get("RAT") or "5g"
+
+    -- GL-INDEPENDENT unlock FIRST (Finding C1): this is what actually frees
+    -- the link. set_cell_tower can fail (GL error code 20002050, or a
+    -- refusal while an operator lock exists) -- a manual revert must not
+    -- leave the modem locked with the watchdog already torn down, which
+    -- would defeat the whole safety guarantee. Mirrors what the watchdog's
+    -- own cell-revert does (mudimodem-revert restore_from_pending).
+    at('AT+QNWLOCK="common/' .. rat .. '",0', sub)
     local pm = pending_get("PREV_mode_pref")
     if pm and pm ~= "" then at('AT+QNWPREFCFG="mode_pref",' .. pm, sub) end
     local pd = pending_get("PREV_nr5g_disable_mode")
     if pd and pd ~= "" then at('AT+QNWPREFCFG="nr5g_disable_mode",' .. pd, sub) end
     local psc = pending_get("PREV_SAVE_CTRL")
     if psc and psc ~= "" then at('AT+QNWLOCK="save_ctrl",' .. psc, sub) end
+
+    -- THEN reconcile GL's store, best-effort -- the link is already safe by
+    -- this point regardless of whether this succeeds. If it fails, drop the
+    -- STALE marker so the frontend offers a reconcile instead of silently
+    -- disagreeing with the modem.
+    local gl = glc("modem", "get_cell_tower", { bus = "cpu" })
+    local tower = (gl and gl["slot" .. slot]) or {}
+    local payload = { bus = "cpu", slot = slot, lock = false }
+    for k, v in pairs(tower) do if payload[k] == nil then payload[k] = v end end
+    local res = glc("modem", "set_cell_tower", payload)
+    if not res then
+      os.execute("mkdir -p /etc/mudimodem 2>/dev/null")
+      local sf = io.open(STALE, "w")
+      if sf then sf:close() end
+    end
+
     os.remove(PENDING)
     os.remove(ARMED)
     append_event("user", "Reverted", "Cell lock removed")

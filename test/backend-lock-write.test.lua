@@ -149,15 +149,18 @@ assert(r.ok and r.confirmed, "confirm failed")
 assert(not io.open(PENDING, "r"), "pending must be gone after confirm")
 assert(#setfeat_calls == 0, "cell confirm must not touch band config (set_feature_config)")
 
--- 7. revert_now on a cell pending: GL unlock + mode restore + pending gone.
+-- 7. revert_now on a cell pending: raw-AT unlock (C1) + GL unlock + mode
+--    restore + pending gone.
 reset()
 assert(M.set_cell_lock({ rat = "5g", pci = 516, freq = 127490, scs = 15, band = 71 }).ok)
 at_log = {}; glc_calls = {}
 r = M.revert_now({})
 assert(r.ok and r.reverted, "revert_now failed")
-local unlocked
+local raw_unlocked, unlocked
+for _, c in ipairs(at_log) do if c:find('QNWLOCK="common/5g",0', 1, true) then raw_unlocked = true end end
 for _, c in ipairs(glc_calls) do if c:find('"lock":false') then unlocked = true end end
-assert(unlocked, "revert_now must GL-unlock")
+assert(raw_unlocked, "revert_now must issue the GL-independent raw-AT unlock (C1)")
+assert(unlocked, "revert_now must also GL-unlock to reconcile the store")
 local mode_restored, disable_restored, savectrl_restored
 for _, c in ipairs(at_log) do
   if c:find('mode_pref",NR5G') then mode_restored = true end
@@ -168,6 +171,20 @@ assert(mode_restored, "revert_now must restore mode_pref")
 assert(disable_restored, "revert_now must restore nr5g_disable_mode")
 assert(savectrl_restored, "revert_now must restore save_ctrl")
 assert(not io.open(PENDING, "r"), "pending must be gone after revert")
+
+-- 7b. C1: when GL's unlock FAILS, revert_now STILL raw-AT-unlocks (link freed)
+--     and drops the STALE marker so the frontend reconciles later.
+reset()
+assert(M.set_cell_lock({ rat = "5g", pci = 516, freq = 127490, scs = 15, band = 71 }).ok)
+at_log = {}; glc_calls = {}
+glc_fail = true                       -- set_cell_tower(lock:false) now returns an error code
+r = M.revert_now({})
+assert(r.ok and r.reverted, "revert_now must still report reverted on GL failure")
+local raw_unlocked2
+for _, c in ipairs(at_log) do if c:find('QNWLOCK="common/5g",0', 1, true) then raw_unlocked2 = true end end
+assert(raw_unlocked2, "revert_now must raw-AT-unlock even when GL unlock fails (link safety)")
+assert(io.open(STALE, "r"), "revert_now must drop the STALE marker when GL unlock fails")
+assert(not io.open(PENDING, "r"), "pending must be gone after revert even on GL failure")
 
 -- 8. clear_cell_lock: GL unlock + stale marker removed.
 reset()
