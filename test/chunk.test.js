@@ -1109,3 +1109,98 @@ test('present-but-unregistered slot (status 5) still shows identity + form', () 
   assert.ok(text.includes('89012601000000000001'), 'present SIM shows identity even if unregistered');
   assert.ok(text.includes('Not registered'), 'honest not-registered badge');
 });
+
+// ---------------------------------------------------------------------------
+// Bands tab — network-type lock conflict check
+// A cell/tower lock names a RAT (LTE / NR5G). If the network mode excludes that
+// RAT, the lock is stranded: stored, reported, but inert. The tab must SAY so
+// (warn) and refuse to let the user MOVE INTO a stranding mode (block).
+// ---------------------------------------------------------------------------
+
+// Helper: the mode segmented-control options, by visible label.
+function modeSeg(c, vm, label) {
+  return walk(c.render.call(vm, h))
+    .filter((n) => n.data.staticClass && /mm-seg-b/.test(n.data.staticClass))
+    .find((n) => textOf(n) === label);
+}
+
+test('bands tab: LTE lock under 5G-only is a conflict; Auto clears it; no lock = none', () => {
+  const c = loadChunk();
+  // LTE lock (rat 4g) while mode is NR5G (5G-only) → stranded.
+  let vm = bandsVm(c, { meta: { mode: 'NR5G', plmn_matched: true,
+    lock: { active: true, rat: '4g', pci: 115, freq: 5035, band: 12 } } });
+  assert.strictEqual(vm.lockConflict(), true, 'LTE lock cannot take under 5G-only');
+  // Same lock, Auto mode → LTE enabled → no conflict.
+  vm = bandsVm(c, { meta: { mode: 'AUTO', plmn_matched: true,
+    lock: { active: true, rat: '4g', pci: 115, freq: 5035, band: 12 } } });
+  assert.strictEqual(vm.lockConflict(), false, 'Auto enables LTE, lock can take');
+  // No active lock → never a conflict.
+  vm = bandsVm(c, { meta: { mode: 'NR5G', plmn_matched: true, lock: { active: false } } });
+  assert.strictEqual(vm.lockConflict(), false, 'no lock, no conflict');
+  // meta with no lock field at all (older backend) → no crash, no conflict.
+  vm = bandsVm(c, { meta: { mode: 'NR5G', plmn_matched: true } });
+  assert.strictEqual(vm.lockConflict(), false, 'absent meta.lock tolerated');
+});
+
+test('bands tab: 5G lock under 4G-only is a conflict', () => {
+  const c = loadChunk();
+  const vm = bandsVm(c, { meta: { mode: 'LTE', plmn_matched: true,
+    lock: { active: true, rat: '5g', pci: 516, freq: 127490, band: 71 } } });
+  assert.strictEqual(vm.lockConflict(), true, '5G lock cannot take under 4G-only');
+});
+
+test('bands tab: conflict renders a warning banner naming the lock and the mode', () => {
+  const c = loadChunk();
+  const vm = bandsVm(c, { meta: { mode: 'NR5G', plmn_matched: true,
+    lock: { active: true, rat: '4g', pci: 115, freq: 5035, band: 12 } } });
+  const txt = textOf(c.render.call(vm, h));
+  assert.match(txt, /cell-locked/i, 'names the lock condition');
+  assert.match(txt, /B12/, 'names the LTE band');
+  assert.match(txt, /PCI 115/, 'names the PCI');
+  assert.match(txt, /5G only/, 'names the current mode');
+  assert.match(txt, /can.?t take effect|cannot take effect/i, 'explains the lock is inert');
+});
+
+test('bands tab: no banner when there is no conflict', () => {
+  const c = loadChunk();
+  const vm = bandsVm(c, { meta: { mode: 'AUTO', plmn_matched: true,
+    lock: { active: true, rat: '4g', pci: 115, freq: 5035, band: 12 } } });
+  assert.doesNotMatch(textOf(c.render.call(vm, h)), /can.?t take effect|cannot take effect/i,
+    'a satisfiable lock draws no warning');
+});
+
+test('bands tab: mode selector blocks the stranding option, but not the applied one', () => {
+  const c = loadChunk();
+  const dis = (n) => !!(n && n.data.attrs && n.data.attrs.disabled);
+  // Applied mode IS the stranding mode (this box: NR5G under an LTE lock).
+  // "5G only" must stay selectable-but-flagged — greying the current mode reads
+  // as broken, and we never auto-write a mode change on the live link.
+  let vm = bandsVm(c, { meta: { mode: 'NR5G', plmn_matched: true,
+    lock: { active: true, rat: '4g', pci: 115, freq: 5035, band: 12 } } });
+  assert.ok(!dis(modeSeg(c, vm, '5G only')), 'current stranding mode is not disabled');
+  // Applied mode is Auto (LTE fine). Moving to "5G only" would strand the LTE
+  // lock → that option is blocked. Auto and 4G-only stay enabled.
+  vm = bandsVm(c, { meta: { mode: 'AUTO', plmn_matched: true,
+    lock: { active: true, rat: '4g', pci: 115, freq: 5035, band: 12 } } });
+  assert.ok(dis(modeSeg(c, vm, '5G only')), '5G only blocked: it would strand the LTE lock');
+  assert.ok(!dis(modeSeg(c, vm, 'Auto')), 'Auto never blocked');
+  assert.ok(!dis(modeSeg(c, vm, '4G only')), '4G only enables the LTE lock');
+});
+
+test('bands tab: setMode refuses a mode that would strand an active lock', () => {
+  const c = loadChunk();
+  const vm = bandsVm(c, { meta: { mode: 'AUTO', plmn_matched: true,
+    lock: { active: true, rat: '4g', pci: 115, freq: 5035, band: 12 } } });
+  vm.setMode('NR5G');                 // would strand the LTE lock
+  assert.strictEqual(vm.selMode, 'AUTO', 'blocked mode is not applied');
+  vm.setMode('LTE');                  // enables LTE — allowed
+  assert.strictEqual(vm.selMode, 'LTE', 'a non-stranding mode still applies');
+});
+
+test('bands tab: no lock → mode selector fully enabled (regression guard)', () => {
+  const c = loadChunk();
+  const dis = (n) => !!(n && n.data.attrs && n.data.attrs.disabled);
+  const vm = bandsVm(c, { meta: { mode: 'NR5G', plmn_matched: true } });
+  ['Auto', '5G only', '4G only'].forEach((l) =>
+    assert.ok(!dis(modeSeg(c, vm, l)), l + ' enabled when no lock is set'));
+});

@@ -288,7 +288,32 @@ function M.get_bands(args)
     config.nsa = fb["NR-NSA"] or {}
     config.LTE = fb.LTE or {}
   end
-  local mode_pref = (feat and feat.network_mode) or nil   -- AUTO | NR5G | LTE
+  -- Network mode: the modem's AUTHORITATIVE mode_pref (AT), NOT feat.network_mode.
+  -- get_feature_config returns network_mode TWICE (the modem's real value AND GL's
+  -- stored default); the ubus->lua flatten keeps the trailing one, which can read
+  -- "AUTO" while the modem is genuinely NR5G. The config bands above are fine from
+  -- feat; the mode is not — read mode_pref directly.
+  local mode_blob = at('AT+QNWPREFCFG="mode_pref"', sub_id)
+  local mode_pref
+  if mode_blob then
+    local v = mode_blob:match('"mode_pref",%s*([%u%d:_]+)')
+    if v then
+      -- a colon combo naming both RATs (e.g. "LTE:NR5G") == Auto for our selector.
+      mode_pref = (v:find("LTE") and v:find("NR5G")) and "AUTO" or v
+    end
+  end
+  mode_pref = mode_pref or (feat and feat.network_mode) or nil   -- fallback if AT unreadable
+
+  -- Cell/tower lock (from feat.tower, already in hand) — the RAT the modem is
+  -- locked to. The Bands tab warns/blocks when the mode excludes that RAT.
+  local tw = feat and feat.tower
+  local lock
+  if tw and tw.lock then
+    lock = { active = true, rat = (tw.network_type == "LTE") and "4g" or "5g",
+             pci = tw.pci, freq = tw.freq, band = tw.band }
+  else
+    lock = { active = false }
+  end
 
   -- 4. policy + capability — AT only, at the resolved sub_id.
   local pol_blob = at('AT+QNWPREFCFG="policy_band"', sub_id)
@@ -315,7 +340,8 @@ function M.get_bands(args)
       plmn = plmn,
       sub_id = sub_id,
       plmn_matched = matched,   -- false => sub_id resolution is a best guess
-      mode = mode_pref,         -- AUTO | NR5G | LTE (or a combo) — the RAT gate
+      mode = mode_pref,         -- AUTO | NR5G | LTE — the RAT gate (from AT mode_pref)
+      lock = lock,              -- { active, rat, pci, freq, band } — network-type lock
     },
   }
 end

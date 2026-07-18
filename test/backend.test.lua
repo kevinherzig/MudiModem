@@ -61,7 +61,38 @@ for _, g in ipairs({ "sa", "nsa", "LTE" }) do
   end
 end
 
+-- meta.mode must reflect the modem's AUTHORITATIVE mode_pref (AT), not GL's
+-- duplicate/stale network_mode field. get_feature_config returns network_mode
+-- twice; the ubus->lua flatten keeps the trailing one, which can read "AUTO"
+-- while the modem is genuinely NR5G. Read mode_pref independently and compare.
+assert(r.meta.mode ~= nil, "meta.mode missing")
+local mp = conn:call("modem.CPU.AT", "get_result_AT",
+  { cmd = 'AT+QNWPREFCFG="mode_pref"', timeout = 6, sub_id = r.meta.sub_id })
+local want = (mp and mp.data or ""):match('"mode_pref",%s*([%u%d:_]+)')
+local function norm(v)
+  if not v then return nil end
+  if v:find("LTE") and v:find("NR5G") then return "AUTO" end   -- both RATs => Auto
+  return v
+end
+assert(want ~= nil, "could not read mode_pref from the modem")
+assert(r.meta.mode == norm(want),
+  "meta.mode (" .. tostring(r.meta.mode) .. ") disagrees with AT mode_pref (" ..
+  tostring(want) .. ") - the duplicate network_mode key trap")
+
+-- meta.lock: always a table with a boolean 'active'; when active it carries the
+-- locked cell's RAT + pci + freq (from get_feature_config.tower). This is what
+-- the Bands tab uses to warn/block on a network-type lock conflict.
+assert(type(r.meta.lock) == "table", "meta.lock missing")
+assert(type(r.meta.lock.active) == "boolean", "meta.lock.active must be boolean")
+if r.meta.lock.active then
+  assert(r.meta.lock.rat == "4g" or r.meta.lock.rat == "5g",
+    "active lock rat must be 4g/5g, got " .. tostring(r.meta.lock.rat))
+  assert(r.meta.lock.pci ~= nil and r.meta.lock.freq ~= nil, "active lock needs pci+freq")
+end
+
 print("backend OK: sub_id=" .. r.meta.sub_id ..
+      " mode=" .. tostring(r.meta.mode) ..
+      " lock=" .. (r.meta.lock.active and (r.meta.lock.rat .. "/PCI" .. tostring(r.meta.lock.pci)) or "none") ..
       " plmn=" .. tostring(r.meta.plmn) ..
       " | SA supported=" .. #r.supported.sa ..
       " policy=" .. #r.policy.sa ..

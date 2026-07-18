@@ -53,7 +53,7 @@ module.exports = (function () {
       return { winW: 60, pinnedM: null, tick: 0, live: true, width: 900,
         styleId: "mmt-css", cursor: null, poll: null,
         samples: [], events: [], lastT: 0, serverNow: 0, serverNowAt: 0,
-        loading: true, err: "" };
+        loading: true, err: "", fetching: false };
     },
 
     computed: {
@@ -110,9 +110,18 @@ module.exports = (function () {
       fetchHistory: function (incremental) {
         var self = this;
         if (typeof window === "undefined" || !window.$axios) { self.loading = false; return; }
+        // One fetch at a time. On a slow initial full load (flaky cellular link,
+        // 20s timeout), the 10s poll would otherwise fire with lastT still 0 —
+        // "incremental" with since=0 re-fetches the WHOLE history and concats it,
+        // duplicating every sample. That duplicate, walked in array order, draws a
+        // line straight back across the plot. Skipping an overlapping fetch is the
+        // root fix; winSamples() sorting is the belt-and-braces on the draw side.
+        if (self.fetching) return;
+        self.fetching = true;
         var since = incremental ? self.lastT : 0;
         this.rpcSilent("get_history", { since: since })
           .then(function (res) {
+            self.fetching = false;
             if (!res) { self.loading = false; if (!incremental) self.err = ""; return; }
             var ns = res.samples || [], ne = res.events || [];
             if (incremental) {
@@ -128,6 +137,7 @@ module.exports = (function () {
             self.err = ""; self.loading = false; self.tick++;
           })
           .catch(function (e) {
+            self.fetching = false;
             self.err = (e && (e.type || e.message)) || "couldn't load history"; self.loading = false;
           });
       },
@@ -190,8 +200,22 @@ module.exports = (function () {
       },
       winSamples: function () {
         var cutoff = this.nowMs() - this.winW * 60000, self = this;
-        return this.samples.filter(function (s) { return s.t >= cutoff; })
+        var win = this.samples.filter(function (s) { return s.t >= cutoff; })
           .map(function (s) { return Object.assign({ m: self.mOf(s.t) }, s); });
+        // The draw + bus code walk this in array order and connect consecutive
+        // points, so they REQUIRE ascending t. Incremental polling builds
+        // this.samples with .concat(), which can leave it out of order or with
+        // duplicate timestamps (a full/incremental poll race, or a re-fetch with
+        // a stale `since`) — a backward point then draws one long line jumping
+        // across the whole plot. Sort ascending and drop duplicate t here, at the
+        // single choke point every consumer goes through.
+        win.sort(function (a, b) { return a.t - b.t; });
+        var out = [], prev = null;
+        for (var i = 0; i < win.length; i++) {
+          if (prev !== null && win[i].t === prev) continue;   // keep first of a dup t
+          out.push(win[i]); prev = win[i].t;
+        }
+        return out;
       },
       winEvents: function () {
         var cutoff = this.nowMs() - this.winW * 60000, self = this;

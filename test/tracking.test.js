@@ -241,3 +241,97 @@ test('render-only: no template, render is a function', () => {
   assert.strictEqual(typeof c.render, 'function');
   assert.strictEqual(c.name, 'mudimodem-tracking');
 });
+
+// ---- in-memory sample ordering (the "line across the whole graph" bug) ----
+// The draw + bus code walk winSamples() in array order, drawing one polyline per
+// metric. Incremental polling builds this.samples with .concat(), which does NOT
+// guarantee ascending t: a full/incremental poll race, or a re-fetch with a stale
+// `since`, re-appends already-held samples. A point ordered before its neighbours
+// makes the single polyline draw a long L segment jumping back across the plot —
+// the straight line spanning the whole graph.
+
+// Longest single drawn segment (in window-minutes) across every metric path. A
+// backward jump across the plot shows up here as a segment approaching winW.
+function longestSegMin(c, vm) {
+  const paths = [];
+  const cap = (tag, data) => {
+    if (tag === 'path' && data && data.attrs && data.attrs.d) paths.push(data.attrs.d);
+    return {};
+  };
+  c.methods.renderLanes.call(vm, cap);
+  const minPerPx = 60 / (vm.width - 30 - 12);   // PADL 30, PADR 12
+  let worst = 0;
+  for (const d of paths) {
+    const pts = d.split(/(?=[ML])/).map((x) => x.trim()).filter(Boolean)
+      .map((t) => ({ cmd: t[0], x: Number(t.slice(1).trim().split(/\s+/)[0]) }));
+    for (let i = 1; i < pts.length; i++)
+      if (pts[i].cmd === 'L') worst = Math.max(worst, Math.abs(pts[i].x - pts[i - 1].x));
+  }
+  return worst * minPerPx;
+}
+
+test('winSamples returns ascending, de-duplicated time order', () => {
+  const c = loadChunk();
+  const base = seedSamples();                       // 21 ordered samples
+  // Model an incremental-poll overlap: the whole history re-appended (a full/
+  // incremental race or a stale `since`). Raw array is now out of order + dup'd.
+  const vm = makeVm(c, { samples: base.concat(base.slice()), winW: 60, width: 1900 });
+  const ts = vm.winSamples().map((x) => x.t);
+  assert.deepStrictEqual(ts, ts.slice().sort((a, b) => a - b), 'winSamples must be ascending by t');
+  assert.strictEqual(new Set(ts).size, ts.length, 'winSamples must not contain duplicate timestamps');
+  assert.strictEqual(ts.length, base.length, 'duplicates collapse back to the unique set');
+});
+
+test('an overlapping in-memory merge does NOT draw a line across the plot', () => {
+  const c = loadChunk();
+  const base = seedSamples();
+  assert.ok(longestSegMin(c, makeVm(c, { samples: base, winW: 60, width: 1900 })) < 2,
+    'clean data has only short segments');
+  // Full re-append — without a sort in winSamples this drew a ~winW-minute L
+  // segment straight back across the graph.
+  assert.ok(
+    longestSegMin(c, makeVm(c, { samples: base.concat(base.slice()), winW: 60, width: 1900 })) < 2,
+    'a re-appended/duplicated merge must not produce a cross-plot segment');
+});
+
+test('a single out-of-order sample cannot streak across the plot', () => {
+  const c = loadChunk();
+  const base = seedSamples();
+  // Newest sample ordered before the oldest (two batches concatenated newest-first).
+  const scrambled = base.slice(1).concat([base[0]]);
+  assert.ok(longestSegMin(c, makeVm(c, { samples: scrambled, winW: 60, width: 1900 })) < 2,
+    'a lone misordered sample must be sorted back into place before drawing');
+});
+
+test('a poll while the initial fetch is still in flight is skipped (the duplicate source)', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, { samples: [], winW: 60, width: 1900 });
+  let posts = 0, resolvers = [];
+  global.window = {
+    $getCookie: () => 'sid',
+    $axios: { post: () => { posts++; return new Promise((res) => resolvers.push(res)); } }
+  };
+  try {
+    vm.fetchHistory(false);        // initial full load (since=0) — stays pending
+    vm.fetchHistory(true);         // the 10s poll fires before it resolves, lastT still 0
+    assert.strictEqual(posts, 1, 'an overlapping fetch must not issue a second request');
+  } finally { delete global.window; }
+});
+
+test('after a fetch resolves, the next poll runs (guard clears, not a deadlock)', async () => {
+  const c = loadChunk();
+  const vm = makeVm(c, { samples: [], winW: 60, width: 1900 });
+  let posts = 0, resolvers = [];
+  global.window = {
+    $getCookie: () => 'sid',
+    $axios: { post: () => { posts++; return new Promise((res) => resolvers.push(res)); } }
+  };
+  try {
+    vm.fetchHistory(false);
+    assert.strictEqual(posts, 1);
+    resolvers[0]({ data: { result: { samples: [], events: [], now: Date.now() } } });
+    await new Promise((r) => setImmediate(r));
+    vm.fetchHistory(true);         // a later poll, no longer overlapping
+    assert.strictEqual(posts, 2, 'the guard released after the first fetch settled');
+  } finally { delete global.window; }
+});

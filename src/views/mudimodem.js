@@ -867,7 +867,41 @@ module.exports = {
       return false;
     },
     ratActive(group) { return this.modeEnables(group, this.selMode); },
-    setMode(m) { if (!this.pending) this.selMode = m; },
+    // --- network-type lock conflict ---------------------------------------
+    // A cell/tower lock names a RAT (LTE or NR5G). If the network mode excludes
+    // that RAT the lock is stranded: stored, reported, but inert (an LTE lock
+    // under 5G-only never binds). meta.lock rides on get_bands' feat.tower.
+    lockInfo() {
+      var lk = this.bands && this.bands.meta && this.bands.meta.lock;
+      return (lk && lk.active) ? lk : null;
+    },
+    appliedMode() { return (this.bands && this.bands.meta && this.bands.meta.mode) || "AUTO"; },
+    // Would `mode` strand the active lock? Reuse the band-group RAT gate:
+    // a 4g lock needs LTE enabled, a 5g lock needs SA enabled.
+    modeStrands(mode) {
+      var lk = this.lockInfo();
+      if (!lk) return false;
+      return !this.modeEnables(lk.rat === "4g" ? "LTE" : "sa", mode);
+    },
+    lockConflict() { return this.modeStrands(this.appliedMode()); },
+    // "LTE B12 / PCI 115" or "5G n71 / PCI 516" for the warning banner + tooltip.
+    lockLabel() {
+      var lk = this.lockInfo();
+      if (!lk) return "";
+      var rat = lk.rat === "4g" ? "LTE" : "5G";
+      var band = (lk.band !== undefined && lk.band !== null && lk.band !== "")
+        ? " " + (lk.rat === "4g" ? "B" : "n") + lk.band : "";
+      var pci = (lk.pci !== undefined && lk.pci !== null) ? " / PCI " + lk.pci : "";
+      return rat + band + pci;
+    },
+    setMode(m) {
+      // Block moving INTO a mode that would strand the lock. The mode the modem
+      // is already in is exempt — we never auto-write it away; only a NEW
+      // stranding selection is refused (the banner tells the user how to fix it).
+      if (this.pending) return;
+      if (this.modeStrands(m) && m !== this.appliedMode()) return;
+      this.selMode = m;
+    },
     modeChanged() { return this.bands && this.selMode !== ((this.bands.meta && this.bands.meta.mode) || "AUTO"); },
     // Only policy-permitted bands are selectable; blocked ones never take.
     selectable(group, b) {
@@ -1189,10 +1223,19 @@ module.exports = {
             : h("span", { staticClass: "mm-hint" }, "which radios the modem may use")
         ]),
         h("div", { staticClass: "mm-seg" }, opts.map(function (o) {
+          // Block the mode that would strand an active cell lock — but never the
+          // mode the modem is already in (greying the current option reads as broken).
+          var blocked = self.modeStrands(o[0]) && o[0] !== self.appliedMode();
           return h("button", {
             key: o[0],
             staticClass: "mm-seg-b" + (cur === o[0] ? " on" : ""),
-            attrs: { disabled: !!self.pending },
+            attrs: {
+              disabled: !!self.pending || blocked,
+              title: blocked
+                ? ("Would strand your " + (self.lockInfo().rat === "4g" ? "LTE" : "5G") +
+                   " cell lock - clear the lock first")
+                : undefined
+            },
             on: { click: function () { self.setMode(o[0]); } }
           }, o[1]);
         }))
@@ -1253,6 +1296,20 @@ module.exports = {
         ? h("div", { staticClass: "mm-hint", staticStyle: { color: "var(--warning)", marginTop: "2px" } },
             "Couldn't confirm which SIM answered - values may be for the other slot")
         : null;
+      // Network-type lock conflict: the modem is cell-locked to a RAT the current
+      // mode excludes, so the lock can't take effect. Name the lock + the fix.
+      var lockWarn = this.lockConflict()
+        ? h("div", { staticClass: "mm-revert" }, [
+            h("div", { staticClass: "mm-revert-row", staticStyle: { display: "block", color: "var(--warning-hover)" } }, [
+              h("b", "⚠ Modem is cell-locked to " + this.lockLabel() + ", "),
+              "but network mode is " +
+                ({ NR5G: "5G only", LTE: "4G only", AUTO: "Auto" }[this.appliedMode()] || this.appliedMode()) +
+                " - the lock can't take effect. Set mode to " +
+                (this.lockInfo().rat === "4g" ? "Auto or 4G only" : "Auto or 5G only") +
+                ", or clear the lock on the Cell Lock tab."
+            ])
+          ])
+        : null;
       var head = [
         h("div", { staticStyle: { display: "flex", justifyContent: "space-between", alignItems: "baseline" } }, [
           h("span", { staticClass: "mm-sect" }, "Bands"),
@@ -1269,6 +1326,7 @@ module.exports = {
           "Choose the network mode and which 5G/LTE bands the modem may use. Blocked bands are ones " +
           "the module supports but your carrier forbids - they can't be selected because they never take."),
         warn,
+        lockWarn,
         (this.pending && this.pending.kind !== "cell") ? this.renderRevert(h) : null
       ];
       var footer = [];
