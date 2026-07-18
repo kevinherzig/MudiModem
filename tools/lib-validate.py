@@ -8,12 +8,13 @@ receives the merged, gzipped result)."""
 import glob, json, os, re, sys
 
 RISKS = {"read", "set", "nv"}
-REQUIRED = ["id", "cat", "title", "cmd", "risk", "vendor", "verified", "summary", "source", "by"]
+REQUIRED = ["id", "cat", "title", "risk", "vendor", "verified", "summary", "source", "by"]
 # Required fields that must be non-empty strings. `risk` is covered by the RISKS
 # check and `verified` by its list check, so they're excluded to avoid double
 # messages; the rest — including the sort keys `cat`/`title` — must be strings or
 # the sort in main() would raise a raw TypeError instead of a clean per-entry msg.
-STR_REQUIRED = ["id", "cat", "title", "cmd", "vendor", "summary", "source", "by"]
+STR_REQUIRED = ["id", "cat", "title", "vendor", "summary", "source", "by"]
+MAX_STEPS = 8
 PLACEHOLDER = re.compile(r"\{\{(\w+)\}\}")
 
 
@@ -50,8 +51,37 @@ def validate(entries):
             seen.add(rawid)
         if not isinstance(e.get("verified"), list):
             errs.append("%s: verified must be a list (empty = 'nobody yet')" % eid)
-        cmd = e.get("cmd")
-        ph = set(PLACEHOLDER.findall(cmd if isinstance(cmd, str) else ""))
+        # Exactly one of cmd / steps.
+        has_cmd = "cmd" in e
+        has_steps = "steps" in e
+        if has_cmd and has_steps:
+            errs.append("%s: an entry must have exactly one of 'cmd' or 'steps', not both" % eid)
+        elif not has_cmd and not has_steps:
+            errs.append("%s: an entry needs 'cmd' or 'steps'" % eid)
+
+        if has_cmd and not (isinstance(e["cmd"], str) and e["cmd"]):
+            errs.append("%s: field 'cmd' must be a non-empty string" % eid)
+
+        step_texts = []
+        if has_steps:
+            steps = e["steps"]
+            if not (isinstance(steps, list) and steps):
+                errs.append("%s: 'steps' must be a non-empty list" % eid)
+            else:
+                if len(steps) > MAX_STEPS:
+                    errs.append("%s: at most %d steps (has %d)" % (eid, MAX_STEPS, len(steps)))
+                for s in steps:
+                    if not (isinstance(s, str) and s.strip()):
+                        errs.append("%s: every step must be a non-empty string" % eid)
+                    else:
+                        step_texts.append(s)
+        elif has_cmd and isinstance(e["cmd"], str):
+            step_texts = [e["cmd"]]
+
+        # Placeholder coverage over the UNION across cmd/steps.
+        ph = set()
+        for txt in step_texts:
+            ph |= set(PLACEHOLDER.findall(txt))
         pnames = set(p.get("name") for p in e.get("params", []))
         if ph != pnames:
             errs.append("%s: params %s must exactly cover placeholders %s"
@@ -59,9 +89,11 @@ def validate(entries):
         for p in e.get("params", []):
             if not p.get("name") or not p.get("hint"):
                 errs.append("%s: every param needs name + hint" % eid)
-        # A parameterized entry can't also decode: the chunk matches decode by the
-        # literal `cmd` string, but the SENT command has {{params}} substituted, so
-        # it never matches the template — decode would silently no-op.
+
+        # decode is only meaningful on a single literal cmd (matched by string).
+        if e.get("decode") and has_steps:
+            errs.append("%s: 'decode' is not allowed with 'steps' "
+                        "(multi-step entries are actions, not reads)" % eid)
         if e.get("decode") and e.get("params"):
             errs.append("%s: an entry cannot have both params and decode "
                         "(the substituted command never matches the template, so decode would silently no-op)" % eid)
