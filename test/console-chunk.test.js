@@ -387,6 +387,66 @@ test('send(): aborted sequence marks the remaining steps skipped', async () => {
     'skipped note for the step that never ran');
 });
 
+test('typing a newline morphs the prompt to multi-line', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, {});
+  vm.onPromptInput('AT+ONE\nAT+TWO');
+  assert.strictEqual(vm.multiline, true);
+  assert.strictEqual(vm.promptMultiline, true);
+});
+
+test('Shift+Enter inserts a newline and does not send', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, {});
+  const saved = global.window;
+  let sent = false;
+  try {
+    global.window = { $rpcRequest: () => { sent = true; return Promise.resolve({ ok: true, steps: [] }); } };
+    vm.prompt = 'AT+ONE'; vm.selId = null;
+    vm.promptKey({ key: 'Enter', shiftKey: true, preventDefault() {} });
+    assert.strictEqual(sent, false, 'Shift+Enter must not send');
+    assert.strictEqual(vm.multiline, true, 'morphed to multi-line');
+    assert.match(vm.prompt, /\n$/, 'a newline was appended');
+  } finally { global.window = saved; }
+});
+
+test('Enter (no shift) sends', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, {});
+  const saved = global.window;
+  let sent = false;
+  try {
+    global.window = { $rpcRequest: () => { sent = true;
+      return Promise.resolve({ ok: true, requested: 1, ran: 1, aborted: false,
+        steps: [{ cmd: 'ATI', status: 'ok', response: 'OK\r\n' }] }); } };
+    vm.prompt = 'ATI'; vm.selId = null;
+    vm.promptKey({ key: 'Enter', shiftKey: false, preventDefault() {} });
+    assert.strictEqual(sent, true);
+  } finally { global.window = saved; }
+});
+
+test('picking a steps[] entry lists its commands in the detail card', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, {});
+  vm.lib = LIB;
+  vm.pick(LIB.find((e) => e.id === 'demo.set-commit'));
+  assert.strictEqual(vm.multiline, true, 'steps entry is multi-line');
+  const txt = textOf(c.render.call(vm, h));
+  assert.match(txt, /AT\+QNWPREFCFG="nr5g_band"/, 'a step command is listed');
+});
+
+test('multi-line prompt renders a textarea, single-line an input', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, {});
+  vm.prompt = 'ATI'; vm.selId = null;
+  assert.ok(walk(c.render.call(vm, h)).some((n) => n.tag === 'input'
+    && n.data.attrs && n.data.attrs['aria-label'] === 'AT command'),
+    'single-line uses <input>');
+  vm.onPromptInput('AT+ONE\nAT+TWO');
+  assert.ok(walk(c.render.call(vm, h)).some((n) => n.tag === 'textarea'),
+    'multi-line uses <textarea>');
+});
+
 test('send(): RPC timeout scales with the number of steps', async () => {
   const c = loadChunk();
   const vm = makeVm(c, {});

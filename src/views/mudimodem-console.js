@@ -28,6 +28,7 @@ module.exports = {
       history: [],
       histIdx: null,
       prompt: "",
+      multiline: false,
       params: {},           // param values for the selected entry
       sending: false,
       decodeRows: null,     // [[{f,v,hi},…] per matched response line]
@@ -97,6 +98,11 @@ module.exports = {
       return v.split(/\r?\n/).map(function (s) { return s.trim(); })
               .filter(function (s) { return s !== ""; });
     },
+    promptMultiline() {
+      if (this.multiline) return true;
+      var v = this.paramMode ? this.assembled : this.prompt;
+      return (v || "").indexOf("\n") >= 0;
+    },
     paramsFilled() {
       var p = this.params;
       return this.selParams.every(function (x) {
@@ -141,18 +147,36 @@ module.exports = {
       var ps = {};
       (e.params || []).forEach(function (p) { ps[p.name] = ""; });
       this.params = ps;               // fresh object => later key writes are reactive
-      this.prompt = (e.params && e.params.length) ? "" : e.cmd;
+      var base = e.steps ? e.steps.join("\n") : e.cmd;
+      this.prompt = (e.params && e.params.length) ? "" : base;
+      this.multiline = !!e.steps || base.indexOf("\n") >= 0;
       this.decodeRows = null; this.decodeSrc = "";
     },
     onPromptInput(v) {
       this.prompt = v;
-      // Hand-editing away from the entry's command = free-typing (gate no
-      // longer applies; the entry stops claiming the prompt).
-      if (this.sel && !this.paramMode && v !== this.sel.cmd) this.selId = null;
+      if (v.indexOf("\n") >= 0) this.multiline = true;
+      // Hand-editing away from the entry's text = free-typing (gate no longer
+      // applies; the entry stops claiming the prompt).
+      var base = this.sel ? (this.sel.steps ? this.sel.steps.join("\n") : this.sel.cmd) : null;
+      if (this.sel && !this.paramMode && v !== base) this.selId = null;
     },
     promptKey(ev) {
-      if (ev.key === "Enter") { this.send(); return; }
-      if ((ev.key === "ArrowUp" || ev.key === "ArrowDown") && !this.paramMode) {
+      if (ev.key === "Enter" && !ev.shiftKey) {
+        if (ev.preventDefault) ev.preventDefault();
+        this.send(); return;
+      }
+      if (ev.key === "Enter" && ev.shiftKey) {
+        // Morph an <input> into a multi-line block; in a <textarea> the browser
+        // inserts the newline itself, so only seed it on the first transition.
+        if (!this.promptMultiline && !this.paramMode) {
+          if (ev.preventDefault) ev.preventDefault();
+          this.multiline = true;
+          this.prompt = (this.prompt || "") + "\n";
+        }
+        return;
+      }
+      if ((ev.key === "ArrowUp" || ev.key === "ArrowDown")
+          && !this.paramMode && !this.promptMultiline) {
         if (!this.history.length) return;
         if (ev.preventDefault) ev.preventDefault();
         var i = this.histIdx === null ? this.history.length : this.histIdx;
@@ -340,6 +364,10 @@ module.exports = {
         '.mmc-meta span{display:block;font-size:9px;font-weight:500;letter-spacing:.05em;text-transform:uppercase;color:var(--text-badge)}' +
         '.mmc-meta b{font-size:11.5px;font-weight:600;color:var(--text-title)}' +
         '.mmc-warn{color:var(--error-700)}' +
+        '.mmc-ta{flex:1;font-family:monospace;font-size:12px;padding:6px 9px;border:1px solid var(--border);border-radius:3px;background:var(--bg-card);color:var(--text-regular);resize:vertical;line-height:1.5}' +
+        '.mmc-ta:focus{outline:0;border-color:var(--primary)}' +
+        '.mmc-steps{margin-top:8px;display:flex;flex-direction:column;gap:3px}' +
+        '.mmc-step{font-family:monospace;font-size:11px;color:var(--text-weak);background:var(--bg-title);border-radius:3px;padding:4px 8px}' +
         '@media(prefers-reduced-motion:reduce){.mmc *{transition:none!important}}';
       var el = document.createElement("style");
       el.id = this.styleId;
@@ -452,19 +480,23 @@ module.exports = {
     }
 
     // ---- prompt + send ----
+    var multi = this.promptMultiline;
+    var promptCtl = h(multi ? "textarea" : "input", {
+      staticClass: multi ? "mmc-ta" : "",
+      attrs: {
+        placeholder: "AT+…", "aria-label": "AT command",
+        readonly: this.paramMode || null,
+        rows: multi ? Math.min(8, Math.max(2, this.stepLines.length)) : null
+      },
+      domProps: { value: this.paramMode ? this.assembled : this.prompt },
+      on: {
+        input: function (ev) { if (!self.paramMode) self.onPromptInput(ev.target.value); },
+        keydown: function (ev) { self.promptKey(ev); }
+      }
+    });
     var promptRow = h("div", { staticClass: "mmc-prompt" }, [
       h("span", ">"),
-      h("input", {
-        attrs: {
-          placeholder: "AT+…", "aria-label": "AT command",
-          readonly: this.paramMode || null
-        },
-        domProps: { value: this.paramMode ? this.assembled : this.prompt },
-        on: {
-          input: function (ev) { if (!self.paramMode) self.onPromptInput(ev.target.value); },
-          keydown: function (ev) { self.promptKey(ev); }
-        }
-      }),
+      promptCtl,
       h("button", {
         staticClass: "mmc-send",
         attrs: { disabled: this.sending || (this.paramMode && !this.paramsFilled) },
@@ -524,6 +556,9 @@ module.exports = {
           e.summary + " ",
           e.warn ? h("span", { staticClass: "mmc-warn" }, e.warn) : null
         ]),
+        e.steps ? h("div", { staticClass: "mmc-steps" }, e.steps.map(function (s, i) {
+          return h("code", { key: i, staticClass: "mmc-step" }, s);
+        })) : null,
         h("div", { staticClass: "mmc-meta" }, [
           h("div", [h("span", "Vendor"), h("b", e.vendor)]),
           h("div", [h("span", "Verified on"),
@@ -531,7 +566,7 @@ module.exports = {
           h("div", [h("span", "Source"), h("b", e.source)]),
           h("div", [h("span", "Contributed by"), h("b", e.by)])
         ])
-      ]);
+      ].filter(Boolean));
     }
 
     return h("div", { staticClass: "mmc" }, [
