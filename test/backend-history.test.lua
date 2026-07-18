@@ -49,6 +49,23 @@ assert(len(since.samples) == 1, "since=1500 -> only t=2000 sample")
 assert(since.samples[1].t == 2000, "correct sample after since")
 assert(len(since.events) == 0, "since=1500 -> event at t=1500 is NOT > since")
 
+-- Windowing returns the correct TAIL, oldest-first. The backward-read early-exit
+-- (perf: it stops decoding once it passes `since` instead of decoding the whole
+-- file) must not drop, duplicate, or reorder the returned window.
+w(HIST .. "/samples.jsonl", {
+  '{"t":100,"rsrp":-100}', '{"t":200,"rsrp":-101}', '{"t":300,"rsrp":-102}',
+  '{"t":400,"rsrp":-103}', '{"t":500,"rsrp":-104}',
+})
+local tail = M.get_history({ since = 250 })
+assert(len(tail.samples) == 3, "since=250 -> t=300,400,500 (3), got " .. len(tail.samples))
+assert(tail.samples[1].t == 300, "window is oldest-first (first = 300)")
+assert(tail.samples[3].t == 500, "window ends at the newest (last = 500)")
+local none = M.get_history({ since = 500 })
+assert(len(none.samples) == 0, "since=newest -> empty window")
+local everything = M.get_history({})
+assert(len(everything.samples) == 5, "no since -> the whole file (5)")
+assert(everything.samples[1].t == 100 and everything.samples[5].t == 500, "full read stays oldest-first")
+
 -- empty dir -> empty arrays, never an error
 os.execute("rm -f " .. HIST .. "/samples.jsonl " .. HIST .. "/events.jsonl")
 local empty = M.get_history({})

@@ -581,19 +581,28 @@ end
 -- all (retained 24h). Files absent (collector not started) => empty arrays.
 function M.get_history(args)
   local since = args and tonumber(args.since) or nil
+  -- Read BACKWARD from the newest line and stop decoding once we pass `since`.
+  -- The files are append-ordered by time (the collector appends per tick; trim()
+  -- rewrites in order), so everything before the first out-of-window record is
+  -- older still. This decodes only the requested tail, not the whole 24h file —
+  -- the 10s poll (since=lastT) and the windowed page load then cost O(window),
+  -- not O(file). Reading the raw lines is cheap; the cjson.decode was the cost.
   local function read_lines(path)
-    local out = {}
+    local lines = {}
     local fh = io.open(path, "r")
-    if not fh then return out end
-    for line in fh:lines() do
-      if #line > 1 then
-        local ok, obj = pcall(cjson.decode, line)   -- cjson.decode can't yield; pcall is safe here
-        if ok and type(obj) == "table" and obj.t then
-          if not since or obj.t > since then out[#out + 1] = obj end
-        end
-      end
-    end
+    if not fh then return {} end
+    for line in fh:lines() do if #line > 1 then lines[#lines + 1] = line end end
     fh:close()
+    local rev = {}                                     -- collected newest-first
+    for i = #lines, 1, -1 do
+      local ok, obj = pcall(cjson.decode, lines[i])    -- cjson.decode can't yield; pcall is safe here
+      if ok and type(obj) == "table" and obj.t then
+        if since and obj.t <= since then break end      -- reached the window edge: stop
+        rev[#rev + 1] = obj
+      end                                               -- malformed line: skip, keep scanning
+    end
+    local out = {}                                     -- flip back to oldest-first (the contract)
+    for i = #rev, 1, -1 do out[#out + 1] = rev[i] end
     return out
   end
   return { samples = arr(read_lines(SAMPLES)), events = arr(read_lines(EVENTS)), now = os.time() * 1000 }

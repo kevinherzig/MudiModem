@@ -303,35 +303,83 @@ test('a single out-of-order sample cannot streak across the plot', () => {
     'a lone misordered sample must be sorted back into place before drawing');
 });
 
-test('a poll while the initial fetch is still in flight is skipped (the duplicate source)', () => {
-  const c = loadChunk();
-  const vm = makeVm(c, { samples: [], winW: 60, width: 1900 });
-  let posts = 0, resolvers = [];
+// Capture the get_history `since` argument of each /rpc post.
+function stubAxios() {
+  const calls = [], resolvers = [];
   global.window = {
     $getCookie: () => 'sid',
-    $axios: { post: () => { posts++; return new Promise((res) => resolvers.push(res)); } }
+    $axios: { post: (url, body) => {
+      calls.push({ since: body.params[3].since, method: body.params[2] });
+      return new Promise((res) => resolvers.push(res));
+    } }
   };
+  return { calls, resolvers,
+    settle: (i, result) => resolvers[i]({ data: { result } }) };
+}
+
+test('initial fetch requests only the visible window, not the whole history', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, { samples: [], winW: 60, width: 1900, serverNow: 0 });
+  const ax = stubAxios();
   try {
-    vm.fetchHistory(false);        // initial full load (since=0) — stays pending
-    vm.fetchHistory(true);         // the 10s poll fires before it resolves, lastT still 0
-    assert.strictEqual(posts, 1, 'an overlapping fetch must not issue a second request');
+    const t0 = Date.now();
+    vm.fetchHistory();                      // the mount-time load
+    assert.strictEqual(ax.calls.length, 1);
+    const want = t0 - 60 * 60000;           // now - winW
+    assert.ok(Math.abs(ax.calls[0].since - want) < 5000,
+      `since must be ~now-winW (${want}), not 0 — got ${ax.calls[0].since}`);
   } finally { delete global.window; }
 });
 
-test('after a fetch resolves, the next poll runs (guard clears, not a deadlock)', async () => {
+test('selecting a LARGER range backfills the wider window; SMALLER/equal does not', async () => {
   const c = loadChunk();
-  const vm = makeVm(c, { samples: [], winW: 60, width: 1900 });
-  let posts = 0, resolvers = [];
-  global.window = {
-    $getCookie: () => 'sid',
-    $axios: { post: () => { posts++; return new Promise((res) => resolvers.push(res)); } }
-  };
+  const vm = makeVm(c, { samples: [], winW: 60, width: 1900, serverNow: 0 });
+  const ax = stubAxios();
+  const flush = () => new Promise((r) => setImmediate(r));
   try {
-    vm.fetchHistory(false);
-    assert.strictEqual(posts, 1);
-    resolvers[0]({ data: { result: { samples: [], events: [], now: Date.now() } } });
+    vm.fetchHistory();                                  // loads 60m, loadedFrom = now-60m
+    ax.settle(0, { samples: [], events: [], now: Date.now() });
+    await flush();
+    // Go to 24h → must backfill the wider window.
+    const before = ax.calls.length;
+    const t0 = Date.now();
+    vm.setRange(1440);
+    assert.strictEqual(ax.calls.length, before + 1, 'a wider range fetches more history');
+    assert.ok(Math.abs(ax.calls[before].since - (t0 - 1440 * 60000)) < 5000,
+      'backfill requests since = now - 24h');
+    ax.settle(before, { samples: [], events: [], now: Date.now() });
+    await flush();
+    // Back down to 1h → already loaded, no fetch.
+    const n = ax.calls.length;
+    vm.setRange(60);
+    assert.strictEqual(ax.calls.length, n, 'a narrower range re-filters in memory, no fetch');
+  } finally { delete global.window; }
+});
+
+test('the 10s poll fetches incrementally from lastT and merges', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, { samples: [], winW: 60, width: 1900, serverNow: 0, lastT: 111111, loading: false });
+  const ax = stubAxios();
+  try {
+    vm.fetchHistory({ since: vm.lastT, merge: true });
+    assert.strictEqual(ax.calls[0].since, 111111, 'poll uses lastT, not the window');
+  } finally { delete global.window; }
+});
+
+test('an overlapping fetch is skipped, and a range request made during one runs after it settles', async () => {
+  const c = loadChunk();
+  const vm = makeVm(c, { samples: [], winW: 60, width: 1900, serverNow: 0 });
+  const ax = stubAxios();
+  try {
+    vm.fetchHistory();                       // initial load, stays pending
+    assert.strictEqual(ax.calls.length, 1);
+    vm.fetchHistory({ since: vm.lastT, merge: true });   // a poll fires mid-flight
+    assert.strictEqual(ax.calls.length, 1, 'the overlapping poll is dropped');
+    vm.setRange(1440);                       // user widens the range while still fetching
+    assert.strictEqual(ax.calls.length, 1, 'the backfill is deferred, not lost');
+    ax.settle(0, { samples: [], events: [], now: Date.now() });
     await new Promise((r) => setImmediate(r));
-    vm.fetchHistory(true);         // a later poll, no longer overlapping
-    assert.strictEqual(posts, 2, 'the guard released after the first fetch settled');
+    assert.strictEqual(ax.calls.length, 2, 'the deferred backfill runs once the first settles');
+    assert.ok(ax.calls[1].since < Date.now() - 1400 * 60000, 'and it is the 24h window');
   } finally { delete global.window; }
 });

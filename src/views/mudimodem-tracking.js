@@ -53,7 +53,11 @@ module.exports = (function () {
       return { winW: 60, pinnedM: null, tick: 0, live: true, width: 900,
         styleId: "mmt-css", cursor: null, poll: null,
         samples: [], events: [], lastT: 0, serverNow: 0, serverNowAt: 0,
-        loading: true, err: "", fetching: false };
+        loading: true, err: "", fetching: false,
+        // how far back we've fetched (epoch ms); null = nothing yet. A larger
+        // range only refetches when it reaches earlier than this. pendingSince
+        // holds a range request that arrived while a fetch was in flight.
+        loadedFrom: null, pendingSince: null };
     },
 
     computed: {
@@ -74,8 +78,10 @@ module.exports = (function () {
       this.parseHash();
       this._onResize = function () { self.measure(); };
       window.addEventListener("resize", this._onResize);
-      this.fetchHistory(false);
-      this.poll = setInterval(function () { if (self.live) self.fetchHistory(true); }, 10000);
+      this.fetchHistory();                        // initial: just the visible window
+      this.poll = setInterval(function () {
+        if (self.live) self.fetchHistory({ since: self.lastT, merge: true });
+      }, 10000);
     },
     // Keep the viewBox width in sync with the rendered width. At mount the lanes
     // element is usually absent (loading state), so the initial measure() no-ops
@@ -107,39 +113,58 @@ module.exports = (function () {
           .then(function (r) { return (r && r.data && r.data.result) || null; })
           .catch(function () { return null; });
       },
-      fetchHistory: function (incremental) {
+      // opts = { since, merge }. Default (no opts) = the initial/visible-window
+      // load: fetch only `now - winW`, replacing. A poll passes { since: lastT,
+      // merge: true } to append just the new tail. Backfill (a wider range)
+      // passes { since: olderCutoff } to replace with the wider window.
+      // Fetching only the shown window keeps first paint small: the full 24h is
+      // ~1.4 MB uncompressed, the 1h default ~85 KB.
+      fetchHistory: function (opts) {
+        opts = opts || {};
         var self = this;
         if (typeof window === "undefined" || !window.$axios) { self.loading = false; return; }
-        // One fetch at a time. On a slow initial full load (flaky cellular link,
-        // 20s timeout), the 10s poll would otherwise fire with lastT still 0 —
-        // "incremental" with since=0 re-fetches the WHOLE history and concats it,
-        // duplicating every sample. That duplicate, walked in array order, draws a
-        // line straight back across the plot. Skipping an overlapping fetch is the
-        // root fix; winSamples() sorting is the belt-and-braces on the draw side.
-        if (self.fetching) return;
+        // One fetch at a time. On a slow load the 10s poll would otherwise fire
+        // before it settles and (with a stale lastT) re-fetch + concat overlapping
+        // data. A range request that lands mid-flight is remembered, not dropped.
+        if (self.fetching) {
+          if (opts.since != null && !opts.merge)
+            self.pendingSince = (self.pendingSince == null) ? opts.since : Math.min(self.pendingSince, opts.since);
+          return;
+        }
         self.fetching = true;
-        var since = incremental ? self.lastT : 0;
-        this.rpcSilent("get_history", { since: since })
+        var merge = !!opts.merge;
+        var since = (opts.since != null) ? opts.since : (self.nowMs() - self.winW * 60000);
+        this.rpcSilent("get_history", { since: Math.floor(since) })
           .then(function (res) {
             self.fetching = false;
-            if (!res) { self.loading = false; if (!incremental) self.err = ""; return; }
-            var ns = res.samples || [], ne = res.events || [];
-            if (incremental) {
-              if (ns.length) self.samples = self.samples.concat(ns);
-              if (ne.length) self.events = self.events.concat(ne);
-            } else { self.samples = ns; self.events = ne; }
-            self.serverNow = res.now || Date.now();
-            self.serverNowAt = Date.now();
-            var cut = self.serverNow - 24 * 3600 * 1000;
-            self.samples = self.samples.filter(function (s) { return s.t >= cut; });
-            self.events = self.events.filter(function (e) { return e.t >= cut; });
-            if (self.samples.length) self.lastT = self.samples[self.samples.length - 1].t;
-            self.err = ""; self.loading = false; self.tick++;
+            if (res) {
+              var ns = res.samples || [], ne = res.events || [];
+              if (merge) {
+                if (ns.length) self.samples = self.samples.concat(ns);
+                if (ne.length) self.events = self.events.concat(ne);
+              } else { self.samples = ns; self.events = ne; }
+              self.serverNow = res.now || Date.now();
+              self.serverNowAt = Date.now();
+              var cut = self.serverNow - 24 * 3600 * 1000;
+              self.samples = self.samples.filter(function (s) { return s.t >= cut; });
+              self.events = self.events.filter(function (e) { return e.t >= cut; });
+              if (self.samples.length) self.lastT = self.samples[self.samples.length - 1].t;
+              self.loadedFrom = (self.loadedFrom == null) ? since : Math.min(self.loadedFrom, since);
+              self.err = ""; self.tick++;
+            }
+            self.loading = false;
+            self.drainPending();
           })
           .catch(function (e) {
             self.fetching = false;
             self.err = (e && (e.type || e.message)) || "couldn't load history"; self.loading = false;
+            self.drainPending();
           });
+      },
+      drainPending: function () {
+        if (this.pendingSince == null) return;
+        var s = this.pendingSince; this.pendingSince = null;
+        this.fetchHistory({ since: s });
       },
       // pure: derive net (handover/failover) events from consecutive samples,
       // suppressing any within RECENT_USER_MS of a known user/watchdog event so a
@@ -271,7 +296,13 @@ module.exports = (function () {
         var m = this.mFromEvent(e); if (m == null) return;
         this.pinnedM = this.cursor = this.clampM(m);
       },
-      setRange: function (w) { this.winW = w; this.pinnedM = null; this.cursor = null; },
+      setRange: function (w) {
+        this.winW = w; this.pinnedM = null; this.cursor = null;
+        // Backfill only when the new window reaches earlier than we've loaded; a
+        // narrower range just re-filters the samples already in memory.
+        var cutoff = this.nowMs() - w * 60000;
+        if (this.loadedFrom == null || cutoff < this.loadedFrom - 1000) this.fetchHistory({ since: cutoff });
+      },
       parseHash: function () {
         if (typeof window === "undefined" || !window.location) return;
         var q = {};
