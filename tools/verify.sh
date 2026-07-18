@@ -105,4 +105,50 @@ if [ -f src/sbin/mudimodem-collectd ]; then
     || fail "get_history test failed on-device"
 fi
 
+# 8. Phase 3: AT console chunk + community library + own-channel AT tool.
+echo "8. Phase 3: console chunk + AT library + AT tool"
+ssh -o BatchMode=yes "root@$HOST" 'test -s /www/views/gl-sdk4-ui-mudimodem-console.common.js.gz' \
+  || fail "console chunk .gz missing"
+ssh -o BatchMode=yes "root@$HOST" 'test -s /www/mudimodem/at-library.json.gz' \
+  || fail "at-library .gz missing"
+ssh -o BatchMode=yes "root@$HOST" 'test -s /usr/lib/mudimodem/mudimodem-at.py' \
+  || fail "AT tool missing"
+
+echo "8a. library gz parses on-device and is served via gzip_static"
+ssh -o BatchMode=yes "root@$HOST" 'gzip -dc /www/mudimodem/at-library.json.gz > /tmp/mm-lib.json && lua -e "local c=require(\"cjson\"); local f=io.open(\"/tmp/mm-lib.json\"); local d=c.decode(f:read(\"*a\")); assert(type(d.entries)==\"table\" and #d.entries>0)"; rc=$?; rm -f /tmp/mm-lib.json; exit $rc' \
+  || fail "at-library.json.gz is not valid gzipped JSON with entries"
+ssh -o BatchMode=yes "root@$HOST" \
+  'curl -sk -H "Accept-Encoding: gzip" "https://127.0.0.1/mudimodem/at-library.json?_t=1" | gzip -dc | grep -q "\"entries\""' \
+  || fail "library not served via gzip_static"
+
+echo "8b. console chunk serves + evals (render-only, speaks at_console)"
+CONBODY=$(ssh -o BatchMode=yes "root@$HOST" \
+  'curl -sk -H "Accept-Encoding: gzip" "https://127.0.0.1/views/gl-sdk4-ui-mudimodem-console.common.js?_t=1" | gzip -dc')
+printf '%s' "$CONBODY" | node -e '
+  let s=""; process.stdin.on("data",d=>s+=d).on("end",()=>{
+    const module={exports:{}}; const c=eval(s);
+    if(!c||c.name!=="mudimodem-console"){console.error("FAIL: console eval");process.exit(1);}
+    if(typeof c.render!=="function"||c.template!==undefined){console.error("FAIL: not render-only");process.exit(1);}
+    if(!/"at_console"/.test(s)){console.error("FAIL: does not speak at_console");process.exit(1);}
+    if(/modem\.CPU\.AT|send_at_command/.test(s)){console.error("FAIL: touches GL AT surfaces");process.exit(1);}
+    console.log("   console chunk eval OK ->", c.name);
+  })' || fail "console chunk eval failed"
+
+echo "8c. at_console backend (clamps + envelope, against the fake tool)"
+ssh -o BatchMode=yes "root@$HOST" 'mkdir -p /tmp/mmtest'
+ssh -o BatchMode=yes "root@$HOST" 'cat > /tmp/mmtest/fake-at.py' < test/fake-at-tool.py
+ssh -o BatchMode=yes "root@$HOST" 'cat > /tmp/mmtest/t.lua' < test/backend-console.test.lua
+ssh -o BatchMode=yes "root@$HOST" 'MUDIMODEM_AT_TOOL=/tmp/mmtest/fake-at.py lua /tmp/mmtest/t.lua >/dev/null; rc=$?; rm -rf /tmp/mmtest; exit $rc' \
+  || fail "at_console backend test failed on-device"
+
+echo "8d. LIVE: one read-only AT through the real tool (envelope + gl_modem sleep)"
+ssh -o BatchMode=yes "root@$HOST" \
+  'python3 /usr/lib/mudimodem/mudimodem-at.py --envelope --timeout 6 "AT" | head -1 | grep -q "^MM-AT:ok"' \
+  || fail "live AT through /dev/at_mdm0 did not return MM-AT:ok"
+
+echo "8e. gl_modem alive and NOT left stopped (the one failure that must never survive)"
+ssh -o BatchMode=yes "root@$HOST" \
+  'pids=$(pidof gl_modem); [ -n "$pids" ] || exit 1; for p in $pids; do s=$(cut -d" " -f3 "/proc/$p/stat"); [ "$s" = "T" ] && exit 1; done; exit 0' \
+  || fail "gl_modem missing or left in state T after the AT call"
+
 echo "ALL CHECKS PASSED"

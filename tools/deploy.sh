@@ -27,6 +27,15 @@ ssh -o BatchMode=yes "root@$HOST" 'cat > /usr/share/oui/menu.d/mudimodem-trackin
   < src/menu/mudimodem-tracking.json
 echo "tracking chunk + menu deployed"
 
+# Phase 3: AT console chunk + community library + our own AT channel tool.
+ssh -o BatchMode=yes "root@$HOST" 'cat > /www/views/gl-sdk4-ui-mudimodem-console.common.js.gz' \
+  < build/gl-sdk4-ui-mudimodem-console.common.js.gz
+ssh -o BatchMode=yes "root@$HOST" 'mkdir -p /www/mudimodem && cat > /www/mudimodem/at-library.json.gz' \
+  < build/at-library.json.gz
+ssh -o BatchMode=yes "root@$HOST" 'mkdir -p /usr/lib/mudimodem && cat > /usr/lib/mudimodem/mudimodem-at.py' \
+  < tools/mudimodem-at.py
+echo "console chunk + AT library + AT tool deployed"
+
 # Confirm-or-revert watchdog + panic restore (§5). Inert until invoked; install
 # it BEFORE the backend so set_bands can always find it.
 if [ -f src/sbin/mudimodem-revert ]; then
@@ -70,7 +79,11 @@ ssh -o BatchMode=yes "root@$HOST" 'f=/etc/sysupgrade.conf; touch "$f"; for p in 
   /usr/lib/oui-httpd/rpc/mudimodem \
   /usr/sbin/mudimodem-revert \
   /usr/sbin/mudimodem-collectd \
-  /etc/init.d/mudimodem-collectd ; do \
+  /etc/init.d/mudimodem-collectd \
+  /www/views/gl-sdk4-ui-mudimodem-console.common.js.gz \
+  /www/mudimodem/at-library.json.gz \
+  /usr/lib/mudimodem/mudimodem-at.py \
+  ; do \
   grep -qxF "$p" "$f" || echo "$p" >> "$f" ; done'
 echo "sysupgrade.conf registered"
 echo "deployed to $HOST"
