@@ -31,6 +31,8 @@ package.loaded["oui.ubus"] = {
   end
 }
 
+local base_ubus_call = package.loaded["oui.ubus"].call
+
 -- glc stub: nginx subrequest to GL's C plugins. Body format: "<code> <json>".
 local glc_calls = {}
 local glc_body = '0 {"slot1":{"cellid":"18B1AE035","network_type":"NR5G","pci":516,"freq":127490,"scs":15,"band":71},"slot2":{}}'
@@ -80,5 +82,62 @@ end)(package.loaded["oui.ubus"].call)
 r = M.get_lock({})
 assert(r.lock.l5g.locked == false and r.gl.locked == true, "setup wrong")
 assert(r.stale == true, "GL-locked + modem-unlocked must be stale")
+
+-- 4. 4G-locked parse branch: field order must be mode,freq,pci (modem.sh:940-942).
+package.loaded["oui.ubus"].call = (function(orig)
+  return function(o, m, p)
+    if o == "modem.CPU.AT" and p and p.cmd == 'AT+QNWLOCK="common/4g"' then
+      return { data = '\r\n+QNWLOCK: "common/4g",1,900,42\r\n\r\nOK\r\n' }
+    end
+    return orig(o, m, p)
+  end
+end)(base_ubus_call)
+glc_body = '0 {"slot1":{"cellid":"18B1AE035","network_type":"NR5G","pci":516,"freq":127490,"scs":15,"band":71},"slot2":{}}'
+at_replies = {}
+r = M.get_lock({})
+assert(r.lock.l4g.locked == true, "4g should be locked")
+assert(r.lock.l4g.mode == 1, "4g mode wrong")
+assert(r.lock.l4g.freq == 900, "4g freq wrong")
+assert(r.lock.l4g.pci == 42, "4g pci wrong")
+
+-- 5. at_expect retry exhaustion: three consecutive crossed replies for one
+--    query must degrade that field to nil, not throw. Note: get_lock also
+--    resolves the active sub_id via QSPN before the QNWLOCK reads, so a
+--    shared at_replies queue would get eaten by that unrelated call first —
+--    target the "common/4g" cmd specifically instead, leaving QSPN/others on
+--    their normal defaults.
+local junk = '\r\n+QNWPREFCFG: "nr5g_band",71\r\n\r\nOK\r\n'   -- matches no QNWLOCK/QENG marker
+package.loaded["oui.ubus"].call = (function(orig)
+  return function(o, m, p)
+    if o == "modem.CPU.AT" and p and p.cmd == 'AT+QNWLOCK="common/4g"' then
+      return { data = junk }   -- always wrong; exhausts all 3 at_expect retries
+    end
+    return orig(o, m, p)
+  end
+end)(base_ubus_call)
+glc_body = '0 {"slot1":{"cellid":"18B1AE035","network_type":"NR5G","pci":516,"freq":127490,"scs":15,"band":71},"slot2":{}}'
+at_replies = {}
+r = M.get_lock({})
+assert(type(r) == "table", "get_lock must not throw on exhausted retries")
+assert(r.lock.l4g == nil, "4g must degrade to nil after 3 crossed replies")
+assert(r.lock.l5g and r.lock.l5g.locked == true, "later fields must still parse normally")
+
+-- 6. stale formula's gl_locked conjunct: GL unlocked + modem unlocked must NOT
+--    be stale. Isolates gl_locked from a regression that simplifies stale to
+--    just `not modem_locked` (which would wrongly report true here).
+package.loaded["oui.ubus"].call = (function(orig)
+  return function(o, m, p)
+    if o == "modem.CPU.AT" and p and p.cmd == 'AT+QNWLOCK="common/5g"' then
+      return { data = '\r\n+QNWLOCK: "common/5g",0\r\n\r\nOK\r\n' }
+    end
+    return orig(o, m, p)
+  end
+end)(base_ubus_call)
+glc_body = '0 {"slot1":{},"slot2":{}}'   -- no cellid -> gl_locked=false
+at_replies = {}
+r = M.get_lock({})
+assert(r.lock.l4g.locked == false and r.lock.l5g.locked == false, "modem must be unlocked")
+assert(r.gl.locked == false, "GL store must show unlocked")
+assert(r.stale == false, "gl_locked=false + modem unlocked must not be stale")
 
 print("backend-lock.test.lua: all ok")
