@@ -73,6 +73,30 @@ const LIVE = {
   ] }
 };
 
+// Failover split state, captured live 2026-07-18: slot 1 SELECTED (T-Mobile,
+// registered, no data), slot 2 (Belgian 206-01 travel SIM, roaming on AT&T)
+// CARRYING DATA. The state GL's UI cannot render.
+const SPLIT = {
+  'cellular.modems_info': LIVE['cellular.modems_info'],
+  'cellular.modems_status': { modems: [{ bus: 'cpu', current_sim_slot: '1', slot_switch_status: 0 }] },
+  'cellular.sims_info': { sims: [
+    { slot: '1', bus: 'cpu', iccid: '8901260108736235562F', imsi: '310260103623556',
+      mcc: '310', mnc: '260', phone_number: '15388500234',
+      apn_list: ['h2g2', 'fast.t-mobile.com', 'gigsky', 'gigsky'] },
+    { slot: '2', bus: 'cpu', iccid: '89320420000217304391', imsi: '206018224530439',
+      mcc: '206', mnc: '01', phone_number: '',
+      apn_list: ['bicsapn', 'internet.proximus.be'] }
+  ] },
+  'cellular.sims_status': { sims: [
+    { slot: '1', iccid: '8901260108736235562F', carrier: 'T-Mobile', status: 6, apn: 'h2g2' },
+    { slot: '2', iccid: '89320420000217304391', carrier: 'AT&T', status: 6, apn: 'internet.proximus.be' }
+  ] },
+  'cellular.networks_status': { networks: [
+    { slot: '1', iccid: '8901260108736235562F', dial_status: 0 },
+    { slot: '2', iccid: '89320420000217304391', dial_status: 1 }
+  ] }
+};
+
 test('chunk eval returns the component (not undefined)', () => {
   const c = loadChunk();
   assert.ok(c && typeof c === 'object', 'eval must yield the component object');
@@ -348,4 +372,65 @@ test('the write calls target the watchdog-protected methods only', () => {
   // The page must never speak raw AT or hit the modem object directly.
   assert.doesNotMatch(src, /get_result_AT|modem\.CPU\.AT|QNWPREFCFG/,
     'the chunk must never issue raw AT — writes go through the backend');
+});
+
+// ---------------------------------------------------------------------------
+// Phase 4 — SIM / APN tab
+// ---------------------------------------------------------------------------
+
+test('slotCards: merges info/status/network per slot with the DSDS facts', () => {
+  const vm = makeVm(loadChunk(), SPLIT);
+  const [s1, s2] = vm.slotCards;
+  assert.equal(vm.slotCards.length, 2);
+  // Slot 1: selected, registered, NOT carrying data.
+  assert.equal(s1.slot, 1);
+  assert.equal(s1.selected, true);
+  assert.equal(s1.data, false);
+  assert.equal(s1.reg, 6);
+  assert.equal(s1.carrier, 'T-Mobile');
+  assert.equal(s1.apn, 'h2g2');
+  // Slot 2: NOT selected, carrying data — the split state.
+  assert.equal(s2.selected, false);
+  assert.equal(s2.data, true);
+  assert.equal(s2.iccid, '89320420000217304391');
+});
+
+test('slotCards: roaming honesty — home PLMN vs serving carrier', () => {
+  const vm = makeVm(loadChunk(), SPLIT);
+  const [s1, s2] = vm.slotCards;
+  // T-Mobile SIM on T-Mobile: home operator known, not roaming.
+  assert.equal(s1.home, 'T-Mobile US');
+  assert.equal(s1.roaming, false);
+  // Belgian 206-01 SIM serving on AT&T: roaming.
+  assert.equal(s2.home, 'Proximus BE');
+  assert.equal(s2.roaming, true);
+});
+
+test('slotCards: apn_list is deduplicated', () => {
+  const vm = makeVm(loadChunk(), SPLIT);
+  assert.deepEqual(vm.slotCards[0].apnList, ['h2g2', 'fast.t-mobile.com', 'gigsky']);
+});
+
+test('slotCards: empty slot degrades to blanks, unknown PLMN to mcc-mnc', () => {
+  const empty = JSON.parse(JSON.stringify(SPLIT));
+  empty['cellular.sims_info'].sims = [
+    { slot: '1', mcc: '999', mnc: '99', iccid: 'X', imsi: 'Y', apn_list: [] }
+  ];
+  empty['cellular.sims_status'].sims = [{ slot: '1', status: 0 }];
+  empty['cellular.networks_status'].networks = [];
+  const vm = makeVm(loadChunk(), empty);
+  const [s1, s2] = vm.slotCards;
+  assert.equal(s1.home, '999-99');           // unknown PLMN: no fake name
+  assert.equal(s1.roaming, false);           // status 0 → never claim roaming
+  assert.equal(s2.iccid, '');                // absent slot → blank card, no crash
+  assert.equal(s2.reg, undefined);
+});
+
+test('regLabel maps GL sim-status codes', () => {
+  const vm = makeVm(loadChunk(), SPLIT);
+  assert.equal(vm.regLabel(6), 'Registered');
+  assert.equal(vm.regLabel(5), 'Not registered');
+  assert.equal(vm.regLabel(0), 'No SIM');
+  assert.equal(vm.regLabel(undefined), '—');
+  assert.equal(vm.regLabel(3), 'Status 3');
 });

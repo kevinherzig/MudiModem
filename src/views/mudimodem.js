@@ -56,6 +56,16 @@ module.exports = {
         B: { 2: 1900, 4: 1700, 5: 850, 7: 2600, 12: 700, 13: 750, 14: 700, 17: 700,
              25: 1900, 26: 850, 29: 700, 30: 2300, 38: 2600, 41: 2500, 42: 3500,
              43: 3600, 48: 3500, 66: 1700, 71: 600 }
+      },
+      // Home-operator names for common PLMNs (MCC+MNC from sims_info). Labels
+      // only — used for the "roaming on X" honesty line. Unknown → "MCC-MNC".
+      PLMN: {
+        "310260": "T-Mobile US", "312250": "T-Mobile US", "310410": "AT&T US",
+        "310280": "AT&T US", "311480": "Verizon US", "313100": "FirstNet US",
+        "20601": "Proximus BE", "20404": "Vodafone NL", "26201": "Telekom DE",
+        "23430": "EE UK", "20801": "Orange FR", "22201": "TIM IT",
+        "21407": "Movistar ES", "50501": "Telstra AU", "44010": "docomo JP",
+        "302220": "Telus CA", "302610": "Bell CA", "302720": "Rogers CA"
       }
     };
   },
@@ -102,6 +112,43 @@ module.exports = {
       var s = sims.filter(function (x) { return String(x.slot) === String(self.activeSlot); })[0] || {};
       if (s.carrier) return s.carrier;
       return this.activeSim.mcc ? (this.activeSim.mcc + this.activeSim.mnc) : "";
+    },
+    // ---- SIM tab (Phase 4) ----
+    // One view-model per physical slot: identity + registration + the two DSDS
+    // facts GL never shows together (selected slot vs data-carrying slot).
+    slotCards() {
+      var self = this;
+      var infos = this.ms("cellular.sims_info").sims || [];
+      var stats = this.ms("cellular.sims_status").sims || [];
+      var nets = this.ms("cellular.networks_status").networks || [];
+      return [1, 2].map(function (slot) {
+        var bySlot = function (arr) {
+          return arr.filter(function (x) { return String(x.slot) === String(slot); })[0] || {};
+        };
+        var info = bySlot(infos), st = bySlot(stats), net = bySlot(nets);
+        var home = self.plmnName(info.mcc, info.mnc);
+        var named = !!self.PLMN[String(info.mcc || "") + String(info.mnc || "")];
+        return {
+          slot: slot,
+          selected: String(self.activeSlot) === String(slot),
+          data: net.dial_status === 1,
+          reg: st.status,
+          carrier: st.carrier || "",
+          home: home,
+          // Roaming claim only when confident: registered, home PLMN known, and
+          // the serving carrier's name doesn't contain the home name (or vice
+          // versa — "T-Mobile" vs "T-Mobile US" is home, not roaming).
+          roaming: st.status === 6 && named && !!st.carrier &&
+            !self.nameOverlap(home, st.carrier),
+          iccid: info.iccid || "", imsi: info.imsi || "",
+          phone: info.phone_number || "",
+          mcc: info.mcc || "", mnc: info.mnc || "",
+          apn: st.apn || "",
+          apnList: (info.apn_list || []).filter(function (a, i, arr) {
+            return arr.indexOf(a) === i;
+          })
+        };
+      });
     },
     hasData() { return this.serving.rsrp !== undefined && this.serving.rsrp !== null; },
     isNR() { return /NR5G/.test(this.serving.mode || ""); },
@@ -165,6 +212,20 @@ module.exports = {
         poor: "var(--error)", fair: "var(--warning)", good: "var(--info-hover)",
         excellent: "var(--success)", none: "var(--text-hint)"
       })[q];
+    },
+    plmnName(mcc, mnc) {
+      if (!mcc) return "";
+      return this.PLMN[String(mcc) + String(mnc)] || (mcc + "-" + mnc);
+    },
+    // Case/punctuation-insensitive containment: "T-Mobile US" vs "T-Mobile".
+    nameOverlap(a, b) {
+      var n = function (s) { return String(s).toLowerCase().replace(/[^a-z0-9]/g, ""); };
+      var x = n(a), y = n(b);
+      return !!x && !!y && (x.indexOf(y) !== -1 || y.indexOf(x) !== -1);
+    },
+    regLabel(reg) {
+      if (reg === undefined || reg === null) return "—";
+      return ({ 0: "No SIM", 5: "Not registered", 6: "Registered" })[reg] || ("Status " + reg);
     },
     freqOf(group, b) {
       var t = (group === "LTE") ? this.freq.B : this.freq.n;
