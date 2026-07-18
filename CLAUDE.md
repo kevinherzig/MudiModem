@@ -613,6 +613,15 @@ MudiModem/
   `mvas.switch_sim_slot` fallback unused). Spec: `docs/superpowers/specs/2026-07-18-sim-apn-tab-design.md`;
   plan: `docs/superpowers/plans/2026-07-18-sim-apn-tab.md`. Test-only tool: `ubus call gl-session call
   '{"module":"modem","func":..,"params":..}'` reaches `modem.so` glc methods as root, no web sid.
+- ⚠️ **Rapid slot switches can wedge GL's SIM detection (observed 2026-07-18).** Two
+  `set_slot_failover_config {current_sim}` switches seconds apart (1→2→1) left `cellular.sim` reporting
+  **`status:0` (No SIM) with garbage iccids** (`44000000003`, `E0127E0127E`) on *both* slots for 5+ min,
+  while **WAN stayed up** (radio/data path fine — it's the reporting layer, not connectivity). Recovery:
+  **`/etc/init.d/gl_cellular_manager restart`** (SIMs back to `status:6` in ~5 s; band lock survives).
+  Lesson for a real switch: **wait for the websocket to confirm before another switch** (the UI already
+  does — `switchTarget` gates re-entry). UI hardening from this: SIM cards now gate identity/form on
+  GL's **present** signal (`status` 5/6), never the iccid string, so a status-0 slot renders a clean
+  "Empty / No SIM" card instead of a stale-iccid + editable-form contradiction.
 - ⚠️ **Band config drifted off n71 (observed 2026-07-18).** `get_feature_config` now shows the full
   6-band T-Mobile policy set (`NR-SA:[25,41,48,66,77,71]`, `NR-NSA:[2,5,41,66,77,71]`), not the
   deliberate n71-only lock from 2026-07-15. Likely a `cellular_manager` restart re-applying stored
