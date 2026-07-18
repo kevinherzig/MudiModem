@@ -368,6 +368,79 @@ module.exports = {
           self.failoverErr = (e && (e.type || e.message)) || "request failed";
         });
     },
+    maskId(v) { return v ? String(v).slice(0, 4) + "…" : "—"; },
+    renderSlotCard(h, card) {
+      var self = this, slot = card.slot;
+      var revealed = this.simReveal[slot];
+      // Fact badges: Selected (mint) and Carrying data (indigo) are different
+      // facts and never share a colour (spec §4). Registration is neutral/amber.
+      var badges = [];
+      if (card.selected) badges.push(h("span", { staticClass: "mm-badge b-sel" }, "Selected"));
+      if (card.data) badges.push(h("span", { staticClass: "mm-badge b-data" }, "Carrying data"));
+      badges.push(h("span", {
+        staticClass: "mm-badge " + (card.reg === 6 ? "b-reg" : card.reg === 5 ? "b-warn" : "b-off")
+      }, this.regLabel(card.reg)));
+
+      var idRow = function (label, val) {
+        return h("div", { staticClass: "mm-idrow" }, [
+          h("span", { staticClass: "k" }, label),
+          h("b", revealed ? (val || "—") : self.maskId(val))
+        ]);
+      };
+
+      var kids = [
+        h("div", { staticStyle: { display: "flex", justifyContent: "space-between", alignItems: "baseline" } }, [
+          h("span", { staticClass: "mm-sect" }, card.carrier || (card.reg === 0 || card.reg === undefined ? "Empty" : "SIM")),
+          h("span", { staticClass: "mm-hint" }, "Slot " + slot)
+        ]),
+        h("div", { staticClass: "mm-badges" }, badges)
+      ];
+
+      // Identity: home operator + roaming honesty, then masked identifiers.
+      if (card.iccid) {
+        if (card.home) {
+          kids.push(h("div", { staticClass: "mm-idrow" }, [
+            h("span", { staticClass: "k" }, "Home operator"),
+            h("b", card.home)
+          ]));
+        }
+        if (card.roaming) {
+          kids.push(h("div", {
+            staticClass: "mm-hint",
+            staticStyle: { color: "var(--warning)", margin: "2px 0 6px" }
+          }, "Roaming on " + card.carrier));
+        }
+        kids.push(idRow("ICCID", card.iccid));
+        kids.push(idRow("IMSI", card.imsi));
+        if (card.phone) kids.push(idRow("Phone", card.phone));
+        kids.push(h("button", {
+          staticClass: "mm-reveal",
+          on: { click: function () { self.simReveal[slot] = !revealed; } }
+        }, revealed ? "Hide identifiers" : "Show identifiers"));
+        kids.push(h("div", { staticClass: "mm-idrow" }, [
+          h("span", { staticClass: "k" }, "APN in use"),
+          h("b", card.apn || "—")
+        ]));
+      }
+      if (this.simCfgErr[slot]) {
+        kids.push(h("div", { staticClass: "mm-hint", staticStyle: { color: "var(--error)" } },
+          "Couldn't load dial config: " + this.simCfgErr[slot]));
+      }
+      return h("div", { key: slot, staticClass: "mm-card mm-slot" + (card.selected ? " sel" : "") }, kids);
+    },
+    renderSim(h) {
+      var self = this;
+      return h("div", [
+        h("div", { staticClass: "mm-simgrid" },
+          this.slotCards.map(function (c) { return self.renderSlotCard(h, c); })),
+        // Failover card lands here in Task 6.
+        h("div", { staticClass: "mm-hint", staticStyle: { marginTop: "9px" } },
+          "DSDS: both SIMs stay registered; exactly one carries data at a time. " +
+          "The selected slot and the data-carrying slot can differ during failover — " +
+          "both facts are shown above. (AT users: sub_id must follow the active " +
+          "subscription; sub_id=0 answers for the wrong SIM.)")
+      ]);
+    },
 
     // The interactive RATs (each maps to a set_bands arg).
     interactive(group) { return group === "sa" || group === "nsa" || group === "LTE"; },
@@ -528,6 +601,19 @@ module.exports = {
         '.mm-dl .k{display:block;font-size:9px;letter-spacing:.05em;text-transform:uppercase;color:var(--text-badge)}.mm-dl b{font-size:13px;font-weight:600;color:var(--text-title)}' +
         '.mm-soon{padding:26px 14px;text-align:center;color:var(--text-hint);font-size:12px;line-height:1.6}' +
         '.mm-empty{padding:30px 14px;text-align:center;color:var(--text-hint);font-size:12.5px}' +
+        // SIM tab
+        '.mm-simgrid{display:grid;grid-template-columns:1fr 1fr;gap:11px}' +
+        '@media (max-width:720px){.mm-simgrid{grid-template-columns:1fr}}' +
+        '.mm-slot.sel{box-shadow:0 0 0 1.5px var(--success) inset}' +
+        '.mm-badges{display:flex;gap:6px;flex-wrap:wrap;margin:7px 0 9px}' +
+        '.mm-badge{font-size:11px;padding:2px 8px;border-radius:9px;border:1px solid var(--divider);color:var(--text-secondary)}' +
+        '.mm-badge.b-sel{border-color:var(--success);color:var(--success)}' +
+        '.mm-badge.b-data{background:var(--primary);border-color:var(--primary);color:#fff}' +
+        '.mm-badge.b-warn{border-color:var(--warning);color:var(--warning)}' +
+        '.mm-badge.b-off{color:var(--text-hint)}' +
+        '.mm-idrow{display:flex;justify-content:space-between;gap:9px;padding:3px 0;font-size:12.5px}' +
+        '.mm-idrow .k{color:var(--text-hint)}' +
+        '.mm-reveal{background:none;border:none;color:var(--primary);font-size:12px;padding:2px 0;cursor:pointer}' +
         // band grid
         '.mm-grp{margin-bottom:15px}.mm-grp:last-child{margin-bottom:2px}' +
         '.mm-grp-h{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:7px}' +
@@ -873,11 +959,12 @@ module.exports = {
           this.trackingErr ? "Couldn't load the graph: " + this.trackingErr
             : "Loading the signal graph…")]);
       }
+    } else if (this.tab === "sim") {
+      panel = this.renderSim(h);
     } else {
       var soon = {
         lock: "Cell lock - Phase 2.",
-        at: "AT console + community library - Phase 3.",
-        sim: "SIM / APN - Phase 4."
+        at: "AT console + community library - Phase 3."
       }[this.tab];
       panel = h("div", { staticClass: "mm-card" }, [h("div", { staticClass: "mm-soon" }, soon)]);
     }

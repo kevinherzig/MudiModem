@@ -518,3 +518,47 @@ test('fetchFailover: reads config and seeds failoverEdit with string hour/min', 
     });
   } finally { unstubRpc(); }
 });
+
+test('SIM tab renders two slot cards with honest DSDS badges', () => {
+  const comp = loadChunk();
+  const vm = makeVm(comp, SPLIT);
+  vm.tab = 'sim';
+  const nodes = walk(comp.render.call(vm, h));
+  const cards = nodes.filter((n) => /mm-slot\b/.test(n.data.staticClass || ''));
+  assert.equal(cards.length, 2);
+  // Selected ring on slot 1 only.
+  assert.ok(/\bsel\b/.test(cards[0].data.staticClass));
+  assert.ok(!/\bsel\b/.test(cards[1].data.staticClass));
+  // The split state: "Selected" on card 1, "Carrying data" on card 2.
+  assert.ok(textOf(cards[0]).includes('Selected'));
+  assert.ok(!textOf(cards[0]).includes('Carrying data'));
+  assert.ok(textOf(cards[1]).includes('Carrying data'));
+  // Roaming honesty on card 2.
+  assert.ok(textOf(cards[1]).includes('Proximus BE'));
+  assert.ok(textOf(cards[1]).includes('Roaming on AT&T'));
+});
+
+test('SIM tab masks identity until revealed', () => {
+  const comp = loadChunk();
+  const vm = makeVm(comp, SPLIT);
+  vm.tab = 'sim';
+  let text = textOf(comp.render.call(vm, h));
+  assert.ok(!text.includes('8901260108736235562F'));   // full ICCID hidden
+  assert.ok(text.includes('8901…'));                   // masked stub shown
+  vm.simReveal[1] = true;
+  text = textOf(comp.render.call(vm, h));
+  assert.ok(text.includes('8901260108736235562F'));
+});
+
+test('SIM tab: empty slot renders as an empty card, no crash', () => {
+  const empty = JSON.parse(JSON.stringify(SPLIT));
+  empty['cellular.sims_info'].sims = empty['cellular.sims_info'].sims.slice(0, 1);
+  empty['cellular.sims_status'].sims = [
+    empty['cellular.sims_status'].sims[0], { slot: '2', status: 0 }
+  ];
+  const comp = loadChunk();
+  const vm = makeVm(comp, empty);
+  vm.tab = 'sim';
+  const text = textOf(comp.render.call(vm, h));
+  assert.ok(text.includes('No SIM'));
+});
