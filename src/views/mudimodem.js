@@ -932,11 +932,39 @@ module.exports = {
         (this.pending && this.pending.kind === "cell") ? this.renderRevert(h) : null,
         this.lockError && this.lockData
           ? h("div", { staticClass: "mm-hint", staticStyle: { color: "var(--error)" } }, this.lockError) : null,
+        (this.lockData.stale)
+          ? h("div", { staticClass: "mm-revert" }, [
+              h("div", { staticClass: "mm-revert-row" }, [
+                h("span", [
+                  "The watchdog reverted a lock, but ", h("b", "GL's stored lock"),
+                  " still remembers it - GL may re-apply it later. Clear it to reconcile."
+                ]),
+                h("button", { staticClass: "mm-btn keep", attrs: { disabled: this.lockBusy },
+                  on: { click: this.unlockCell } }, "Clear it")
+              ])
+            ])
+          : null,
         this.renderCurrentCell(h),
-        this.renderScanCard(h)
-        // Task 6 appends: stale banner + this.renderRecovery(h)
+        this.renderScanCard(h),
+        this.renderRecovery(h)
       ];
       return h("div", { staticClass: "mm-card" }, kids.filter(Boolean));
+    },
+
+    renderRecovery(h) {
+      return h("div", { staticClass: "mm-grp" }, [
+        h("div", { staticClass: "mm-grp-h" }, [
+          h("span", { staticClass: "mm-grp-t" }, "Recovery"),
+          h("span", { staticClass: "mm-hint" }, "read before locking")
+        ]),
+        h("div", { staticClass: "mm-hint", staticStyle: { lineHeight: "1.6" } }, [
+          "A kept cell lock lives in the modem's own NV (survives reboot, reflash and factory reset) ",
+          "and in GL's store. Every lock made here auto-reverts in 60s unless you keep it, and the ",
+          "watchdog fires even if this page is closed. If the router ever becomes unreachable over ",
+          "the web, the ssh way back is: ", h("b", "ssh root@<router> /usr/sbin/mudimodem-revert panic"),
+          " - it unlocks both RATs, resets lock persistence, and restores the known-good bands."
+        ])
+      ]);
     }
   },
 

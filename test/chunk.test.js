@@ -644,3 +644,25 @@ test('lock tab: scan-row Confirm button disabled while pending (confirming branc
   assert.ok(btn.data.attrs && btn.data.attrs.disabled,
     'scan-row Confirm must be disabled while a revert is pending (previously uncovered)');
 });
+
+test('lock tab: stale GL store shows reconcile banner', () => {
+  const component = loadChunk();
+  const vm = makeVm(component, LIVE);
+  vm.tab = 'lock';
+  vm.lockData = JSON.parse(JSON.stringify(LOCKDATA_UNLOCKED));
+  vm.lockData.stale = true;
+  vm.lockData.gl = { locked: true, tower: { cellid: 'X' } };
+  const text = textOf(component.render.call(vm, h));
+  assert.match(text, /GL('s)? stored lock/i);
+  assert.match(text, /Clear it/);
+});
+
+test('lock tab: recovery card names the ssh panic path', () => {
+  const component = loadChunk();
+  const vm = makeVm(component, LIVE);
+  vm.tab = 'lock';
+  vm.lockData = JSON.parse(JSON.stringify(LOCKDATA_UNLOCKED));
+  const text = textOf(component.render.call(vm, h));
+  assert.match(text, /mudimodem-revert panic/);
+  assert.match(text, /survives reboot/i);
+});

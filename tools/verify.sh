@@ -86,6 +86,14 @@ if [ -f src/sbin/mudimodem-revert ]; then
   ssh -o BatchMode=yes "root@$HOST" 'cat > /tmp/mm-w.test.lua' < test/backend-write.test.lua
   ssh -o BatchMode=yes "root@$HOST" 'MUDIMODEM_PENDING=/tmp/mmv-pending MUDIMODEM_ARMED=/tmp/mmv-armed MUDIMODEM_BIN=/usr/sbin/mudimodem-revert MUDIMODEM_HIST=/tmp/mmv-hist lua /tmp/mm-w.test.lua >/dev/null; rc=$?; rm -rf /tmp/mm-w.test.lua /tmp/mmv-pending /tmp/mmv-armed /tmp/mmv-hist; exit $rc' \
     || fail "set_bands interlock test failed"
+
+  echo "6b. cell-lock backend + watchdog cell revert (isolation, on-device)"
+  ssh -o BatchMode=yes "root@$HOST" 'cat > /tmp/mm-l.test.lua'  < test/backend-lock.test.lua
+  ssh -o BatchMode=yes "root@$HOST" 'cat > /tmp/mm-lw.test.lua' < test/backend-lock-write.test.lua
+  ssh -o BatchMode=yes "root@$HOST" 'MM_PLUGIN=/usr/lib/oui-httpd/rpc/mudimodem MUDIMODEM_PENDING=/tmp/mml-p MUDIMODEM_ARMED=/tmp/mml-a MUDIMODEM_STALE=/tmp/mml-s MUDIMODEM_HIST=/tmp/mml-h lua /tmp/mm-l.test.lua >/dev/null && MM_PLUGIN=/usr/lib/oui-httpd/rpc/mudimodem MUDIMODEM_PENDING=/tmp/mml-p MUDIMODEM_ARMED=/tmp/mml-a MUDIMODEM_STALE=/tmp/mml-s MUDIMODEM_BIN=/usr/sbin/mudimodem-revert MUDIMODEM_HIST=/tmp/mml-h lua /tmp/mm-lw.test.lua >/dev/null; rc=$?; rm -rf /tmp/mm-l.test.lua /tmp/mm-lw.test.lua /tmp/mml-p /tmp/mml-a /tmp/mml-s /tmp/mml-h; exit $rc' \
+    || fail "cell-lock isolation tests failed on-device"
+  ssh -o BatchMode=yes "root@$HOST" 'grep -q "\"\$KIND\" = \"cell\"" /usr/sbin/mudimodem-revert' \
+    || fail "deployed watchdog lacks cell revert"
 fi
 
 # 7. History collector: service running + get_history parses telemetry.
