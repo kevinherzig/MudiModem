@@ -42,4 +42,22 @@ assert(not r4.response:find("\nATZ", 1, true), "no second command line")
 local r5 = M.at_console({ cmd = "AT+X='y'" })
 assert(r5.ok and r5.response:find("AT+X='y'", 1, true), "single quotes survive")
 
+-- Error/fallback paths, driven by the fake tool's branching (no modem, no ubus).
+local rb = M.at_console({ cmd = "AT__BUSY__" })
+assert(rb.error and not rb.ok, "busy must error, not succeed")
+assert(rb.error:lower():find("busy", 1, true), "busy error must mention busy, got: " .. rb.error)
+
+local ro = M.at_console({ cmd = "AT__OPENFAIL__" })
+assert(ro.error and not ro.ok, "openfail must error, not succeed")
+assert(ro.error:find("cannot open", 1, true), "openfail error must mention the port, got: " .. ro.error)
+
+local rg = M.at_console({ cmd = "AT__GARBAGE__" })
+assert(rg.error and not rg.ok, "garbage (no envelope) must error, not succeed")
+assert(rg.error:find("no envelope", 1, true), "garbage error must mention no envelope, got: " .. rg.error)
+
+-- Unknown-but-matching status must NOT be reported as success (Fix 2).
+local rw = M.at_console({ cmd = "AT__WEIRD__" })
+assert(rw.error and not rw.ok, "unknown status must error, not succeed")
+assert(rw.error:find("unexpected status", 1, true), "weird-status error must say so, got: " .. rw.error)
+
 print("at_console backend OK")

@@ -449,9 +449,11 @@ function M.at_console(args)
   if timeout > 60 then timeout = 60 end
   timeout = math.floor(timeout)
 
-  -- POSIX shell single-quote escaping: ' -> '\''
+  -- POSIX shell single-quote escaping: ' -> '\''. AT_TOOL is operator config,
+  -- not request input, so this isn't exploitable — quoted for consistency.
   local quoted = "'" .. cmd:gsub("'", "'\\''") .. "'"
-  local f = io.popen("python3 " .. AT_TOOL .. " --envelope --timeout " ..
+  local quoted_tool = "'" .. AT_TOOL:gsub("'", "'\\''") .. "'"
+  local f = io.popen("python3 " .. quoted_tool .. " --envelope --timeout " ..
                      timeout .. " " .. quoted .. " 2>/dev/null")
   if not f then return { error = "failed to spawn the AT tool" } end
   local out = f:read("*a") or ""
@@ -463,7 +465,10 @@ function M.at_console(args)
   end
   if status == "busy" then return { error = "channel busy - another command in flight" } end
   if status == "openfail" then return { error = "cannot open the AT port (/dev/at_mdm0)" } end
-  return { ok = true, status = status, response = rest, elapsed_ms = tonumber(ms) }
+  if status == "ok" or status == "timeout" then
+    return { ok = true, status = status, response = rest, elapsed_ms = tonumber(ms) }
+  end
+  return { error = "AT tool returned unexpected status: " .. status }
 end
 
 return M
