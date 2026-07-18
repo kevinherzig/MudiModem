@@ -16,14 +16,14 @@ class FakeModem:
     """Answers the first AT command written to the pty with a canned reply."""
     def __init__(self, reply=b"\r\nOK\r\n", delay=0.0):
         self.master, self.slave = os.openpty()
-        tty.setraw(self.slave)          # raw byte stream, like the real port
+        tty.setraw(self.slave)
         self.path = os.ttyname(self.slave)
-        self.reply, self.delay = reply, delay
+        self.reply, self.delay, self.loop = reply, delay, False
         threading.Thread(target=self._serve, daemon=True).start()
 
     def _serve(self):
         buf = b""
-        while b"\r" not in buf:
+        while True:
             try:
                 b = os.read(self.master, 64)
             except OSError:
@@ -31,10 +31,14 @@ class FakeModem:
             if not b:
                 return
             buf += b
-        if self.delay:
-            time.sleep(self.delay)
-        if self.reply:
-            os.write(self.master, self.reply)
+            while b"\r" in buf:
+                buf = buf.split(b"\r", 1)[1]
+                if self.delay:
+                    time.sleep(self.delay)
+                if self.reply:
+                    os.write(self.master, self.reply)
+                if not self.loop:
+                    return
 
 
 class ATToolTest(unittest.TestCase):
@@ -46,21 +50,29 @@ class ATToolTest(unittest.TestCase):
         fm = FakeModem(b"\r\n+QSPN: \"T-Mobile\"\r\n\r\nOK\r\n")
         ch = mm.ATChannel(port=fm.path, lock=self.lock)
         try:
-            text, ok = ch.send("AT+QSPN", timeout=3)
+            text, kind = ch.send("AT+QSPN", timeout=3)
         finally:
             ch.close()
-        self.assertTrue(ok, "terminator must be recognised")
-        self.assertIn("OK", text)
+        self.assertEqual(kind, "ok", "OK terminator must classify as ok")
         self.assertIn("T-Mobile", text)
+
+    def test_send_error_terminator_is_kind_error(self):
+        fm = FakeModem(b"\r\nERROR\r\n")
+        ch = mm.ATChannel(port=fm.path, lock=self.lock)
+        try:
+            text, kind = ch.send("AT+BAD", timeout=3)
+        finally:
+            ch.close()
+        self.assertEqual(kind, "error", "ERROR terminator must classify as error")
 
     def test_send_timeout_reports_no_terminator(self):
         fm = FakeModem(reply=b"")           # never answers
         ch = mm.ATChannel(port=fm.path, lock=self.lock)
         try:
-            text, ok = ch.send("AT", timeout=0.4)
+            text, kind = ch.send("AT", timeout=0.4)
         finally:
             ch.close()
-        self.assertFalse(ok)
+        self.assertEqual(kind, "timeout")
         self.assertEqual(text, "")
 
     def test_lines_filters_urcs(self):
@@ -99,9 +111,34 @@ class ATToolTest(unittest.TestCase):
             capture_output=True, text=True, timeout=15)
         self.assertEqual(r.returncode, 0, r.stderr)
         first, _, rest = r.stdout.partition("\n")
-        self.assertRegex(first, r"^MM-AT:ok:\d+$")
+        self.assertRegex(first, r"^MM-AT:ok:\d+:1/1$")
         self.assertIn("RG650VNA", rest)
         self.assertIn("OK", rest)
+
+    def test_cli_envelope_multistep_ok(self):
+        # A modem that answers EVERY command with OK (serves in a loop).
+        fm = FakeModem(b"\r\nOK\r\n"); fm.loop = True
+        r = subprocess.run(
+            [sys.executable, TOOL, "--envelope", "--timeout", "3",
+             "--port", fm.path, "--lock", self.lock, "--no-glsleep",
+             "AT+ONE", "AT+TWO"],
+            capture_output=True, text=True, timeout=15)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        heads = [l for l in r.stdout.splitlines() if l.startswith("MM-AT:")]
+        self.assertRegex(heads[0], r"^MM-AT:ok:\d+:1/2$")
+        self.assertRegex(heads[1], r"^MM-AT:ok:\d+:2/2$")
+
+    def test_cli_envelope_stop_on_error(self):
+        # First command ERRORs -> second must never run (no 2/2 frame).
+        fm = FakeModem(b"\r\nERROR\r\n"); fm.loop = True
+        r = subprocess.run(
+            [sys.executable, TOOL, "--envelope", "--timeout", "3",
+             "--port", fm.path, "--lock", self.lock, "--no-glsleep",
+             "AT+BAD", "AT+NEVER"],
+            capture_output=True, text=True, timeout=15)
+        heads = [l for l in r.stdout.splitlines() if l.startswith("MM-AT:")]
+        self.assertRegex(heads[0], r"^MM-AT:error:\d+:1/2$")
+        self.assertEqual(len(heads), 1, "no frame after an errored step")
 
     def test_cli_envelope_busy(self):
         fm = FakeModem()

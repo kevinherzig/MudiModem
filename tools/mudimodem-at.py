@@ -48,7 +48,11 @@ URC_PREFIXES = ("RDY", "+CPIN:", "+QUSIM:", "+QUSIM", "+CPINDS:", "+QIND:",
 def gl_modem_pids():
     """PIDs of GL's gl_modem daemon(s) — the AT traffic source we quiet."""
     pids = []
-    for name in os.listdir("/proc"):
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return pids   # no /proc (e.g. the macOS dev box) -> nothing to recover/sleep
+    for name in names:
         if not name.isdigit():
             continue
         try:
@@ -166,10 +170,11 @@ class ATChannel:
                 break
 
     def send(self, cmd, timeout=8):
-        """Send one AT command. Returns (raw_text, terminator_seen)."""
+        """Send one AT command. Returns (raw_text, kind) where kind is
+        'ok' (OK terminator), 'error' (ERROR/+CME/+CMS), or 'timeout'."""
         self._drain()
         os.write(self.fd, (cmd + "\r").encode())
-        buf, ok, deadline = b"", False, time.time() + timeout
+        buf, kind, deadline = b"", "timeout", time.time() + timeout
         while time.time() < deadline:
             r, _, _ = select.select([self.fd], [], [], max(0, deadline - time.time()))
             if not r:
@@ -182,14 +187,15 @@ class ATChannel:
                 continue
             buf += chunk
             t = buf.decode(errors="replace")
-            if any(k in t for k in ("\nOK\r", "\nERROR\r", "+CME ERROR", "+CMS ERROR")):
-                ok = True
-                break
-        return buf.decode(errors="replace"), ok
+            if "\nERROR\r" in t or "+CME ERROR" in t or "+CMS ERROR" in t:
+                kind = "error"; break
+            if "\nOK\r" in t:
+                kind = "ok"; break
+        return buf.decode(errors="replace"), kind
 
     def lines(self, cmd, timeout=8):
         """send(), returned as clean lines with URCs filtered out."""
-        resp, _ok = self.send(cmd, timeout)
+        resp, _kind = self.send(cmd, timeout)
         out = [l.strip() for l in resp.replace("\r", "\n").split("\n") if l.strip()]
         return [l for l in out if not l.startswith(URC_PREFIXES)]
 
@@ -247,16 +253,26 @@ def main(argv):
     try:
         try:
             with GlModemSleep(glsleep):
+                count = len(cmds)
                 if envelope:
-                    resp, ok = ch.send(cmds[0], timeout)
-                    print("MM-AT:%s:%d" % ("ok" if ok else "timeout", ms()))
-                    sys.stdout.write(resp)
+                    for idx, cmd in enumerate(cmds, 1):
+                        resp, kind = ch.send(cmd, timeout)
+                        print("MM-AT:%s:%d:%d/%d" % (kind, ms(), idx, count))
+                        sys.stdout.write(resp)
+                        if not resp.endswith("\n"):
+                            sys.stdout.write("\n")
+                        if kind != "ok":
+                            break          # stop-on-error: emit no further frames
                     return 0
                 for cmd in cmds:
                     t1 = time.time()
-                    for l in ch.lines(cmd, timeout):
+                    resp, kind = ch.send(cmd, timeout)
+                    for l in [x.strip() for x in resp.replace("\r", "\n").split("\n")
+                              if x.strip() and not x.strip().startswith(URC_PREFIXES)]:
                         print("    " + l)
-                    print(">>> %s   (%.2fs)" % (cmd, time.time() - t1))
+                    print(">>> %s   (%.2fs) [%s]" % (cmd, time.time() - t1, kind))
+                    if kind != "ok":
+                        break              # stop-on-error in the shell path too
                 return 0
         except OSError as e:
             # e.g. os.write() failing mid-send (port yanked, EIO, ...). The
