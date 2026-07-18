@@ -261,7 +261,12 @@ module.exports = {
   },
 
   created() { this.injectStyle(); },
-  mounted() { if (this.tab === "tracking") this.loadTracking(); },
+  mounted() {
+    if (this.tab === "tracking") this.loadTracking();
+    // Load the band/lock model up front so the banner's mode + tower badges have
+    // data whatever tab we land on (the tab watcher only fires on a change).
+    if (!this.bands && !this.bandsLoading) this.fetchBands();
+  },
   beforeDestroy() { this.clearCountdown(); this.clearSwitchState(); },
 
   methods: {
@@ -420,6 +425,7 @@ module.exports = {
         .then(function (res) {
           if (res && res.error) { self.lockError = res.error; return; }
           self.fetchLock();
+          self.fetchBands();   // refresh meta.lock so the banner tower badge updates
         })
         .catch(function (e) { self.lockError = (e && (e.type || e.message)) || "unlock failed"; })
         .then(function () { self.lockBusy = false; });
@@ -895,6 +901,44 @@ module.exports = {
       var pci = (lk.pci !== undefined && lk.pci !== null) ? " / PCI " + lk.pci : "";
       return rat + band + pci;
     },
+    // --- banner control-state badges (mode lock + tower lock) ------------
+    // Both ride on this.bands (get_bands). Return null until it has loaded, so
+    // the strip never asserts a state we don't yet know (a false "Unlocked").
+    modeBadge() {
+      if (!this.bands) return null;
+      var m = this.appliedMode();
+      if (m === "LTE") return { text: "4G only", active: true };
+      if (m === "NR5G") return { text: "5G only", active: true };
+      return { text: "Auto", active: false };
+    },
+    towerBadge() {
+      if (!this.bands) return null;
+      var lk = this.lockInfo();
+      if (!lk) return { text: "Unlocked", locked: false };
+      var rat = lk.rat === "4g" ? "LTE" : "5G";
+      var tag = (lk.band !== undefined && lk.band !== null && lk.band !== "")
+        ? (lk.rat === "4g" ? "B" : "n") + lk.band
+        : (lk.pci !== undefined && lk.pci !== null ? "PCI " + lk.pci : "");
+      return { text: rat + (tag ? " " + tag : ""), locked: true, title: this.lockLabel() };
+    },
+    // Two clickable status badges for the trace header. Each jumps to its tab.
+    renderLockBadges(h) {
+      var self = this, mb = this.modeBadge(), tb = this.towerBadge();
+      if (!mb && !tb) return h("span");   // bands not loaded yet — assert nothing
+      var kids = [];
+      if (mb) kids.push(h("button", {
+        staticClass: "mm-lockbadge" + (mb.active ? " mode" : ""),
+        attrs: { type: "button", title: "Network mode — open Bands" },
+        on: { click: function () { self.tab = "bands"; } }
+      }, mb.text));
+      if (tb) kids.push(h("button", {
+        staticClass: "mm-lockbadge" + (tb.locked ? " lock" : ""),
+        attrs: { type: "button",
+                 title: (tb.locked ? tb.title + " — " : "") + "Cell lock — open Cell lock tab" },
+        on: { click: function () { self.tab = "lock"; } }
+      }, (tb.locked ? "🔒 " : "🔓 ") + tb.text));
+      return h("div", { staticClass: "mm-lockbadges" }, kids);
+    },
     setMode(m) {
       // Block moving INTO a mode that would strand the lock. The mode the modem
       // is already in is exempt — we never auto-write it away; only a NEW
@@ -984,7 +1028,7 @@ module.exports = {
           var k = self.pending.kind;
           self.clearCountdown();
           self.pending = { kind: k, done: true, reverted: true };
-          if (k === "cell") self.fetchLock(); else self.fetchBands();
+          self.fetchBands(); if (k === "cell") self.fetchLock();
           setTimeout(function () { self.pending = null; }, 4000);
         }
       }, 1000);
@@ -1000,7 +1044,7 @@ module.exports = {
         .then(function () {
           var k = self.pending && self.pending.kind;
           self.pending = null;
-          if (k === "cell") self.fetchLock(); else self.fetchBands();
+          self.fetchBands(); if (k === "cell") self.fetchLock();
         });
     },
     revertBands() {
@@ -1012,7 +1056,7 @@ module.exports = {
         .then(function () {}).catch(function () {})
         .then(function () {
           self.pending = null;
-          if (k === "cell") self.fetchLock(); else self.fetchBands();
+          self.fetchBands(); if (k === "cell") self.fetchLock();
         });
     },
 
@@ -1053,6 +1097,12 @@ module.exports = {
         '.mm-rsrp{font-size:29px;font-weight:600;line-height:1;letter-spacing:-.025em}.mm-rsrp .u{font-size:11px;font-weight:500;color:var(--text-hint);margin-left:2px}' +
         '.mm-facts{display:flex;flex-wrap:wrap;gap:5px 13px;justify-content:flex-end;margin-top:7px}' +
         '.mm-facts .k{display:block;font-size:9px;letter-spacing:.04em;text-transform:uppercase;color:var(--text-badge)}.mm-facts b{font-size:12.5px;font-weight:600}' +
+        // Control-state badges on the trace header: mode lock + tower lock. Muted
+        // when idle (Auto / Unlocked), tinted when a restriction is in force.
+        '.mm-lockbadges{display:flex;gap:6px;align-items:center}' +
+        '.mm-lockbadge{background:var(--background-3,rgba(0,0,0,.04));border:1px solid transparent;border-radius:9px;padding:1px 8px;font:inherit;font-size:10px;font-weight:600;letter-spacing:.02em;color:var(--text-hint);cursor:pointer;white-space:nowrap}' +
+        '.mm-lockbadge.mode{color:var(--warning);border-color:var(--warning-disabled,var(--warning));background:var(--warning-disabled,transparent)}' +
+        '.mm-lockbadge.lock{color:var(--error);border-color:var(--error);background:transparent}' +
         '.mm-tabs{display:flex;gap:22px;border-bottom:1px solid var(--divider);margin-bottom:11px;padding:0 4px}' +
         '.mm-tab{background:none;border:0;padding:9px 0 8px;font:inherit;font-size:13px;cursor:pointer;color:var(--text-weak);border-bottom:2px solid transparent;margin-bottom:-1px}' +
         '.mm-tab.on{color:var(--primary);border-bottom-color:var(--primary);font-weight:600}' +
@@ -1584,8 +1634,9 @@ module.exports = {
       var rsrpColor = this.qColor(this.rsrpQ);
       stripKids = [
         h("div", { staticClass: "mm-trace" }, [
-          h("div", { staticStyle: { display: "flex", justifyContent: "space-between", alignItems: "baseline" } }, [
-            h("span", { staticClass: "mm-eyebrow" }, "RSRP live")
+          h("div", { staticStyle: { display: "flex", justifyContent: "space-between", alignItems: "center" } }, [
+            h("span", { staticClass: "mm-eyebrow" }, "RSRP live"),
+            this.renderLockBadges(h)
           ]),
           h("div", { staticClass: "mm-plot" }, [
             h("svg", { attrs: { viewBox: "0 0 320 40", preserveAspectRatio: "none" } }, [

@@ -234,6 +234,72 @@ test('strip is inert: no Tracking link, no click handler on the trace', () => {
   assert.doesNotMatch(textOf(trace), /↗/, 'no "Tracking ↗" affordance in the strip');
 });
 
+// ---- Banner mode-lock + tower-lock badges ----
+// The badges live on the always-visible strip and read this.bands (get_bands),
+// which carries meta.mode and meta.lock. They render only once bands has loaded.
+function bannerBadges(c, vm) {
+  return walk(c.render.call(vm, h))
+    .filter((n) => n.data.staticClass && /\bmm-lockbadge\b/.test(n.data.staticClass));
+}
+
+test('banner badges: idle state shows muted Auto + Unlocked', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, LIVE);
+  vm.bands = { meta: { mode: 'AUTO' } };            // no lock
+  const badges = bannerBadges(c, vm);
+  assert.equal(badges.length, 2, 'two badges render once bands loaded');
+  assert.equal(textOf(badges[0]), 'Auto');
+  assert.doesNotMatch(badges[0].data.staticClass, /\bmode\b/, 'Auto is muted (no active class)');
+  assert.match(textOf(badges[1]), /Unlocked/);
+  assert.doesNotMatch(badges[1].data.staticClass, /\block\b/, 'Unlocked is muted');
+});
+
+test('banner badges: 4G-only and 5G-only turn the mode badge active', () => {
+  const c = loadChunk();
+  let vm = makeVm(c, LIVE); vm.bands = { meta: { mode: 'LTE' } };
+  assert.equal(textOf(bannerBadges(c, vm)[0]), '4G only');
+  assert.match(bannerBadges(c, vm)[0].data.staticClass, /\bmode\b/, 'restriction marks the mode badge active');
+  vm = makeVm(c, LIVE); vm.bands = { meta: { mode: 'NR5G' } };
+  assert.equal(textOf(bannerBadges(c, vm)[0]), '5G only');
+});
+
+test('banner badges: active tower lock shows lock glyph + RAT/band + full tooltip', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, LIVE);
+  vm.bands = { meta: { mode: 'AUTO', lock: { active: true, rat: '4g', band: 12, pci: 242 } } };
+  const tower = bannerBadges(c, vm)[1];
+  assert.match(textOf(tower), /LTE B12/, 'compact RAT + band label');
+  assert.match(tower.data.staticClass, /\block\b/, 'locked marks the tower badge active');
+  assert.match(tower.data.attrs.title, /LTE B12 \/ PCI 242/, 'full lock label in the tooltip');
+});
+
+test('banner badges: hidden until bands load (never a false Unlocked)', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, LIVE);                       // vm.bands stays null
+  assert.equal(bannerBadges(c, vm).length, 0, 'no badge asserted before get_bands returns');
+});
+
+test('banner badges: clicking jumps to the owning tab', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, LIVE);
+  vm.bands = { meta: { mode: 'AUTO', lock: { active: true, rat: '4g', band: 12, pci: 242 } } };
+  const badges = bannerBadges(c, vm);
+  badges[0].data.on.click();
+  assert.equal(vm.tab, 'bands', 'mode badge opens Bands');
+  badges[1].data.on.click();
+  assert.equal(vm.tab, 'lock', 'tower badge opens Cell lock');
+});
+
+test('mounted() proactively fetches get_bands so the badges have data on any tab', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, LIVE);
+  let fetched = 0;
+  vm.fetchBands = function () { fetched++; };
+  vm.loadTracking = function () {};
+  c.mounted.call(vm);
+  assert.equal(fetched, 1, 'mounted loads the band/lock model up front');
+});
+
 test('Diagnostics tab is gone; Tracking is first and the default', () => {
   const c = loadChunk();
   assert.strictEqual(c.data().tab, 'tracking', 'default landing tab is Tracking');
