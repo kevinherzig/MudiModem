@@ -35,10 +35,18 @@ module.exports = {
       bandsError: "",
       sel: { sa: null, nsa: null, LTE: null },   // desired allowlists per editable RAT
       selMode: null,        // desired network mode (AUTO | NR5G | LTE)
-      pending: null,        // { window, applied, remaining } after Apply
+      pending: null,        // { kind, window, applied, remaining } after Apply/Lock
       cdTimer: null,        // countdown interval handle
       applying: false,      // Apply in flight
       applyError: "",
+      lockData: null,       // get_lock result, once fetched
+      lockLoading: false,
+      lockError: "",
+      lockBusy: false,      // a lock/unlock RPC in flight
+      lockConfirm: null,    // target awaiting inline confirm ({...target,label})
+      // Scanned neighbour towers (Task 5 fills the scan card); pinTarget reads
+      // scan.towers now to confirm an SCS reading when one is available.
+      scan: { towers: [], running: false, error: "", ts: 0 },
       // Tracking tab: the graph lives in its OWN chunk (gl-sdk4-ui-mudimodem-
       // tracking). Rather than route away (which hides our strip + tab bar), we
       // lazy-load that chunk on first open and render it as an in-page child
@@ -56,7 +64,15 @@ module.exports = {
         B: { 2: 1900, 4: 1700, 5: 850, 7: 2600, 12: 700, 13: 750, 14: 700, 17: 700,
              25: 1900, 26: 850, 29: 700, 30: 2300, 38: 2600, 41: 2500, 42: 3500,
              43: 3600, 48: 3500, 66: 1700, 71: 600 }
-      }
+      },
+      // Default NR SS-block SCS per band (kHz), used ONLY when no scan result
+      // covers the serving cell. Source: 3GPP TS 38.104 §5.4.3 band tables —
+      // FDD low/mid bands are 15 kHz, the TDD mid bands 30 kHz. The confirm
+      // text says when this assumption is in play. Encoding (kHz vs index)
+      // verified at the supervised milestone before first use.
+      SCS_DEFAULT: { 2: 15, 5: 15, 7: 15, 12: 15, 13: 15, 14: 15, 25: 15, 26: 15,
+                     29: 15, 30: 15, 38: 30, 41: 30, 48: 30, 66: 15, 70: 15,
+                     71: 15, 77: 30, 78: 30, 79: 30 }
     };
   },
 
@@ -150,6 +166,7 @@ module.exports = {
     },
     tab(t) {
       if (t === "bands" && !this.bands && !this.bandsLoading) this.fetchBands();
+      if (t === "lock" && !this.lockData && !this.lockLoading) this.fetchLock();
     }
   },
 
@@ -221,6 +238,67 @@ module.exports = {
       var cfg = (this.bands.config && this.bands.config[group]) || [];
       var pol = (this.bands.policy && this.bands.policy[group]) || [];
       return (cfg.length ? cfg : pol).slice();
+    },
+
+    // Fetch the current cell-lock state (serving cell + any existing lock).
+    fetchLock() {
+      var self = this;
+      if (typeof window === "undefined" || !window.$rpcRequest) {
+        this.lockError = "RPC helper unavailable"; return;
+      }
+      this.lockLoading = true; this.lockError = "";
+      window.$rpcRequest("call", ["sid", "mudimodem", "get_lock", {}], { timeout: 20000 })
+        .then(function (res) { self.lockData = res; })
+        .catch(function (e) { self.lockError = (e && (e.type || e.message)) || "request failed"; })
+        .then(function () { self.lockLoading = false; });
+    },
+    scsFor(band) { return this.SCS_DEFAULT[band]; },
+    // Build the lock target for the serving cell. SCS: last scan result for
+    // this pci+arfcn if we have one, else the band default (flagged assumed).
+    pinTarget() {
+      var s = this.lockData && this.lockData.serving;
+      if (!s || !s.pci || !s.arfcn) return null;
+      var isNR = /NR5G/.test(s.rat || "");
+      var t = { rat: isNR ? "5g" : "4g", pci: s.pci, freq: s.arfcn,
+                band: s.band, label: "current cell PCI " + s.pci };
+      if (isNR) {
+        var match = (this.scan.towers || []).filter(function (tw) {
+          return String(tw.pci) === String(s.pci) && String(tw.freq) === String(s.arfcn);
+        })[0];
+        if (match && match.scs !== undefined) { t.scs = Number(match.scs); t.scsAssumed = false; }
+        else { t.scs = this.scsFor(s.band); t.scsAssumed = true; }
+        if (t.scs === undefined) return null;   // unknown band: refuse rather than guess
+      }
+      return t;
+    },
+    lockCell(target) {
+      var self = this;
+      if (this.lockBusy || this.pending || !target) return;
+      this.lockBusy = true; this.lockError = "";
+      var args = { rat: target.rat, pci: target.pci, freq: target.freq };
+      if (target.scs !== undefined) args.scs = target.scs;
+      if (target.band !== undefined) args.band = target.band;
+      if (target.extra) args.extra = target.extra;
+      window.$rpcRequest("call", ["sid", "mudimodem", "set_cell_lock", args], { timeout: 30000 })
+        .then(function (res) {
+          if (!res || res.error) { self.lockError = (res && res.error) || "lock failed"; return; }
+          self.lockConfirm = null;
+          self.startCountdown(res.window || 60, res.applied, "cell");
+        })
+        .catch(function (e) { self.lockError = (e && (e.type || e.message)) || "lock failed"; })
+        .then(function () { self.lockBusy = false; });
+    },
+    unlockCell() {
+      var self = this;
+      if (this.lockBusy || this.pending) return;
+      this.lockBusy = true; this.lockError = "";
+      window.$rpcRequest("call", ["sid", "mudimodem", "clear_cell_lock", {}], { timeout: 30000 })
+        .then(function (res) {
+          if (res && res.error) { self.lockError = res.error; return; }
+          self.fetchLock();
+        })
+        .catch(function (e) { self.lockError = (e && (e.type || e.message)) || "unlock failed"; })
+        .then(function () { self.lockBusy = false; });
     },
 
     // The interactive RATs (each maps to a set_bands arg).
@@ -300,18 +378,23 @@ module.exports = {
         .catch(function (e) { self.applyError = (e && (e.type || e.message)) || "apply failed"; })
         .then(function () { self.applying = false; });
     },
-    startCountdown(window_s, applied) {
+    // kind defaults to "bands" so the existing bands call sites keep working
+    // unchanged; the cell-lock flow passes "cell" so the banner + refetch land
+    // on the right tab (§renderRevert / renderBands / renderLock).
+    startCountdown(window_s, applied, kind) {
       var self = this;
       this.clearCountdown();
-      this.pending = { remaining: window_s, window: window_s, applied: applied, done: false };
+      this.pending = { kind: kind || "bands", remaining: window_s, window: window_s,
+                       applied: applied, done: false };
       this.cdTimer = setInterval(function () {
         if (!self.pending) return;
         self.pending.remaining -= 1;
         if (self.pending.remaining <= 0) {
           // The watchdog has reverted server-side. Reflect it and re-read.
+          var k = self.pending.kind;
           self.clearCountdown();
-          self.pending = { done: true, reverted: true };
-          self.fetchBands();
+          self.pending = { kind: k, done: true, reverted: true };
+          if (k === "cell") self.fetchLock(); else self.fetchBands();
           setTimeout(function () { self.pending = null; }, 4000);
         }
       }, 1000);
@@ -324,15 +407,23 @@ module.exports = {
       this.clearCountdown();
       window.$rpcRequest("call", ["sid", "mudimodem", "confirm", {}])
         .then(function () {}).catch(function () {})
-        .then(function () { self.pending = null; self.fetchBands(); });
+        .then(function () {
+          var k = self.pending && self.pending.kind;
+          self.pending = null;
+          if (k === "cell") self.fetchLock(); else self.fetchBands();
+        });
     },
     revertBands() {
       var self = this;
       this.clearCountdown();
-      this.pending = { done: true, reverting: true };
+      var k = this.pending && this.pending.kind;
+      this.pending = { kind: k, done: true, reverting: true };
       window.$rpcRequest("call", ["sid", "mudimodem", "revert_now", {}], { timeout: 20000 })
         .then(function () {}).catch(function () {})
-        .then(function () { self.pending = null; self.fetchBands(); });
+        .then(function () {
+          self.pending = null;
+          if (k === "cell") self.fetchLock(); else self.fetchBands();
+        });
     },
 
     // Classify one band for the read-only groups: active / permitted / blocked.
@@ -530,17 +621,23 @@ module.exports = {
     renderRevert(h) {
       var self = this, p = this.pending;
       if (p.done) {
+        var doneMsg = p.reverting ? "Reverting..." :
+          (p.reverted ? (p.kind === "cell" ? "Reverted - cell lock removed." : "Reverted - restored your previous bands.") : "");
         return h("div", { staticClass: "mm-revert" }, [
-          h("span", { staticClass: "mm-revert-row" },
-            p.reverting ? "Reverting..." : (p.reverted ? "Reverted - restored your previous bands." : ""))
+          h("span", { staticClass: "mm-revert-row" }, doneMsg)
         ]);
       }
-      // Summarise what changed (applied = { mode, sa, nsa, lte }).
+      // Summarise what changed (applied = { mode, sa, nsa, lte } for bands;
+      // { rat, pci, freq } for a cell lock).
       var a = p.applied || {}, bits = [];
-      if (a.mode) bits.push("mode " + a.mode);
-      if (a.sa) bits.push("5G-SA " + a.sa.split(":").map(function (b) { return "n" + b; }).join(" "));
-      if (a.nsa) bits.push("5G-NSA " + a.nsa.split(":").map(function (b) { return "n" + b; }).join(" "));
-      if (a.lte) bits.push("LTE " + a.lte.split(":").map(function (b) { return "B" + b; }).join(" "));
+      if (p.kind === "cell") {
+        bits.push((a.rat === "4g" ? "LTE" : "5G") + " cell PCI " + a.pci + " / ARFCN " + a.freq);
+      } else {
+        if (a.mode) bits.push("mode " + a.mode);
+        if (a.sa) bits.push("5G-SA " + a.sa.split(":").map(function (b) { return "n" + b; }).join(" "));
+        if (a.nsa) bits.push("5G-NSA " + a.nsa.split(":").map(function (b) { return "n" + b; }).join(" "));
+        if (a.lte) bits.push("LTE " + a.lte.split(":").map(function (b) { return "B" + b; }).join(" "));
+      }
       var pct = Math.max(0, Math.min(100, (p.remaining / p.window) * 100));
       return h("div", { staticClass: "mm-revert" }, [
         h("div", { staticClass: "mm-revert-row" }, [
@@ -590,7 +687,7 @@ module.exports = {
           "Choose the network mode and which 5G/LTE bands the modem may use. Blocked bands are ones " +
           "the module supports but your carrier forbids - they can't be selected because they never take."),
         warn,
-        this.pending ? this.renderRevert(h) : null
+        (this.pending && this.pending.kind !== "cell") ? this.renderRevert(h) : null
       ];
       var footer = [];
       if (!this.pending) {
@@ -623,6 +720,102 @@ module.exports = {
         h("span", "ring = serving now")
       ])];
       return h("div", { staticClass: "mm-card" }, head.filter(Boolean).concat(groups).concat(footer).concat(legend));
+    },
+
+    // ---- cell-lock render helpers ----
+    renderCurrentCell(h) {
+      var self = this, d = this.lockData;
+      var s = d.serving || {};
+      var l5 = (d.lock && d.lock.l5g) || {}, l4 = (d.lock && d.lock.l4g) || {};
+      var locked = !!(l5.locked || l4.locked || (d.gl && d.gl.locked));
+      var rows = [];
+      var push = function (k, v) { if (v !== undefined && v !== null && v !== "") rows.push([k, v]); };
+      push("RAT", s.rat); push("PCI", s.pci); push("ARFCN", s.arfcn);
+      push("Band", s.band !== undefined ? ((/NR5G/.test(s.rat || "") ? "n" : "B") + s.band) : null);
+      push("Cell ID", s.cell_id);
+      push("RSRP", this.serving.rsrp !== undefined ? this.serving.rsrp + " dBm" : null);
+      push("SINR", this.serving.sinr !== undefined ? this.serving.sinr + " dB" : null);
+
+      var action;
+      if (locked) {
+        var lk = l5.locked ? l5 : l4;
+        action = h("div", { staticClass: "mm-foot" }, [
+          h("span", { staticClass: "mm-hint" }, [
+            h("b", { staticStyle: { color: "var(--success)" } }, "Locked"),
+            " to PCI " + lk.pci + " / ARFCN " + lk.freq +
+            (lk.band ? " (n" + lk.band + ")" : "") + ". The modem will not hand over."
+          ]),
+          h("button", {
+            staticClass: "mm-btn danger",
+            attrs: { disabled: this.lockBusy || !!this.pending },
+            on: { click: function () { self.unlockCell(); } }
+          }, this.lockBusy ? "Unlocking..." : "Unlock")
+        ]);
+      } else {
+        var target = this.pinTarget();
+        if (this.lockConfirm && this.lockConfirm.pin) {
+          action = h("div", { staticClass: "mm-foot" }, [
+            h("span", { staticClass: "mm-hint", staticStyle: { color: "var(--warning)" } },
+              "Lock to PCI " + target.pci + "? Network mode switches to " +
+              (target.rat === "5g" ? "5G-only" : "4G-preferred") + " until unlocked." +
+              (target.scsAssumed ? " SCS " + target.scs + " kHz is assumed from the band." : "") +
+              " Auto-reverts in 60s unless kept."),
+            h("span", { staticStyle: { flex: "none", display: "flex", gap: "6px" } }, [
+              h("button", { staticClass: "mm-btn", on: { click: function () { self.lockConfirm = null; } } }, "Cancel"),
+              h("button", {
+                staticClass: "mm-btn primary", attrs: { disabled: this.lockBusy },
+                on: { click: function () { self.lockCell(target); } }
+              }, this.lockBusy ? "Locking..." : "Lock it")
+            ])
+          ]);
+        } else {
+          action = h("div", { staticClass: "mm-foot" }, [
+            h("span", { staticClass: "mm-hint" },
+              "Pin the modem to the cell it is using now - the safest lock target."),
+            h("button", {
+              staticClass: "mm-btn primary",
+              attrs: { disabled: !target || this.lockBusy || !!this.pending },
+              on: { click: function () { self.lockConfirm = { pin: true }; } }
+            }, "Lock to this cell")
+          ]);
+        }
+      }
+      return h("div", { staticClass: "mm-grp" }, [
+        h("div", { staticClass: "mm-grp-h" }, [
+          h("span", { staticClass: "mm-grp-t" }, "Current cell"),
+          h("span", { staticClass: "mm-hint" }, locked ? "locked" : "serving now")
+        ]),
+        h("div", { staticClass: "mm-dl" }, rows.map(function (r, i) {
+          return h("div", { key: i }, [h("span", { staticClass: "k" }, r[0]), h("b", String(r[1]))]);
+        })),
+        action
+      ]);
+    },
+
+    renderLock(h) {
+      if (this.lockLoading && !this.lockData)
+        return h("div", { staticClass: "mm-card" }, [h("div", { staticClass: "mm-empty" }, "Reading lock state from the modem...")]);
+      if (this.lockError && !this.lockData)
+        return h("div", { staticClass: "mm-card" }, [h("div", { staticClass: "mm-empty" }, "Couldn't read lock state: " + this.lockError)]);
+      if (!this.lockData)
+        return h("div", { staticClass: "mm-card" }, [h("div", { staticClass: "mm-empty" }, "...")]);
+      var kids = [
+        h("div", { staticStyle: { display: "flex", justifyContent: "space-between", alignItems: "baseline" } }, [
+          h("span", { staticClass: "mm-sect" }, "Cell lock"),
+          h("button", {
+            staticClass: "mm-tab", staticStyle: { fontSize: "11.5px", padding: "2px 0", borderBottom: "0" },
+            attrs: { disabled: !!this.pending },
+            on: { click: this.fetchLock }
+          }, this.lockLoading ? "refreshing..." : "refresh")
+        ]),
+        (this.pending && this.pending.kind === "cell") ? this.renderRevert(h) : null,
+        this.lockError && this.lockData
+          ? h("div", { staticClass: "mm-hint", staticStyle: { color: "var(--error)" } }, this.lockError) : null,
+        this.renderCurrentCell(h)
+        // Task 5 appends: this.renderScanCard(h)
+        // Task 6 appends: stale banner + this.renderRecovery(h)
+      ];
+      return h("div", { staticClass: "mm-card" }, kids.filter(Boolean));
     }
   },
 
@@ -717,6 +910,8 @@ module.exports = {
       ]);
     } else if (this.tab === "bands") {
       panel = this.renderBands(h);
+    } else if (this.tab === "lock") {
+      panel = this.renderLock(h);
     } else if (this.tab === "tracking") {
       if (this.trackingComp) {
         // Render the lazy-loaded graph as a child component. `embedded` tells it
@@ -729,7 +924,6 @@ module.exports = {
       }
     } else {
       var soon = {
-        lock: "Cell lock - Phase 2.",
         at: "AT console + community library - Phase 3.",
         sim: "SIM / APN - Phase 4."
       }[this.tab];

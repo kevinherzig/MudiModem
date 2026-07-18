@@ -349,3 +349,74 @@ test('the write calls target the watchdog-protected methods only', () => {
   assert.doesNotMatch(src, /get_result_AT|modem\.CPU\.AT|QNWPREFCFG/,
     'the chunk must never issue raw AT — writes go through the backend');
 });
+
+// ---- Cell-lock tab ----
+
+const LOCKDATA_UNLOCKED = {
+  lock: { l4g: { locked: false }, l5g: { locked: false }, save_ctrl: { raw: '0,0', s4g: 0, s5g: 0 } },
+  gl: { locked: false, tower: null },
+  serving: { rat: 'NR5G-SA', pci: 516, arfcn: 127490, band: 71, cell_id: '18B1AE035' },
+  stale: false, pending_kind: null,
+  meta: { sub_id: 1, slot: '1', plmn: '310260', plmn_matched: true }
+};
+
+test('lock tab: unlocked state renders serving cell + Lock button', () => {
+  const component = loadChunk();
+  const vm = makeVm(component, LIVE);
+  vm.tab = 'lock';
+  vm.lockData = JSON.parse(JSON.stringify(LOCKDATA_UNLOCKED));
+  const tree = component.render.call(vm, h);
+  const text = textOf(tree);
+  assert.match(text, /PCI/);
+  assert.match(text, /516/);
+  assert.match(text, /127490/);
+  assert.match(text, /Lock to this cell/);
+});
+
+test('lock tab: locked state shows Locked badge + Unlock, no Lock button', () => {
+  const component = loadChunk();
+  const vm = makeVm(component, LIVE);
+  vm.tab = 'lock';
+  vm.lockData = JSON.parse(JSON.stringify(LOCKDATA_UNLOCKED));
+  vm.lockData.lock.l5g = { locked: true, pci: 516, freq: 127490, scs: 15, band: 71 };
+  vm.lockData.gl = { locked: true, tower: { cellid: 'X', pci: 516 } };
+  const text = textOf(component.render.call(vm, h));
+  assert.match(text, /Locked/);
+  assert.match(text, /Unlock/);
+  assert.doesNotMatch(text, /Lock to this cell/);
+});
+
+test('lock tab: pin target derives from serving cell with SCS default', () => {
+  const component = loadChunk();
+  const vm = makeVm(component, LIVE);
+  vm.lockData = JSON.parse(JSON.stringify(LOCKDATA_UNLOCKED));
+  const t = vm.pinTarget();
+  assert.equal(t.rat, '5g');
+  assert.equal(t.pci, 516);
+  assert.equal(t.freq, 127490);
+  assert.equal(t.band, 71);
+  assert.equal(t.scs, 15);          // n71 default, 3GPP TS 38.104
+  assert.equal(t.scsAssumed, true); // no scan result to confirm it
+});
+
+test('lock tab: cell pending banner renders on lock tab, not bands tab', () => {
+  const component = loadChunk();
+  const vm = makeVm(component, LIVE);
+  vm.tab = 'lock';
+  vm.lockData = JSON.parse(JSON.stringify(LOCKDATA_UNLOCKED));
+  vm.pending = { kind: 'cell', remaining: 42, window: 60,
+                 applied: { rat: '5g', pci: 516, freq: 127490 } };
+  const text = textOf(component.render.call(vm, h));
+  assert.match(text, /42s/);
+  assert.match(text, /Revert now/);
+});
+
+test('bands tab: cell pending does NOT paint the bands banner', () => {
+  const component = loadChunk();
+  const vm = makeVm(component, LIVE);
+  vm.tab = 'bands';
+  vm.bands = null; vm.bandsLoading = true;   // bands view in loading state
+  vm.pending = { kind: 'cell', remaining: 42, window: 60, applied: {} };
+  const text = textOf(component.render.call(vm, h));
+  assert.doesNotMatch(text, /42s/);
+});
