@@ -59,10 +59,13 @@ set_band() {  # $1 = param (e.g. nr5g_band), $2 = colon list, $3 = sub_id
 
 restore_from_pending() {
   if [ ! -f "$PENDING" ]; then log "no pending file; nothing to restore"; return 0; fi
-  SUB_ID=1; PREV_nr5g_band=""
+  SUB_ID=1; PREV_nr5g_band=""; PREV_nsa_nr5g_band=""; PREV_lte_band=""; PREV_mode_pref=""
   # shellcheck disable=SC1090
   . "$PENDING"
-  [ -n "${PREV_nr5g_band:-}" ] && set_band "nr5g_band" "$PREV_nr5g_band" "${SUB_ID:-1}"
+  [ -n "${PREV_nr5g_band:-}" ]     && set_band "nr5g_band"     "$PREV_nr5g_band"     "${SUB_ID:-1}"
+  [ -n "${PREV_nsa_nr5g_band:-}" ] && set_band "nsa_nr5g_band" "$PREV_nsa_nr5g_band" "${SUB_ID:-1}"
+  [ -n "${PREV_lte_band:-}" ]      && set_band "lte_band"      "$PREV_lte_band"      "${SUB_ID:-1}"
+  [ -n "${PREV_mode_pref:-}" ]     && { log "restore mode_pref -> $PREV_mode_pref"; at "AT+QNWPREFCFG=\"mode_pref\",$PREV_mode_pref" "${SUB_ID:-1}"; }
   rm -f "$PENDING"
   log "revert complete; pending cleared"
 }

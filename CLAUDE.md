@@ -303,13 +303,19 @@ returns GL's stored band config **already parsed**:
 (§ reference §2). So the three-layer *lie* stands — GL offers all 18 module bands as checkboxes and
 never shows that policy permits 6.
 
-⚠️ **CORRECTION 2 (2026-07-17, from Phase 2b): read `config` from RAW AT, not `get_feature_config`.**
-`get_feature_config` is GL's *own* stored view; it does **not** observe our raw-AT `set_bands` writes,
-so right after a band change it reports STALE bands and the UI reseeds the selection from the wrong
-list (the n66-vanishes bug). Since we WRITE via raw `AT+QNWPREFCFG`, we must READ config from raw AT
-too (`nr5g_band` at the resolved sub_id). Then supported (ubus) / config+policy+capability (raw AT)
-all stay consistent through a write. `get_bands` reads only `config.sa` from AT (the UI's live need);
-nsa/LTE config are left empty to save AT round-trips (each risks the 10s `/rpc` timeout).
+📌 **CONFIG + MODE read path (settled 2026-07-17 after two reversals): `get_feature_config` (ubus).**
+`get_bands` reads config (`NR-SA`/`NR-NSA`/`LTE`) and mode (`network_mode`) from **one**
+`cellular.modem get_feature_config` call — NOT raw AT. History of the flip-flop, so nobody re-does it:
+- v1 read config from `cellular.sim get_config` → wrong method (no band_list).
+- v2 read config from raw AT (`nr5g_band` etc.) because `get_feature_config` was **stale after our
+  raw-AT `set_bands`** (the n66-vanishes bug: GL's stored view didn't see our write).
+- v3 (current) back to `get_feature_config`, because **Path B fixed the staleness**: `confirm()` now
+  writes GL's stored config via `set_feature_config`, so GL and the modem agree after every Keep. It
+  lags only during a *pending revert*, when editing is locked — so it's accurate whenever it matters.
+- **Why it matters:** the AT channel is shared with GL's polling. `get_bands` doing ~7 raw-AT reads
+  made it slow enough to trip the admin's request-timeout banner and congest GL's polling. The ubus
+  read dropped 4 AT round-trips (get_bands ~0.04s stable). **policy + capability stay on raw AT**
+  (AT-only) — keep the AT count minimal.
 
 ⚠️⚠️ **DURABILITY GAP (2026-07-17) — raw-AT band writes revert on `cellular_manager` restart.**
 GL's `cellular_manager` **re-applies its stored config to the modem on (re)start**, overwriting raw-AT

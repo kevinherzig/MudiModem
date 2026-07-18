@@ -9,7 +9,8 @@
 -- ACL: admin session is aclgroup "root" => always allowed (oui/rpc.lua:87). No
 -- ACL file needed; do NOT expose any no-auth method.
 
-local ubus = require "oui.ubus"
+local ubus  = require "oui.ubus"
+local cjson = require "cjson"
 
 local M = {}
 
@@ -17,6 +18,24 @@ local M = {}
 local PENDING    = os.getenv("MUDIMODEM_PENDING") or "/etc/mudimodem/pending"
 local ARMED      = os.getenv("MUDIMODEM_ARMED")   or "/etc/mudimodem/armed"
 local REVERT_BIN = os.getenv("MUDIMODEM_BIN")     or "/usr/sbin/mudimodem-revert"
+
+-- An empty Lua table encodes as {} (object); GL's set_feature_config wants []
+-- for empty band lists. cjson.empty_array is the sentinel that encodes as [].
+local function arr(t)
+  if type(t) == "table" and #t > 0 then return t end
+  return cjson.empty_array
+end
+
+-- Editable RATs: our key <-> the AT param <-> GL's band_list key.
+local RATS = {
+  { key = "sa",  param = "nr5g_band",     gl = "NR-SA" },
+  { key = "nsa", param = "nsa_nr5g_band", gl = "NR-NSA" },
+  { key = "lte", param = "lte_band",      gl = "LTE" },
+}
+-- Network mode: our label <-> mode_pref (AT) == network_mode (GL config) value.
+-- Only these three are exposed (GL's own choices). NSA needs an LTE anchor, so
+-- it is usable only under AUTO; SA under AUTO/NR5G; LTE under AUTO/LTE.
+local MODES = { AUTO = true, NR5G = true, LTE = true }
 
 -- Call a dotted ubus object, returning (table|nil, err).
 --
@@ -136,16 +155,24 @@ function M.get_bands(args)
   -- 2. active subscription (PLMN-matched sub_id), to target the AT queries.
   local sub_id, plmn, matched, slot = resolve_active()
 
-  -- 3. config (what YOU configured) — from RAW AT, the modem's truth.
-  --    NOT cellular.modem get_feature_config: GL's config layer never observes
-  --    our raw-AT writes, so right after a set_bands it reports STALE bands and
-  --    the UI would reseed the selection from the wrong list. Reading raw AT
-  --    keeps config comparable to policy/capability (all same source).
-  --    Only config.sa is consumed (the interactive SA grid); nsa/LTE config are
-  --    left empty to avoid two extra AT round-trips (every one risks the /rpc
-  --    10s timeout, worse during a re-registration).
+  -- 3. config + mode — from GL's stored view (ONE ubus call, no AT).
+  --    The AT channel is shared with GL's polling; too many raw-AT reads here
+  --    make get_bands slow enough to trip the admin's request-timeout banner and
+  --    congest GL's own polling. Reading get_feature_config instead drops FOUR
+  --    AT round-trips. Safe now: Path B (confirm -> set_feature_config) keeps
+  --    GL's stored config in sync with the modem on every Keep, so this is
+  --    accurate whenever the user can edit — it lags only during a pending
+  --    revert, when editing is locked. (This reverses the earlier "read raw AT"
+  --    workaround, whose whole reason — GL not seeing our writes — Path B fixed.)
   local config = { enable = true, mode = 0, LTE = {}, nsa = {}, sa = {} }
-  config.sa = pref_line(at('AT+QNWPREFCFG="nr5g_band"', sub_id), "nr5g_band")
+  local feat = ucall("cellular.modem", "get_feature_config", { bus = bus })
+  local fb = feat and feat.band and feat.band.band_list
+  if fb then
+    config.sa  = fb["NR-SA"] or {}
+    config.nsa = fb["NR-NSA"] or {}
+    config.LTE = fb.LTE or {}
+  end
+  local mode_pref = (feat and feat.network_mode) or nil   -- AUTO | NR5G | LTE
 
   -- 4. policy + capability — AT only, at the resolved sub_id.
   local pol_blob = at('AT+QNWPREFCFG="policy_band"', sub_id)
@@ -172,44 +199,64 @@ function M.get_bands(args)
       plmn = plmn,
       sub_id = sub_id,
       plmn_matched = matched,   -- false => sub_id resolution is a best guess
+      mode = mode_pref,         -- AUTO | NR5G | LTE (or a combo) — the RAT gate
     },
   }
 end
 
--- WRITE: set the 5G-SA band allowlist, protected by confirm-or-revert.
--- args = { sa = { <band numbers> } }.  Returns { ok, window, previous, applied,
--- sub_id } or { error }.  The change reverts automatically after `window`
--- seconds unless confirm() is called first.
+-- WRITE: set band allowlists and/or the network mode, protected by
+-- confirm-or-revert. args = { sa={..}, nsa={..}, lte={..}, mode="AUTO"|"NR5G"|"LTE" }
+-- — each optional; any provided band list must be non-empty. Returns
+-- { ok, window, applied={sa=..,nsa=..,lte=..,mode=..}, sub_id } or { error }.
 function M.set_bands(args)
-  local sa = args and args.sa
-  if type(sa) ~= "table" or #sa == 0 then
-    return { error = "refusing to write an empty band list (would drop all service)" }
-  end
-  local parts = {}
-  for _, b in ipairs(sa) do
-    local n = tonumber(b)
-    if not n or n < 1 or n ~= math.floor(n) then
-      return { error = "invalid band value: " .. tostring(b) }
+  -- Validate + collect the RATs being changed.
+  local changes = {}
+  for _, rat in ipairs(RATS) do
+    local sel = args and args[rat.key]
+    if type(sel) == "table" then
+      if #sel == 0 then
+        return { error = "refusing to write an empty " .. rat.key .. " list (would drop that RAT)" }
+      end
+      local parts = {}
+      for _, b in ipairs(sel) do
+        local n = tonumber(b)
+        if not n or n < 1 or n ~= math.floor(n) then
+          return { error = "invalid band value: " .. tostring(b) }
+        end
+        parts[#parts + 1] = tostring(n)
+      end
+      changes[#changes + 1] = { key = rat.key, param = rat.param, list = table.concat(parts, ":") }
     end
-    parts[#parts + 1] = tostring(n)
   end
-  local newlist = table.concat(parts, ":")
+  local mode = args and args.mode
+  if mode ~= nil and not MODES[mode] then
+    return { error = "invalid mode: " .. tostring(mode) }
+  end
+  if #changes == 0 and not mode then return { error = "no changes provided" } end
 
-  local sub_id = resolve_active()
+  local sub_id, _, _, slot = resolve_active()
 
-  -- Capture the CURRENT config verbatim as the revert target.
-  local prev = pref_raw(at('AT+QNWPREFCFG="nr5g_band"', sub_id), "nr5g_band")
+  -- Capture PREV (the revert target) and stash APPLIED for confirm()'s durable commit.
+  local lines = { "SUB_ID=" .. sub_id, "SLOT=" .. tostring(slot) }
+  for _, c in ipairs(changes) do
+    local prev = pref_raw(at('AT+QNWPREFCFG="' .. c.param .. '"', sub_id), c.param)
+    lines[#lines + 1] = "PREV_" .. c.param .. "=" .. prev
+    lines[#lines + 1] = "APPLIED_" .. c.param .. "=" .. c.list
+  end
+  if mode then
+    local mblob = at('AT+QNWPREFCFG="mode_pref"', sub_id)
+    local pmode = (mblob and mblob:match('"mode_pref",([%w:]+)')) or ""
+    lines[#lines + 1] = "PREV_mode_pref=" .. pmode
+    lines[#lines + 1] = "APPLIED_mode_pref=" .. mode
+  end
 
-  -- Persist pending state in /etc (survives reboot) for the watchdog.
   os.execute("mkdir -p /etc/mudimodem 2>/dev/null")
   local f = io.open(PENDING, "w")
   if not f then return { error = "cannot write pending state" } end
-  f:write("SUB_ID=" .. sub_id .. "\n")
-  f:write("PREV_nr5g_band=" .. prev .. "\n")
+  f:write(table.concat(lines, "\n") .. "\n")
   f:close()
 
-  -- Arm the watchdog, and CONFIRM it is live before the risky write.
-  -- No safety net, no write.
+  -- Arm the watchdog, and CONFIRM it is live before the writes. No net, no write.
   os.remove(ARMED)
   os.execute(REVERT_BIN .. " watch >/dev/null 2>&1 &")
   os.execute("sleep 1")
@@ -218,16 +265,87 @@ function M.set_bands(args)
     return { error = "revert watchdog failed to arm; no change written" }
   end
 
-  -- Safe to write: a bad lock now self-reverts within the window.
-  at('AT+QNWPREFCFG="nr5g_band",' .. newlist, sub_id)
+  -- Safe to write: a bad change now self-reverts within the window.
+  local applied = {}
+  for _, c in ipairs(changes) do
+    at('AT+QNWPREFCFG="' .. c.param .. '",' .. c.list, sub_id)
+    applied[c.key] = c.list
+  end
+  if mode then
+    at('AT+QNWPREFCFG="mode_pref",' .. mode, sub_id)
+    applied.mode = mode
+  end
 
-  return { ok = true, window = 60, previous = prev, applied = newlist, sub_id = sub_id }
+  return { ok = true, window = 60, applied = applied, sub_id = sub_id }
 end
 
--- Commit a pending change: remove the pending file so the watchdog won't revert.
+-- Read one key=value out of the pending file.
+local function pending_get(key)
+  if not file_exists(PENDING) then return nil end
+  for line in io.lines(PENDING) do
+    local k, v = line:match("^([%w_]+)=(.*)$")
+    if k == key then return v end
+  end
+  return nil
+end
+
+-- Commit a pending change durably (Path B). Two things happen here:
+--   1. stop the watchdog (remove pending) so it won't revert; and
+--   2. write the kept bands into GL's OWN stored config via
+--      cellular.modem set_feature_config — because `cellular_manager`
+--      re-applies its stored config on restart/reboot, overwriting our raw-AT
+--      write. Committing to GL's config makes the change survive that
+--      (reference §11). Our raw-AT write already made it live, so nothing
+--      re-registers here.
 function M.confirm(args)
+  local slot = pending_get("SLOT")
+  local durable = false
+
+  if slot and slot ~= "nil" then
+    local all = ucall("cellular.modem", "get_all_config", { bus = "cpu" })
+    local sf = all and all.slot_feature
+    if sf then
+      local loc, cur
+      for key, val in pairs(sf) do
+        if key:match("^s" .. slot .. "_") then loc, cur = key, val end
+      end
+      if loc then
+        local cb = (cur and cur.band) or {}
+        local bl = cb.band_list or {}
+        -- Start from GL's current band_list, then override each RAT we applied.
+        local band_list = {
+          LTE = arr(bl.LTE), ["NR-SA"] = arr(bl["NR-SA"]), ["NR-NSA"] = arr(bl["NR-NSA"]),
+        }
+        local any = false
+        for _, rat in ipairs(RATS) do
+          local ap = pending_get("APPLIED_" .. rat.param)
+          if ap and ap ~= "" then
+            local list = {}
+            for n in ap:gmatch("(%d+)") do
+              local v = tonumber(n); if v and v > 0 then list[#list + 1] = v end
+            end
+            band_list[rat.gl] = arr(list)
+            any = true
+          end
+        end
+        -- Mode: GL's network_mode == the mode_pref value (AUTO/NR5G/LTE).
+        local nm = pending_get("APPLIED_mode_pref")
+        if not nm or nm == "" then nm = (cur and cur.network_mode) or "AUTO" else any = true end
+        if any then
+          local data = {
+            network_mode = nm,
+            band = { band_enable = true, band_filter_mode = cb.band_filter_mode or 0, band_list = band_list },
+          }
+          local res = ucall("cellular.modem", "set_feature_config",
+                            { bus = "cpu", location_id = loc, data = data })
+          durable = (type(res) == "table" and res.ok == true) or false
+        end
+      end
+    end
+  end
+
   os.remove(PENDING)
-  return { ok = true, confirmed = true }
+  return { ok = true, confirmed = true, durable = durable }
 end
 
 -- Revert a pending change NOW (don't wait out the window). Writes the previous
@@ -235,16 +353,23 @@ end
 -- nothing to do. Same restore the watchdog would perform on timeout.
 function M.revert_now(args)
   if not file_exists(PENDING) then return { ok = true, note = "nothing pending" } end
-  local prev, sub = "", 1
-  for line in io.lines(PENDING) do
-    local k, v = line:match("^(%w+)=(.*)$")
-    if k == "PREV_nr5g_band" then prev = v end
-    if k == "SUB_ID" then sub = tonumber(v) or 1 end
+  local sub = tonumber(pending_get("SUB_ID")) or 1
+  local restored = {}
+  for _, rat in ipairs(RATS) do
+    local prev = pending_get("PREV_" .. rat.param)
+    if prev and prev ~= "" then
+      at('AT+QNWPREFCFG="' .. rat.param .. '",' .. prev, sub)
+      restored[rat.key] = prev
+    end
   end
-  if prev ~= "" then at('AT+QNWPREFCFG="nr5g_band",' .. prev, sub) end
+  local pmode = pending_get("PREV_mode_pref")
+  if pmode and pmode ~= "" then
+    at('AT+QNWPREFCFG="mode_pref",' .. pmode, sub)
+    restored.mode = pmode
+  end
   os.remove(PENDING)
   os.remove(ARMED)
-  return { ok = true, reverted = true, restored = prev }
+  return { ok = true, reverted = true, restored = restored }
 end
 
 return M

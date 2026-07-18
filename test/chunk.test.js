@@ -169,13 +169,15 @@ function bandsVm(c, override) {
   const vm = makeVm(c, LIVE);
   vm.tab = 'bands';
   vm.bands = Object.assign({
-    supported: { sa: [71, 41, 78], nsa: [71], LTE: [66, 12] },
+    supported: { sa: [71, 41, 78], nsa: [71, 41], LTE: [66, 12] },
     config: { enable: true, mode: 0, sa: [71], nsa: [], LTE: [] },
-    policy: { sa: [41, 71], nsa: [71], LTE: [12, 66] },
+    policy: { sa: [41, 71], nsa: [41, 71], LTE: [12, 66] },
     capability: { sa: [71], nsa: [], LTE: [12, 66] },
-    meta: { bus: 'cpu', slot: '1', plmn: '310260', sub_id: 1, plmn_matched: true }
+    meta: { bus: 'cpu', slot: '1', plmn: '310260', sub_id: 1, plmn_matched: true, mode: 'AUTO' }
   }, override || {});
-  vm.selSA = (vm.bands.config.sa || []).slice();  // seeded from config
+  // seed selections + mode exactly as fetchBands does
+  vm.sel = { sa: vm.seedFor('sa'), nsa: vm.seedFor('nsa'), LTE: vm.seedFor('LTE') };
+  vm.selMode = (vm.bands.meta && vm.bands.meta.mode) || 'AUTO';
   return vm;
 }
 function chips(c, vm) {
@@ -200,16 +202,67 @@ test('SA band chips are interactive: selected / permitted / blocked', () => {
 test('toggleBand edits the selection and Apply reflects change/empty', () => {
   const c = loadChunk();
   const vm = bandsVm(c);
-  assert.strictEqual(vm.saChanged(), false, 'no change initially (matches config)');
-  vm.toggleBand(41);                  // add n41 -> widening (safe)
-  assert.deepStrictEqual(vm.selSA.slice().sort(), [41, 71], 'n41 added');
-  assert.strictEqual(vm.saChanged(), true, 'now changed');
-  vm.toggleBand(71); vm.toggleBand(41);
-  assert.deepStrictEqual(vm.selSA, [], 'emptied');
-  // Apply must be disabled on an empty selection (would drop all service).
+  assert.strictEqual(vm.changed('sa'), false, 'no change initially (matches config)');
+  vm.toggleBand('sa', 41);            // add n41 -> widening (safe)
+  assert.deepStrictEqual(vm.sel.sa.slice().sort(), [41, 71], 'n41 added');
+  assert.strictEqual(vm.changed('sa'), true, 'now changed');
+  vm.toggleBand('sa', 71); vm.toggleBand('sa', 41);
+  assert.deepStrictEqual(vm.sel.sa, [], 'emptied');
+  // Apply must be disabled when an edited group has zero bands (would drop it).
+  assert.ok(vm.emptyChange(), 'empty edit flagged');
   const applyBtn = walk(c.render.call(vm, h)).find(
     (n) => n.data.staticClass && /mm-btn primary/.test(n.data.staticClass));
-  assert.ok(applyBtn.data.attrs.disabled, 'Apply disabled when selection is empty');
+  assert.ok(applyBtn.data.attrs.disabled, 'Apply disabled when a group is emptied');
+});
+
+test('per-group All / None / Invert act on the selectable (permitted) bands', () => {
+  const c = loadChunk();
+  const vm = bandsVm(c);              // policy.sa = [41,71]; sel.sa = [71]
+  vm.selectAll('sa');
+  assert.deepStrictEqual(vm.sel.sa.slice().sort(), [41, 71], 'All = every permitted band');
+  vm.selectNone('sa');
+  assert.deepStrictEqual(vm.sel.sa, [], 'None clears');
+  vm.sel.sa = [71];
+  vm.invertSel('sa');
+  assert.deepStrictEqual(vm.sel.sa, [41], 'Invert toggles permitted membership (71 out, 41 in)');
+});
+
+test('LTE and NSA are interactive too, seeded and selectable', () => {
+  const c = loadChunk();
+  const vm = bandsVm(c);              // config.LTE=[]/nsa=[], policy fills the seed
+  assert.deepStrictEqual(vm.sel.LTE.slice().sort(), [12, 66], 'LTE seeded from policy when config empty');
+  assert.deepStrictEqual(vm.sel.nsa.slice().sort(), [41, 71], 'NSA seeded from policy when config empty');
+  assert.strictEqual(vm.selectable('LTE', 12), true, 'permitted LTE band selectable');
+  assert.strictEqual(vm.selectable('nsa', 41), true, 'permitted NSA band selectable');
+});
+
+test('network mode selector: seeded, changeable, feeds Apply payload', () => {
+  const c = loadChunk();
+  const vm = bandsVm(c, { meta: { mode: 'NR5G', plmn_matched: true } });
+  assert.strictEqual(vm.selMode, 'NR5G', 'seeded from meta.mode');
+  assert.strictEqual(vm.modeChanged(), false, 'no change initially');
+  vm.setMode('AUTO');
+  assert.strictEqual(vm.modeChanged(), true, 'mode change detected');
+  assert.strictEqual(vm.changedAny(), true, 'Apply enabled by a mode change alone');
+  // the mode segmented control renders with the current option marked
+  const nodes = walk(c.render.call(vm, h));
+  const on = nodes.filter((n) => n.data.staticClass && /mm-seg-b on/.test(n.data.staticClass));
+  assert.strictEqual(on.length, 1, 'exactly one mode option marked active');
+});
+
+test('mode gate: NSA is off unless Auto; SA off under 4G-only', () => {
+  const c = loadChunk();
+  // NR5G mode: SA active, NSA + LTE gated off.
+  let vm = bandsVm(c, { meta: { mode: 'NR5G', plmn_matched: true } });
+  assert.strictEqual(vm.ratActive('sa'), true, 'SA active under 5G-only');
+  assert.strictEqual(vm.ratActive('nsa'), false, 'NSA needs Auto');
+  assert.strictEqual(vm.ratActive('LTE'), false, 'LTE off under 5G-only');
+  let txt = textOf(c.render.call(vm, h));
+  assert.match(txt, /Off under NR5G mode/, 'shows the mode-gate note');
+  // Auto: everything active, no gate.
+  vm = bandsVm(c, { meta: { mode: 'AUTO', plmn_matched: true } });
+  assert.ok(vm.ratActive('sa') && vm.ratActive('nsa') && vm.ratActive('LTE'), 'all active under Auto');
+  assert.doesNotMatch(textOf(c.render.call(vm, h)), /Off under/, 'no gate under Auto');
 });
 
 test('blocked band cannot be toggled into the selection', () => {
@@ -236,11 +289,13 @@ test('Bands grid orders NR chips by frequency, low to high', () => {
 test('revert countdown banner renders with Keep/Revert and locks chips', () => {
   const c = loadChunk();
   const vm = bandsVm(c);
-  vm.pending = { remaining: 47, window: 60, previous: '71', applied: '71:41', done: false };
+  vm.pending = { remaining: 47, window: 60, applied: { sa: '71:41', lte: '2:66' }, done: false };
   const nodes = walk(c.render.call(vm, h));
   const txt = textOf(nodes);
-  assert.match(txt, /Reverting to/, 'shows revert message');
+  assert.match(txt, /Reverting in/, 'shows revert message');
   assert.match(txt, /47s/, 'shows countdown');
+  assert.match(txt, /5G-SA n71 n41/, 'summarises applied SA bands');
+  assert.match(txt, /LTE B2 B66/, 'summarises applied LTE bands');
   const btns = nodes.filter((n) => n.data.staticClass && /mm-btn/.test(n.data.staticClass))
     .map((n) => textOf(n));
   assert.ok(btns.includes('Keep') && btns.includes('Revert now'), 'Keep + Revert now present');
@@ -250,6 +305,52 @@ test('revert countdown banner renders with Keep/Revert and locks chips', () => {
   // no Apply button while pending
   assert.ok(!nodes.some((n) => n.data.staticClass && /mm-btn primary/.test(n.data.staticClass)),
     'Apply hidden during pending');
+});
+
+test('both chunks carry a byte-identical makeMMHist factory', () => {
+  const a = fs.readFileSync(SRC, 'utf8');
+  const b = fs.readFileSync(path.join(__dirname, '..', 'src', 'views', 'mudimodem-tracking.js'), 'utf8');
+  const grab = (s) => {
+    const i = s.indexOf('function makeMMHist()');
+    assert.ok(i >= 0, 'makeMMHist present');
+    let d = 0, j = i;
+    for (; j < s.length; j++) {
+      if (s[j] === '{') d++;
+      else if (s[j] === '}') { d--; if (d === 0) { j++; break; } }
+    }
+    return s.slice(i, j).replace(/\s+/g, ' ').trim();
+  };
+  assert.strictEqual(grab(a), grab(b), 'the two makeMMHist copies must match');
+});
+
+test('the rsrp watcher records a sample into window.__mmHist', () => {
+  const c = loadChunk();
+  global.window = { __mmHist: null };
+  const vm = makeVm(c, LIVE);
+  vm.recordSample();
+  assert.ok(window.__mmHist && window.__mmHist.samples.length === 1, 'sample recorded');
+  assert.strictEqual(window.__mmHist.samples[0].rsrp, -101);
+  assert.strictEqual(window.__mmHist.samples[0].id, '187461035', 'records the active-slot cell id');
+  delete global.window;
+});
+
+test('hist() lazily creates the window singleton and pushEvent lands', () => {
+  const c = loadChunk();
+  global.window = { __mmHist: null };
+  const vm = makeVm(c, LIVE);
+  const H = vm.hist();
+  assert.ok(H && Array.isArray(H.events), 'recorder created');
+  H.pushEvent({ kind: 'user', label: 'Bands applied', detail: 'SA n71' });
+  assert.strictEqual(window.__mmHist.events[0].kind, 'user');
+  delete global.window;
+});
+
+test('strip shows a History link routing to /mudimodem-tracking', () => {
+  const src = fs.readFileSync(SRC, 'utf8');
+  assert.match(src, /\/mudimodem-tracking/, 'History link targets the tracking route');
+  const c = loadChunk();
+  const vm = makeVm(c, LIVE);
+  assert.match(textOf(c.render.call(vm, h)), /History/, 'History affordance rendered');
 });
 
 test('the write calls target the watchdog-protected methods only', () => {

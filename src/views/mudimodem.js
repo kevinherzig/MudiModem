@@ -15,6 +15,59 @@
 //
 // All colour is GL theme tokens (var(--success) etc.), so light/dark/classic
 // all work with zero extra code.
+//
+// A hidden sibling page (/mudimodem-tracking) reads a window-scoped in-memory
+// history that THIS page also feeds (spec §10.6). The recorder factory below is
+// an IDENTICAL copy of the one in src/views/mudimodem-tracking.js — the two
+// chunks can't require() each other and the repo is toolchain-free, so it is
+// kept verbatim in both; test/chunk.test.js asserts they match byte-for-byte.
+function makeMMHist() {
+    var SAMPLES_MAX = 5000, MIN_SPACING_MS = 5000, EVENTS_MAX = 500, RECENT_USER_MS = 8000;
+    var samples = [], events = [], last = null;
+    function now() { return Date.now(); }
+    function recentUser(t) {
+      for (var i = events.length - 1; i >= 0; i--) {
+        if (t - events[i].t > RECENT_USER_MS) break;
+        if (events[i].kind === "user" || events[i].kind === "dog") return true;
+      }
+      return false;
+    }
+    function pushEvent(e) {
+      e.t = (e.t == null) ? now() : e.t;
+      events.push(e);
+      if (events.length > EVENTS_MAX) events.shift();
+      return e;
+    }
+    function record(s) {
+      var t = now();
+      // network-event detection vs the last state we saw (independent of storage)
+      if (last && !recentUser(t)) {
+        if (String(s.slot) !== String(last.slot)) {
+          pushEvent({ t: t, kind: "net", label: "Failover",
+            detail: "Data now on SIM " + s.slot + (s.carrier ? " · " + s.carrier : "") });
+        } else if (s.id != null && last.id != null && String(s.id) !== String(last.id)) {
+          pushEvent({ t: t, kind: "net", label: "Handover",
+            detail: "Cell " + last.id + " → " + s.id + (s.band != null ? " (" + s.band + ")" : "") });
+        }
+      }
+      var changed = !last || String(s.slot) !== String(last.slot) ||
+        String(s.id) !== String(last.id) || String(s.band) !== String(last.band) ||
+        String(s.mode) !== String(last.mode);
+      last = { slot: s.slot, id: s.id, band: s.band, mode: s.mode };
+      var prev = samples[samples.length - 1];
+      if (prev && !changed && (t - prev.t) < MIN_SPACING_MS) return null;  // spacing: drop
+      var rec = { t: t, slot: s.slot, id: s.id, band: s.band, mode: s.mode,
+        rsrp: s.rsrp, sinr: s.sinr, rsrq: s.rsrq, rssi: s.rssi,
+        dl_bandwidth: s.dl_bandwidth, tx_channel: s.tx_channel,
+        rsrp_level: s.rsrp_level, sinr_level: s.sinr_level, rsrq_level: s.rsrq_level,
+        carrier: s.carrier };
+      samples.push(rec);
+      if (samples.length > SAMPLES_MAX) samples.shift();
+      return rec;
+    }
+    return { samples: samples, events: events, startedAt: now(),
+      record: record, pushEvent: pushEvent };
+}
 module.exports = {
   name: "mudimodem",
 
@@ -27,8 +80,9 @@ module.exports = {
       bands: null,          // get_bands result, once fetched
       bandsLoading: false,
       bandsError: "",
-      selSA: null,          // desired SA allowlist (band numbers) being edited
-      pending: null,        // { window, previous, applied, remaining } after Apply
+      sel: { sa: null, nsa: null, LTE: null },   // desired allowlists per editable RAT
+      selMode: null,        // desired network mode (AUTO | NR5G | LTE)
+      pending: null,        // { window, applied, remaining } after Apply
       cdTimer: null,        // countdown interval handle
       applying: false,      // Apply in flight
       applyError: "",
@@ -132,6 +186,7 @@ module.exports = {
         if (isNaN(n)) return;
         this.trace.push(n);
         if (this.trace.length > this.TRACE_MAX) this.trace.shift();
+        this.recordSample();
       }
     },
     tab(t) {
@@ -143,6 +198,23 @@ module.exports = {
   beforeDestroy() { this.clearCountdown(); },
 
   methods: {
+    // In-memory history shared with the Tracking page (spec §10.6). hist() lazily
+    // creates the window singleton; recordSample() feeds it on every rsrp push.
+    hist() {
+      if (typeof window === "undefined") return null;
+      return window.__mmHist || (window.__mmHist = makeMMHist());
+    },
+    numOf(v) { var n = parseFloat(v); return isNaN(n) ? null : n; },
+    recordSample() {
+      var H = this.hist(); if (!H) return;
+      var c = this.serving;
+      if (c.rsrp === undefined || c.rsrp === null || c.rsrp === "") return;
+      H.record({ slot: this.activeSlot, id: c.id, band: c.band, mode: c.mode,
+        rsrp: this.numOf(c.rsrp), sinr: this.numOf(c.sinr), rsrq: this.numOf(c.rsrq),
+        rssi: this.numOf(c.rssi), dl_bandwidth: c.dl_bandwidth, tx_channel: c.tx_channel,
+        rsrp_level: c.rsrp_level, sinr_level: c.sinr_level, rsrq_level: c.rsrq_level,
+        carrier: this.servingCarrier });
+    },
     qFromLevel(lvl) {
       return ({ 1: "poor", 2: "fair", 3: "good", 4: "excellent" })[lvl] || "none";
     },
@@ -170,57 +242,112 @@ module.exports = {
       window.$rpcRequest("call", ["sid", "mudimodem", "get_bands", {}], { timeout: 15000 })
         .then(function (res) {
           self.bands = res;
-          // Seed the editable selection from the current config; an empty config
+          // Seed each editable selection from the current config; an empty config
           // means "unrestricted", so start from everything the carrier permits.
-          var cfg = (res.config && res.config.sa) || [];
-          var pol = (res.policy && res.policy.sa) || [];
-          self.selSA = (cfg.length ? cfg : pol).slice();
+          self.sel = { sa: self.seedFor("sa"), nsa: self.seedFor("nsa"), LTE: self.seedFor("LTE") };
+          self.selMode = (res.meta && res.meta.mode) || "AUTO";
         })
         .catch(function (e) {
           self.bandsError = (e && (e.type || e.message)) || "request failed";
         })
         .then(function () { self.bandsLoading = false; });
     },
+    seedFor(group) {
+      var cfg = (this.bands.config && this.bands.config[group]) || [];
+      var pol = (this.bands.policy && this.bands.policy[group]) || [];
+      return (cfg.length ? cfg : pol).slice();
+    },
 
+    // The interactive RATs (each maps to a set_bands arg).
+    interactive(group) { return group === "sa" || group === "nsa" || group === "LTE"; },
+    argKey(group) { return group === "LTE" ? "lte" : group; },   // set_bands arg name
+    // Which RATs a given network mode actually enables (NSA needs an LTE anchor).
+    modeEnables(group, mode) {
+      if (group === "sa") return mode === "AUTO" || mode === "NR5G";
+      if (group === "nsa") return mode === "AUTO";
+      if (group === "LTE") return mode === "AUTO" || mode === "LTE";
+      return false;
+    },
+    ratActive(group) { return this.modeEnables(group, this.selMode); },
+    setMode(m) { if (!this.pending) this.selMode = m; },
+    modeChanged() { return this.bands && this.selMode !== ((this.bands.meta && this.bands.meta.mode) || "AUTO"); },
     // Only policy-permitted bands are selectable; blocked ones never take.
     selectable(group, b) {
-      if (group !== "sa" || !this.bands) return false;
-      return (this.bands.policy.sa || []).indexOf(b) !== -1;
+      if (!this.interactive(group) || !this.bands) return false;
+      return (this.bands.policy[group] || []).indexOf(b) !== -1;
     },
-    isSelected(b) { return this.selSA && this.selSA.indexOf(b) !== -1; },
-    toggleBand(b) {
-      if (this.pending || !this.selSA) return;      // locked during a pending revert
-      var i = this.selSA.indexOf(b);
-      if (i === -1) this.selSA.push(b); else this.selSA.splice(i, 1);
+    isSelected(group, b) {
+      var s = this.sel[group];
+      return s && s.indexOf(b) !== -1;
     },
-    saChanged() {
-      if (!this.bands || !this.selSA) return false;
-      var cur = ((this.bands.config.sa || []).length
-        ? this.bands.config.sa : (this.bands.policy.sa || [])).slice().sort(function (a, b) { return a - b; });
-      var sel = this.selSA.slice().sort(function (a, b) { return a - b; });
+    toggleBand(group, b) {
+      if (this.pending || !this.sel[group]) return;   // locked during a pending revert
+      var i = this.sel[group].indexOf(b);
+      if (i === -1) this.sel[group].push(b); else this.sel[group].splice(i, 1);
+    },
+    selectAll(group) {
+      if (this.pending || !this.bands) return;
+      this.sel[group] = (this.bands.policy[group] || []).slice();   // all permitted
+    },
+    selectNone(group) {
+      if (this.pending) return;
+      this.sel[group] = [];
+    },
+    invertSel(group) {
+      if (this.pending || !this.bands) return;
+      var perm = this.bands.policy[group] || [], cur = this.sel[group] || [];
+      this.sel[group] = perm.filter(function (b) { return cur.indexOf(b) === -1; });
+    },
+    changed(group) {
+      if (!this.bands || !this.sel[group]) return false;
+      var cur = this.seedFor(group).sort(function (a, b) { return a - b; });
+      var sel = this.sel[group].slice().sort(function (a, b) { return a - b; });
       if (cur.length !== sel.length) return true;
       for (var i = 0; i < cur.length; i++) if (cur[i] !== sel[i]) return true;
       return false;
     },
+    changedAny() {
+      return this.changed("sa") || this.changed("nsa") || this.changed("LTE") || this.modeChanged();
+    },
+    emptyChange() {
+      // an edited RAT with zero bands selected — not allowed (would drop the RAT)
+      return (this.changed("sa") && this.sel.sa.length === 0) ||
+             (this.changed("nsa") && this.sel.nsa.length === 0) ||
+             (this.changed("LTE") && this.sel.LTE.length === 0);
+    },
 
     applyBands() {
       var self = this;
-      if (this.applying || !this.selSA || this.selSA.length === 0) return;
+      if (this.applying || !this.changedAny() || this.emptyChange()) return;
       if (typeof window === "undefined" || !window.$rpcRequest) return;
+      var payload = {};
+      if (this.changed("sa")) payload.sa = this.sel.sa.slice();
+      if (this.changed("nsa")) payload.nsa = this.sel.nsa.slice();
+      if (this.changed("LTE")) payload.lte = this.sel.LTE.slice();
+      if (this.modeChanged()) payload.mode = this.selMode;
       this.applying = true;
       this.applyError = "";
-      window.$rpcRequest("call", ["sid", "mudimodem", "set_bands", { sa: this.selSA.slice() }], { timeout: 20000 })
+      window.$rpcRequest("call", ["sid", "mudimodem", "set_bands", payload], { timeout: 20000 })
         .then(function (res) {
           if (!res || res.error) { self.applyError = (res && res.error) || "apply failed"; return; }
-          self.startCountdown(res.window || 60, res.previous, res.applied);
+          self.startCountdown(res.window || 60, res.applied);
+          var H = self.hist();
+          if (H) {
+            var b = res.applied || {}, d = [];
+            if (b.sa) d.push("SA " + b.sa.split(":").map(function (x) { return "n" + x; }).join(" "));
+            if (b.nsa) d.push("NSA " + b.nsa.split(":").map(function (x) { return "n" + x; }).join(" "));
+            if (b.lte) d.push("LTE " + b.lte.split(":").map(function (x) { return "B" + x; }).join(" "));
+            if (b.mode) d.push("mode " + b.mode);
+            H.pushEvent({ kind: "user", label: "Bands applied", detail: d.join("; ") || "band change" });
+          }
         })
         .catch(function (e) { self.applyError = (e && (e.type || e.message)) || "apply failed"; })
         .then(function () { self.applying = false; });
     },
-    startCountdown(window_s, previous, applied) {
+    startCountdown(window_s, applied) {
       var self = this;
       this.clearCountdown();
-      this.pending = { remaining: window_s, window: window_s, previous: previous, applied: applied, done: false };
+      this.pending = { remaining: window_s, window: window_s, applied: applied, done: false };
       this.cdTimer = setInterval(function () {
         if (!self.pending) return;
         self.pending.remaining -= 1;
@@ -228,6 +355,9 @@ module.exports = {
           // The watchdog has reverted server-side. Reflect it and re-read.
           self.clearCountdown();
           self.pending = { done: true, reverted: true };
+          var H = self.hist();
+          if (H) H.pushEvent({ kind: "dog", label: "Auto-revert fired",
+            detail: "No confirm in " + window_s + "s — previous bands restored" });
           self.fetchBands();
           setTimeout(function () { self.pending = null; }, 4000);
         }
@@ -239,6 +369,8 @@ module.exports = {
     keepBands() {
       var self = this;
       this.clearCountdown();
+      var H = this.hist();
+      if (H) H.pushEvent({ kind: "user", label: "Kept", detail: "Change confirmed" });
       window.$rpcRequest("call", ["sid", "mudimodem", "confirm", {}])
         .then(function () {}).catch(function () {})
         .then(function () { self.pending = null; self.fetchBands(); });
@@ -247,6 +379,8 @@ module.exports = {
       var self = this;
       this.clearCountdown();
       this.pending = { done: true, reverting: true };
+      var H = this.hist();
+      if (H) H.pushEvent({ kind: "user", label: "Reverted", detail: "Restored previous bands" });
       window.$rpcRequest("call", ["sid", "mudimodem", "revert_now", {}], { timeout: 20000 })
         .then(function () {}).catch(function () {})
         .then(function () { self.pending = null; self.fetchBands(); });
@@ -303,6 +437,16 @@ module.exports = {
         '.mm-grp{margin-bottom:15px}.mm-grp:last-child{margin-bottom:2px}' +
         '.mm-grp-h{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:7px}' +
         '.mm-grp-t{font-size:12px;font-weight:600;color:var(--text-title)}' +
+        '.mm-acts{display:flex;gap:2px}' +
+        '.mm-act{background:none;border:0;font:inherit;font-size:10.5px;cursor:pointer;color:var(--primary);padding:2px 6px;border-radius:3px}' +
+        '.mm-act:hover{background:var(--primary-background)}' +
+        '.mm-grp-off .mm-wrap{opacity:.5}' +
+        '.mm-gate{font-size:10.5px;color:var(--warning-hover);background:var(--warning-background);border:1px solid var(--warning-disabled);border-radius:3px;padding:4px 8px;margin-bottom:6px}' +
+        '.mm-seg{display:inline-flex;border:1px solid var(--border);border-radius:4px;overflow:hidden}' +
+        '.mm-seg-b{font:inherit;font-size:12px;background:transparent;border:0;padding:5px 14px;cursor:pointer;color:var(--text-weak);border-right:1px solid var(--border)}' +
+        '.mm-seg-b:last-child{border-right:0}' +
+        '.mm-seg-b.on{background:var(--primary);color:#fff;font-weight:600}' +
+        '.mm-seg-b:disabled{cursor:default;opacity:.6}' +
         '.mm-wrap{display:flex;gap:4px;flex-wrap:wrap}' +
         '.mm-band{position:relative;min-width:44px;padding:4px 6px 3px;text-align:center;border:1px solid var(--border);border-radius:4px;background:var(--background-card);transition:border-color .1s,background .1s}' +
         '.mm-band b{display:block;font-size:12px;font-weight:600;line-height:1.2}.mm-band s{display:block;font-size:9px;line-height:1.2;color:var(--text-hint);text-decoration:none}' +
@@ -337,10 +481,10 @@ module.exports = {
     },
 
     // ---- band grid render helpers ----
-    // group "sa" is interactive (set_bands writes SA); nsa/LTE stay read-only.
+    // sa + LTE are interactive (set_bands writes them); nsa stays read-only.
     renderGroup(h, group, title) {
       var self = this, d = this.bands;
-      var interactive = (group === "sa");
+      var interactive = this.interactive(group);
       var supported = (d.supported[group] || []).slice();
       supported.sort(function (a, b) {
         var fa = self.freqOf(group, a), fb = self.freqOf(group, b);
@@ -354,9 +498,9 @@ module.exports = {
         var f = self.freqOf(group, b);
         var cls, tip;
         if (interactive) {
-          if (!self.selectable("sa", b)) {
+          if (!self.selectable(group, b)) {
             cls = "blocked"; tip = pre + b + " blocked by carrier policy; selecting has no effect";
-          } else if (self.isSelected(b)) {
+          } else if (self.isSelected(group, b)) {
             cls = "sel"; tip = pre + b + " allowed (click to remove)";
           } else {
             cls = "unsel"; tip = pre + b + " permitted (click to allow)";
@@ -371,16 +515,38 @@ module.exports = {
           key: b,
           staticClass: "mm-band " + cls + (serving ? " serving" : "") + (clickable ? " clickable" : ""),
           attrs: { title: tip },
-          on: clickable ? { click: function () { self.toggleBand(b); } } : {}
+          on: clickable ? { click: function () { self.toggleBand(group, b); } } : {}
         }, [h("b", pre + b), h("s", f ? String(f) : " ")]);
       });
+      // per-group actions (interactive groups only): All / None / Invert
+      var actions = null;
+      if (interactive && !this.pending) {
+        var mkAct = function (label, fn) {
+          return h("button", { staticClass: "mm-act", on: { click: fn } }, label);
+        };
+        actions = h("span", { staticClass: "mm-acts" }, [
+          mkAct("All", function () { self.selectAll(group); }),
+          mkAct("None", function () { self.selectNone(group); }),
+          mkAct("Invert", function () { self.invertSel(group); })
+        ]);
+      }
       var counts = (d.supported[group] || []).length + " supported / " +
         (d.policy[group] || []).length + " permitted / " + (d.capability[group] || []).length + " active";
-      return h("div", { staticClass: "mm-grp", key: group }, [
+      // Mode gate: if the selected mode doesn't enable this RAT, say so — the
+      // selections are inert until the mode includes it.
+      var gate = null;
+      if (interactive && !this.ratActive(group)) {
+        var need = group === "nsa" ? "Auto" : (group === "LTE" ? "Auto or 4G only" : "Auto or 5G only");
+        gate = h("div", { staticClass: "mm-gate" },
+          "Off under " + this.selMode + " mode - these won't apply. Set mode to " + need + " to use them.");
+      }
+      return h("div", { staticClass: "mm-grp" + (gate ? " mm-grp-off" : ""), key: group }, [
         h("div", { staticClass: "mm-grp-h" }, [
           h("span", { staticClass: "mm-grp-t" }, title + (interactive ? "" : "  (read-only)")),
-          h("span", { staticClass: "mm-hint" }, counts)
+          actions || h("span", { staticClass: "mm-hint" }, counts)
         ]),
+        interactive ? h("div", { staticClass: "mm-hint", staticStyle: { margin: "-3px 0 6px" } }, counts) : null,
+        gate,
         h("div", { staticClass: "mm-wrap" }, chips),
         h("div", { staticClass: "mm-axis2" }, [
           h("span", "low band, reaches far"),
@@ -389,22 +555,49 @@ module.exports = {
       ]);
     },
 
+    // The network-mode selector (Auto / 5G only / 4G only).
+    renderMode(h) {
+      var self = this, cur = this.selMode;
+      var opts = [["AUTO", "Auto"], ["NR5G", "5G only"], ["LTE", "4G only"]];
+      return h("div", { staticClass: "mm-grp" }, [
+        h("div", { staticClass: "mm-grp-h" }, [
+          h("span", { staticClass: "mm-grp-t" }, "Network mode"),
+          this.modeChanged()
+            ? h("span", { staticClass: "mm-hint", staticStyle: { color: "var(--warning)" } }, "changed")
+            : h("span", { staticClass: "mm-hint" }, "which radios the modem may use")
+        ]),
+        h("div", { staticClass: "mm-seg" }, opts.map(function (o) {
+          return h("button", {
+            key: o[0],
+            staticClass: "mm-seg-b" + (cur === o[0] ? " on" : ""),
+            attrs: { disabled: !!self.pending },
+            on: { click: function () { self.setMode(o[0]); } }
+          }, o[1]);
+        }))
+      ]);
+    },
+
     // Confirm-or-revert banner (design C1: inline, on the tab that caused it).
     renderRevert(h) {
       var self = this, p = this.pending;
-      var nlist = function (s) { return "n" + String(s || "").split(":").join(" n"); };
       if (p.done) {
         return h("div", { staticClass: "mm-revert" }, [
           h("span", { staticClass: "mm-revert-row" },
             p.reverting ? "Reverting..." : (p.reverted ? "Reverted - restored your previous bands." : ""))
         ]);
       }
+      // Summarise what changed (applied = { mode, sa, nsa, lte }).
+      var a = p.applied || {}, bits = [];
+      if (a.mode) bits.push("mode " + a.mode);
+      if (a.sa) bits.push("5G-SA " + a.sa.split(":").map(function (b) { return "n" + b; }).join(" "));
+      if (a.nsa) bits.push("5G-NSA " + a.nsa.split(":").map(function (b) { return "n" + b; }).join(" "));
+      if (a.lte) bits.push("LTE " + a.lte.split(":").map(function (b) { return "B" + b; }).join(" "));
       var pct = Math.max(0, Math.min(100, (p.remaining / p.window) * 100));
       return h("div", { staticClass: "mm-revert" }, [
         h("div", { staticClass: "mm-revert-row" }, [
           h("span", [
-            "Applied ", h("b", nlist(p.applied)), ". Reverting to ", h("b", nlist(p.previous)),
-            " in ", h("b", { staticClass: "mm-cd" }, String(p.remaining) + "s"),
+            "Applied ", h("b", bits.join("; ") || "band change"),
+            ". Reverting in ", h("b", { staticClass: "mm-cd" }, String(p.remaining) + "s"),
             " unless you keep it - watch the trace above."
           ]),
           h("span", { staticStyle: { flex: "none", display: "flex", gap: "6px" } }, [
@@ -422,6 +615,7 @@ module.exports = {
       if (!this.bands) return h("div", { staticClass: "mm-empty" }, "...");
       var d = this.bands, self = this;
       var groups = [
+        this.renderMode(h),
         this.renderGroup(h, "sa", "5G NR standalone"),
         this.renderGroup(h, "nsa", "5G NR non-standalone"),
         this.renderGroup(h, "LTE", "LTE")
@@ -444,20 +638,26 @@ module.exports = {
           ])
         ]),
         h("div", { staticClass: "mm-hint", staticStyle: { margin: "3px 0 12px" } },
-          "Choose which 5G-SA bands the modem may use. Blocked bands are ones the module supports " +
-          "but your carrier forbids - they can't be selected because they never take."),
+          "Choose the network mode and which 5G/LTE bands the modem may use. Blocked bands are ones " +
+          "the module supports but your carrier forbids - they can't be selected because they never take."),
         warn,
         this.pending ? this.renderRevert(h) : null
       ];
       var footer = [];
       if (!this.pending) {
-        var changed = this.saChanged();
-        var empty = this.selSA && this.selSA.length === 0;
+        var changed = this.changedAny();
+        var empty = this.emptyChange();
         var status;
         if (this.applyError) status = h("span", { staticStyle: { color: "var(--error)" } }, this.applyError);
-        else if (empty) status = h("span", { staticStyle: { color: "var(--error)" } }, "Select at least one band");
-        else if (changed) status = this.selSA.length + " SA band" + (this.selSA.length === 1 ? "" : "s") + " selected; applies with a 60s revert";
-        else status = "No changes";
+        else if (empty) status = h("span", { staticStyle: { color: "var(--error)" } }, "Each edited band group needs at least one band");
+        else if (changed) {
+          var parts = [];
+          if (this.modeChanged()) parts.push("mode -> " + this.selMode);
+          if (this.changed("sa")) parts.push(this.sel.sa.length + " SA");
+          if (this.changed("nsa")) parts.push(this.sel.nsa.length + " NSA");
+          if (this.changed("LTE")) parts.push(this.sel.LTE.length + " LTE");
+          status = parts.join(" + ") + " changed; applies with a 60s revert";
+        } else status = "No changes";
         footer.push(h("div", { staticClass: "mm-foot" }, [
           h("span", { staticClass: "mm-hint" }, [status]),
           h("button", {
@@ -486,7 +686,14 @@ module.exports = {
       var rsrpColor = this.qColor(this.rsrpQ);
       stripKids = [
         h("div", { staticClass: "mm-trace" }, [
-          h("div", { staticClass: "mm-eyebrow" }, "RSRP live"),
+          h("div", { staticStyle: { display: "flex", justifyContent: "space-between", alignItems: "baseline" } }, [
+            h("span", { staticClass: "mm-eyebrow" }, "RSRP live"),
+            h("button", {
+              staticClass: "mm-tab",
+              staticStyle: { fontSize: "10.5px", padding: "0", borderBottom: "0", letterSpacing: ".03em" },
+              on: { click: function () { if (self.$router) self.$router.push("/mudimodem-tracking"); } }
+            }, "History →")
+          ]),
           h("div", { staticClass: "mm-plot" }, [
             h("svg", { attrs: { viewBox: "0 0 320 40", preserveAspectRatio: "none" } }, [
               h("path", { attrs: {

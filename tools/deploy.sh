@@ -20,6 +20,13 @@ ssh -o BatchMode=yes "root@$HOST" 'cat > /www/views/gl-sdk4-ui-mudimodem.common.
 ssh -o BatchMode=yes "root@$HOST" 'cat > /usr/share/oui/menu.d/mudimodem.json' \
   < src/menu/mudimodem.json
 
+# Tracking page (hidden level:0 route) — second chunk + menu entry.
+ssh -o BatchMode=yes "root@$HOST" 'cat > /www/views/gl-sdk4-ui-mudimodem-tracking.common.js.gz' \
+  < build/gl-sdk4-ui-mudimodem-tracking.common.js.gz
+ssh -o BatchMode=yes "root@$HOST" 'cat > /usr/share/oui/menu.d/mudimodem-tracking.json' \
+  < src/menu/mudimodem-tracking.json
+echo "tracking chunk + menu deployed"
+
 # Confirm-or-revert watchdog + panic restore (§5). Inert until invoked; install
 # it BEFORE the backend so set_bands can always find it.
 if [ -f src/sbin/mudimodem-revert ]; then

@@ -3,6 +3,7 @@
 **Date:** 2026-07-17
 **Status:** design agreed; band data unverified (see Open questions)
 **Mockup:** `.superpowers/brainstorm/782253-1784289176/content/design.html` (self-contained, opens in any browser)
+**Addendum (2026-07-17, Tracking page):** `.superpowers/brainstorm/782253-1784289176/content/tracking.html` — see §10
 **Supersedes the UI portions of:** `2026-07-16-mudimodem-design.md`
 
 ---
@@ -203,3 +204,193 @@ or not a browser is open (CLAUDE.md §5).
 | Charts | Hand-rolled SVG | `gl-line-chart` gives no fixed domain, no markers |
 | Readout size | 29px (breaks GL's scale) | Only page whose job is watching a number; accepted risk |
 | Axis gradient | **Cut** | Used quality colours for frequency — wrong meaning |
+
+## 10. Addendum — Tracking page (the uber graph)
+
+**Date:** 2026-07-17
+**Status:** ✅ design agreed **and data source resolved** (2026-07-17) — in-memory recorder,
+history kept in a session-scoped `window` singleton (§10.6.1). Ready for an implementation plan.
+**Mockup:** `.superpowers/brainstorm/782253-1784289176/content/tracking.html` (⚠️ its "Cell · PCI"
+bus is corrected to **Cell ID** below — the box carries no PCI over the websocket, §10.2).
+
+### 10.1 Why a separate page, and why it's allowed to look different
+
+The monitor strip (§3) answers **now** — it's evidence for the revert decision, and it's deliberately
+thin: one trace, one readout, visible from every tab. It cannot also be the place you go to answer
+*"what happened at 6am, and why did the link move to AT&T?"* — that needs history across every
+metric, not the readout of one.
+
+So Tracking is a **second route**, not a sixth tab. Reasoning:
+
+- **Registered `level:0`**, exactly like GL's own `modemsignallog` (CLAUDE.md §2) — reachable, not in
+  the nav. It's a drill-down, not a peer of Diagnostics/Bands/Cell lock/AT console/SIM.
+- **Linked from the strip** (the readout or trace becomes a link/button to `/mudimodem-tracking`), so
+  the "why" is always one click from the "what's true now."
+- It's allowed a **denser idiom than the rest of the admin** — a logic-analyzer lane stack, not GL's
+  card-and-form language — because its job is different: forensic reconstruction, not control. The
+  five tabs stay in GL's idiom because they're closer to what a GL page already looks like; this page
+  doesn't try to.
+
+### 10.2 The signature: one clock, every lane, a slice cursor
+
+Same discipline as §3's "the trace is the object, not a KPI row" — extended across every metric at
+once instead of one.
+
+- **Three fixed-domain traces** stacked on a shared time axis: RSRP (−120…−80 dBm), SINR (−10…30 dB),
+  RSRQ (−20…−3 dB). Same rule as Diagnostics (§4): **never a shared or dual axis** — dBm and dB don't
+  compose on one scale. Each trace is coloured by GL's own quality ramp (§2) *per sample*, so a
+  degrading run visibly walks mint → amber → rose without a legend lookup.
+- **Three state buses** below the traces — Band, **Cell ID**, SIM — rendered as labelled segments, not
+  lines. A band or cell is identity, not a magnitude; a bus makes the boundary (the moment it changed)
+  the thing you see, the way a logic analyzer shows a signal's state, not its voltage.
+  - ⚠️ **Correction from the box (verified 2026-07-17):** `cellular.network info` → `cell_info` carries
+    **no PCI**. The serving cell is identified by `id` (a hex Cell ID, e.g. `"D43B70D"`), with
+    `tx_channel` the ARFCN (`"8701"`). PCI is AT-only (`AT+QENG`) and not on `/ws`. So the middle bus
+    is **Cell ID + band + ARFCN**, and handover detection keys off a **change in `id`**, not PCI.
+    Metrics arrive as strings (`"-118"`) with `_level` (1–4) buckets already attached — the tracking
+    page reuses those levels for quality colour exactly as the main page's strip does (`qFromLevel`).
+- **Full-height cause ticks** cross every lane at once, coloured by **who/what caused the change**, not
+  by what changed: indigo square = you (an apply/confirm), amber triangle = the watchdog (an
+  auto-revert), open circle = the network (a handover/failover with no local cause). This is the same
+  "user vs system" distinction the revert banner already makes (§5) — the tick vocabulary is that
+  decision's icon set reused, not invented fresh, because it's the same question ("who did this?")
+  asked with history now available.
+- **The slice cursor is the signature.** Hover anywhere in the lane stack and a crosshair reads every
+  lane at that instant into one composite tooltip (RSRP/SINR/RSRQ with quality dots, band+freq+RAT,
+  PCI, SIM) — click to pin it, click again to release. This is what makes the page a graph you
+  *interrogate* rather than a chart you *read*: the six-lane alignment problem (which SINR corresponds
+  to which band segment, at which second) is solved by pointing, not by visually tracing a vertical
+  line across six rows by eye.
+- A **re-registration gap** (SIM/network searching after a band change or failover) renders as an
+  absent trace segment and a `searching…` bus state, never an interpolated line — a straight line
+  across a gap would assert a measurement that was never taken.
+
+### 10.3 Interaction
+
+- **Time range** is a segmented control (15 m / 1 h / 6 h / 24 h), not a date picker — matches the
+  field-test-instrument framing (§1): these are the ranges that answer "did the thing I just did work"
+  vs. "what's the pattern of failovers this box has." Any other range is not a use case this page
+  serves.
+- **Live/paused toggle**, top right, mirrors what "watching a live radio" means: paused freezes the
+  right edge so a hover/pin target doesn't scroll out from under the cursor mid-inspection.
+- **The event log below the lanes is the accessibility table** (dataviz skill §6: a table view must
+  exist alongside any chart) — newest-first, one row per cause tick, with the same source/agency
+  vocabulary (You / Watchdog / Network) as chip colour. Hovering a row places the slice cursor at that
+  moment without leaving the table; clicking pins it and, if the event is outside the current window,
+  widens the range to bring it into view. This makes the log a second way to reach every cause tick,
+  for anyone who'd rather scan text than hover a chart.
+- **Deep-linkable** (`#w=<minutes>&m=<minute>&d=<0|1>`) so a specific moment — "look, THIS is where the
+  n71 lock happened" — is a URL, not a set of hover instructions. Not a requirement from the brief;
+  added because the page's whole job is pointing at a moment in history, and a moment that can't be
+  named and shared undermines that job.
+
+### 10.4 Visual system — no new tokens
+
+Tracking introduces **zero new colour**. Trace quality colouring reuses GL's `modemsignallog` ramp
+(§2); cause-tick colours reuse the revert banner's user/watchdog vocabulary (§5); bus segments and
+gridlines use the same card/border/divider tokens as every other tab. The only new *marks* are the
+bus segment (a rounded rect on `--bg-title`) and the cause-tick glyphs (square/triangle/circle) — both
+validated against the dataviz skill's six-check palette validator (§10.7) before use, not eyeballed.
+
+Base type stays at GL's 13px system stack; ARFCN/PCI/band figures use `ui-monospace` (§2's existing
+rule for RF figures), applied here to the bus-segment labels and the slice-cursor readout.
+
+### 10.5 What this page is not
+
+- **Not a replacement for the strip.** The strip is the loop's evidence (§1); Tracking is the loop's
+  memory. Removing the strip in favour of "just link to Tracking" would break the revert decision,
+  which needs to be answerable without navigating away from Bands.
+- **Not a general-purpose time-series explorer.** No arbitrary metric picker, no export, no annotation
+  authoring. Scope is fixed to the three RF traces + three state buses this box actually has, because
+  a configurable dashboard is a different (and much larger) product than "why did the radio do that."
+- **Not real-time-guaranteed.** Data delivery depends on §10.6 below; the page is designed to degrade
+  to "shows what's been captured so far" rather than promise a complete history it can't back.
+
+### 10.6 Data source — RESOLVED (2026-07-17): in-memory, session-scoped
+
+**Decision (Kevin, 2026-07-17): keep history in memory for now.** No backend recorder, no `/tmp`
+storage, no mining of GL logs — those stay as *later* options (§10.6.5) if the in-memory limits bite.
+
+#### 10.6.1 The recorder — a `window`-scoped singleton (`window.__mmHist`)
+
+`global_sockets` (§2) pushes *current* state over `/ws`; it is not a history API. We build history
+client-side by recording each push into a bounded ring buffer. **The buffer lives on `window`, not in a
+component's `data()`**, for one load-bearing reason: **Tracking is a separate route/chunk (§10.1).** A
+buffer inside the Tracking component would start empty every time you open the page — the opposite of
+its job. A component inside the *main* page would vanish when you navigate to Tracking. `window`
+outlives both, for the whole SPA session.
+
+Shape:
+```
+window.__mmHist = {
+  samples: [ { t, slot, id, band, mode, rsrp, sinr, rsrq, rssi, dl_bandwidth, tx_channel,
+               rsrp_level, sinr_level, rsrq_level, carrier } , … ],   // ring, capped
+  events:  [ { t, kind:'user'|'dog'|'net', label, detail } , … ],
+  record(sample), pushEvent(evt)
+}
+```
+- **Capped ring buffer:** ~5000 samples with a **min ~5 s spacing** between recorded samples ⇒ several
+  hours of coverage at trivial memory cost. Pushes arriving faster than the spacing are dropped (the
+  latest value wins); this is the retention-resolution decision the old open-question flagged. The four
+  range buttons window into *whatever exists* — a 24 h button with 3 h buffered shows 3 h and says so.
+- **Recording happens while any MudiModem page is mounted.** The main page already watches
+  `serving.rsrp` for its strip; that same watcher calls `record()`. The Tracking page records too while
+  it's the mounted page. Both reach the singleton through an **identical small `makeMMHist()` factory
+  inlined in both chunks** (`window.__mmHist || (window.__mmHist = makeMMHist())`, first-mount-wins) —
+  chunks can't `require` each other and the repo is deliberately toolchain-free (§7), so a tiny verbatim
+  copy in each file is the honest cost, covered by a test asserting both produce a compatible recorder.
+
+#### 10.6.2 Honest limitation (say it in the empty state)
+
+History accumulates **only while a MudiModem page has been open this session, and is lost on reload.**
+Open Tracking cold ⇒ it fills going forward; sit on Diagnostics first ⇒ you carry that history in. The
+empty/short-buffer state says exactly this ("collecting since HH:MM · reload clears it"), so the page
+never implies a completeness it can't back. Whether the `global_sockets` subscription is session-wide
+(store updates even off-page) or per-page is **not yet verified on the box** — if session-wide, a future
+tweak could record from an earlier point, but the design does not depend on it.
+
+#### 10.6.3 Cause-tick detection — where each agency comes from
+
+- **`user`** — pushed explicitly by the main page's own handlers: `applyBands()` success →
+  `pushEvent({kind:'user', label:'Bands applied', …})`; `keepBands()` → `Kept`; `revertBands()` (manual
+  *Revert now*) → `Reverted`. We already know the instant we cause these.
+- **`dog`** — the auto-revert: the main page's countdown reaching 0 (the watchdog fired server-side) →
+  `pushEvent({kind:'dog', label:'Auto-revert fired', …})`.
+- **`net`** — handover/failover, **inferred inside `record()`** by diffing the new sample against the
+  previous: a change in `id` (handover), active `slot` (failover), or `band`/`mode` (RAT change) with
+  **no `user` event within a small window (~5 s)** ⇒ a `net` event. The near-in-time guard prevents
+  misattributing a band change *we* just applied as a network event. A missed sample at a fast handover
+  can still merge two edges into one tick — acceptable for an in-memory best-effort log, and noted.
+
+#### 10.6.4 The four files
+
+| File | Change |
+|---|---|
+| `src/views/mudimodem-tracking.js` | **New chunk** (`render(h)`, expression `module.exports=…`, §7). Lane stack (3 traces + 3 buses), cause ticks, slice cursor + pin, range control, live/pause, event-log table. Reads `window.__mmHist`; records while mounted. |
+| `src/menu/mudimodem-tracking.json` | **New.** `level:0` (hidden, mirrors `modemsignallog.json`) + the same six `global_sockets` so the subscription is live on this route. |
+| `src/views/mudimodem.js` | Add recorder taps: `record()` on the existing `serving.rsrp` watcher; `pushEvent` in apply/keep/revert; a **"History →"** affordance in the strip → `this.$router.push('/mudimodem-tracking')`. The existing strip `trace` stays as-is (low-risk; recorder is additive). |
+| `test/chunk.test.js` | Extend to eval the new chunk as the SPA does, and exercise `makeMMHist()` (record/cap/spacing, event diffing) + the slice-lookup math under the stub. |
+
+#### 10.6.5 Deferred (revisit only if in-memory bites)
+
+- **Backend recorder to `/tmp`** (bounded, rotated — NOT `/etc`; this is telemetry, not durable config)
+  → survives reload/tab-close. Costs a process + rotation design.
+- **Mining GL's own logs** if `cellular_manager` already records handovers (unconfirmed — not grepped).
+- **Drag-to-zoom** on the lane stack if the four fixed ranges prove too coarse to separate close events.
+- **build/deploy/verify wiring** (`tools/build.sh` must gzip the second chunk; `deploy.sh` push it;
+  `verify.sh` assert the `level:0` entry) — mechanical, folded into the implementation plan, not a design
+  question.
+
+### 10.7 Quality floor (delta from §6)
+
+Same floor as §6, plus:
+
+- **Palette validated, not eyeballed** — dataviz skill's `validate_palette.js` run against GL's quality
+  ramp (mint/indigo/amber/rose) on both light and dark surfaces: CVD separation and normal-vision
+  floor pass; the light-mode mint/amber-vs-white contrast WARN is relieved by direct labels (bus text,
+  slice-cursor readout) and the event-log table, per the skill's "WARN obligates visible labels or a
+  table view" rule — both already exist here for other reasons, so no extra element was added to
+  satisfy it.
+- **Deep-link hash state** (`#w=&m=&d=`) must round-trip through the SPA's router without colliding
+  with `?_t=` cache-busting (§7) — untested against the real route since no backend exists yet.
+- `prefers-reduced-motion` kills the LIVE-dot pulse, matching §6's existing rule for the strip/bar.

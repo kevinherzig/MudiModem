@@ -1,0 +1,12 @@
+{
+    "view": "mudimodem-tracking",
+    "level": 0,
+    "global_sockets": [
+        "cellular.modems_info",
+        "cellular.modems_status",
+        "cellular.networks_info",
+        "cellular.networks_status",
+        "cellular.sims_info",
+        "cellular.sims_status"
+    ]
+}

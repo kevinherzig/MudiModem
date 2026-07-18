@@ -45,6 +45,26 @@ printf '%s' "$BODY" | node -e '
     console.log("   eval + render OK ->", c.name, "(shows -101 / n71)");
   })'
 
+echo "4b. tracking chunk present, valid menu, serves, evals + renders"
+ssh -o BatchMode=yes "root@$HOST" 'test -s /www/views/gl-sdk4-ui-mudimodem-tracking.common.js.gz' \
+  || fail "tracking chunk .gz missing"
+ssh -o BatchMode=yes "root@$HOST" 'test -s /usr/share/oui/menu.d/mudimodem-tracking.json' \
+  || fail "tracking menu json missing"
+ssh -o BatchMode=yes "root@$HOST" \
+  'lua -e "local c=require(\"cjson\"); local f=io.open(\"/usr/share/oui/menu.d/mudimodem-tracking.json\"); c.decode(f:read(\"*a\"))"' \
+  || fail "tracking menu json does not parse (would break ui.get_menu_list for EVERY page)"
+TBODY=$(ssh -o BatchMode=yes "root@$HOST" \
+  'curl -sk -H "Accept-Encoding: gzip" "https://127.0.0.1/views/gl-sdk4-ui-mudimodem-tracking.common.js?_t=1" | gzip -dc')
+printf '%s' "$TBODY" | node -e '
+  let s=""; process.stdin.on("data",d=>s+=d).on("end",()=>{
+    global.window={__mmHist:null};
+    const module={exports:{}}; const c=eval(s);
+    if(!c||c.name!=="mudimodem-tracking"){console.error("FAIL: tracking eval");process.exit(1);}
+    if(typeof c.render!=="function"||c.template!==undefined){console.error("FAIL: not render-only");process.exit(1);}
+    if(typeof c.makeMMHist!=="function"){console.error("FAIL: recorder missing");process.exit(1);}
+    console.log("   tracking eval + render-only OK ->", c.name);
+  })' || fail "tracking chunk eval failed"
+
 # 5. RPC backend (only if we ship one) — run the real plugin against live ubus.
 if [ -f src/rpc/mudimodem ]; then
   echo "5. RPC backend present + get_bands returns the three-layer model"
