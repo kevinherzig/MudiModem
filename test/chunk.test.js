@@ -386,6 +386,26 @@ test('lock tab: locked state shows Locked badge + Unlock, no Lock button', () =>
   assert.doesNotMatch(text, /Lock to this cell/);
 });
 
+test('lock tab: GL-only-locked state falls back to gl.tower, never shows literal "undefined"', () => {
+  const component = loadChunk();
+  const vm = makeVm(component, LIVE);
+  vm.tab = 'lock';
+  vm.lockData = JSON.parse(JSON.stringify(LOCKDATA_UNLOCKED));
+  // Both AT-side locks read unlocked, but GL's store says locked (the
+  // documented GL/AT disagreement) — only gl.tower carries the details.
+  vm.lockData.lock.l4g = { locked: false };
+  vm.lockData.lock.l5g = { locked: false };
+  vm.lockData.gl = {
+    locked: true,
+    tower: { cellid: 'X', network_type: 'NR5G', pci: 516, freq: 127490, scs: 15, band: 71 }
+  };
+  const text = textOf(component.render.call(vm, h));
+  assert.match(text, /516/, 'PCI comes from gl.tower');
+  assert.match(text, /127490/, 'ARFCN comes from gl.tower');
+  assert.doesNotMatch(text, /undefined/, 'never renders the literal word "undefined"');
+  assert.match(text, /Unlock/, 'Unlock is still offered');
+});
+
 test('lock tab: pin target derives from serving cell with SCS default', () => {
   const component = loadChunk();
   const vm = makeVm(component, LIVE);
@@ -397,6 +417,28 @@ test('lock tab: pin target derives from serving cell with SCS default', () => {
   assert.equal(t.band, 71);
   assert.equal(t.scs, 15);          // n71 default, 3GPP TS 38.104
   assert.equal(t.scsAssumed, true); // no scan result to confirm it
+});
+
+test('lock tab: pin target prefers a scan-confirmed SCS over the band default', () => {
+  const component = loadChunk();
+  const vm = makeVm(component, LIVE);
+  vm.lockData = JSON.parse(JSON.stringify(LOCKDATA_UNLOCKED));   // serving pci 516, arfcn 127490, band 71
+  // A scan row for this exact pci+arfcn with a DIFFERENT scs than the n71
+  // default (15) — the scan reading must win, and be marked unassumed.
+  vm.scan = { towers: [{ pci: 516, freq: 127490, scs: 30 }], running: false, error: '', ts: 0 };
+  const t = vm.pinTarget();
+  assert.equal(t.scs, 30, 'scan-confirmed scs overrides the band default');
+  assert.equal(t.scsAssumed, false, 'not flagged as assumed when scan confirms it');
+});
+
+test('lock tab: pin target refuses an unknown NR band rather than guess SCS', () => {
+  const component = loadChunk();
+  const vm = makeVm(component, LIVE);
+  vm.lockData = JSON.parse(JSON.stringify(LOCKDATA_UNLOCKED));
+  vm.lockData.serving.band = 999;   // not in SCS_DEFAULT, and no scan match below
+  vm.scan = { towers: [], running: false, error: '', ts: 0 };
+  const t = vm.pinTarget();
+  assert.strictEqual(t, null, 'refuses to build a lock target rather than guess an unknown band\'s SCS');
 });
 
 test('lock tab: cell pending banner renders on lock tab, not bands tab', () => {
@@ -413,9 +455,11 @@ test('lock tab: cell pending banner renders on lock tab, not bands tab', () => {
 
 test('bands tab: cell pending does NOT paint the bands banner', () => {
   const component = loadChunk();
-  const vm = makeVm(component, LIVE);
-  vm.tab = 'bands';
-  vm.bands = null; vm.bandsLoading = true;   // bands view in loading state
+  // Use a fully-populated bands model (bandsLoading:false, valid bands shape)
+  // so renderBands actually reaches the `pending.kind !== "cell"` gate instead
+  // of short-circuiting on the loading guard — otherwise this test would pass
+  // even if the gate itself were deleted.
+  const vm = bandsVm(component);
   vm.pending = { kind: 'cell', remaining: 42, window: 60, applied: {} };
   const text = textOf(component.render.call(vm, h));
   assert.doesNotMatch(text, /42s/);

@@ -1,4 +1,5 @@
-// MudiModem — Phase 1 diagnostics + Phase 2 interactive three-layer band grid.
+// MudiModem — Phase 1 diagnostics + Phase 2 interactive three-layer band grid +
+// cell-lock tab (pin to the serving cell, confirm-or-revert like band writes).
 //
 // Loaded by GL's SPA via eval(), so this file MUST be a single expression whose
 // value is the component (module.exports = {...}). `module` is in scope at eval
@@ -738,12 +739,23 @@ module.exports = {
 
       var action;
       if (locked) {
-        var lk = l5.locked ? l5 : l4;
+        // Prefer whichever AT-side lock is actually set; if the lock is known
+        // only via GL's store (d.gl.locked, with both l4g/l5g reading unlocked
+        // — a documented GL/AT disagreement), fall back to GL's stored tower
+        // rather than rendering l4g's empty pci/freq as "undefined".
+        var lk = l5.locked ? l5 : (l4.locked ? l4 : ((d.gl && d.gl.tower) || {}));
+        var hasPci = lk.pci !== undefined && lk.pci !== null;
+        var hasFreq = lk.freq !== undefined && lk.freq !== null;
+        var lockedDetail;
+        if (hasPci && hasFreq) lockedDetail = " to PCI " + lk.pci + " / ARFCN " + lk.freq;
+        else if (hasPci) lockedDetail = " to PCI " + lk.pci;
+        else if (hasFreq) lockedDetail = " to ARFCN " + lk.freq;
+        else lockedDetail = " (details unavailable)";
+        var lockedSuffix = (hasPci || hasFreq) && lk.band ? " (n" + lk.band + ")" : "";
         action = h("div", { staticClass: "mm-foot" }, [
           h("span", { staticClass: "mm-hint" }, [
             h("b", { staticStyle: { color: "var(--success)" } }, "Locked"),
-            " to PCI " + lk.pci + " / ARFCN " + lk.freq +
-            (lk.band ? " (n" + lk.band + ")" : "") + ". The modem will not hand over."
+            lockedDetail + lockedSuffix + ". The modem will not hand over."
           ]),
           h("button", {
             staticClass: "mm-btn danger",
@@ -763,7 +775,7 @@ module.exports = {
             h("span", { staticStyle: { flex: "none", display: "flex", gap: "6px" } }, [
               h("button", { staticClass: "mm-btn", on: { click: function () { self.lockConfirm = null; } } }, "Cancel"),
               h("button", {
-                staticClass: "mm-btn primary", attrs: { disabled: this.lockBusy },
+                staticClass: "mm-btn primary", attrs: { disabled: this.lockBusy || !!this.pending },
                 on: { click: function () { self.lockCell(target); } }
               }, this.lockBusy ? "Locking..." : "Lock it")
             ])
