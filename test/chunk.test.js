@@ -538,16 +538,18 @@ test('SIM tab renders two slot cards with honest DSDS badges', () => {
   assert.ok(textOf(cards[1]).includes('Roaming on AT&T'));
 });
 
-test('SIM tab masks identity until revealed', () => {
+test('SIM tab shows full identifiers by default, hides them on toggle', () => {
   const comp = loadChunk();
   const vm = makeVm(comp, SPLIT);
   vm.tab = 'sim';
   let text = textOf(comp.render.call(vm, h));
-  assert.ok(!text.includes('8901260108736235562F'));   // full ICCID hidden
-  assert.ok(text.includes('8901…'));                   // masked stub shown
-  vm.simReveal[1] = true;
+  assert.ok(text.includes('8901260108736235562F'), 'full ICCID visible by default');
+  assert.ok(text.includes('Hide identifiers'), 'offers a hide toggle');
+  vm.simReveal[1] = false;                              // user hides
   text = textOf(comp.render.call(vm, h));
-  assert.ok(text.includes('8901260108736235562F'));
+  assert.ok(!text.includes('8901260108736235562F'), 'full ICCID hidden after toggle');
+  assert.ok(text.includes('8901…'), 'masked stub shown when hidden');
+  assert.ok(text.includes('Show identifiers'));
 });
 
 test('SIM tab: empty slot renders as an empty card, no crash', () => {
@@ -772,6 +774,6 @@ test('present-but-unregistered slot (status 5) still shows identity + form', () 
   vm.tab = 'sim';
   vm.simEdit[1] = { apn: 'h2g2', auth: 'NONE', username: '', password: '', ip_type: 0, roaming: true };
   const text = textOf(comp.render.call(vm, h));
-  assert.ok(text.includes('Show identifiers'), 'present SIM shows identity even if unregistered');
+  assert.ok(text.includes('8901260108736235562F'), 'present SIM shows identity even if unregistered');
   assert.ok(text.includes('Not registered'), 'honest not-registered badge');
 });

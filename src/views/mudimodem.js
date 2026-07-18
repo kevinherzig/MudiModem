@@ -54,7 +54,8 @@ module.exports = {
       simCfg: { 1: null, 2: null },      // fresh get_sim_config per slot (the RMW base)
       simCfgErr: { 1: "", 2: "" },
       simEdit: { 1: null, 2: null },     // editable dial-profile fields per slot
-      simReveal: { 1: false, 2: false }, // identity fields unmasked per card
+      simReveal: { 1: true, 2: true },   // ICCID/IMSI/phone shown in full by default
+                                         // (admin-only page); "Hide identifiers" masks them
       simApplying: 0,                    // slot with an Apply in flight, else 0
       simApplyErr: { 1: "", 2: "" },
       switchConfirm: 0,                  // slot awaiting "Use this SIM" confirm, else 0
