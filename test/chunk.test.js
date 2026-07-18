@@ -666,3 +666,18 @@ test('lock tab: recovery card names the ssh panic path', () => {
   assert.match(text, /mudimodem-revert panic/);
   assert.match(text, /survives reboot/i);
 });
+
+test('AT console is an in-page tab: lazy-loads its own chunk', () => {
+  const src = fs.readFileSync(SRC, 'utf8');
+  assert.match(src, /gl-sdk4-ui-mudimodem-console\.common\.js/, 'lazy-loads the console chunk');
+  const c = loadChunk();
+  const vm = makeVm(c, LIVE);
+  vm.tab = 'at';
+  const txt = textOf(c.render.call(vm, h));
+  assert.match(txt, /Loading the AT console/, 'loading state before the chunk arrives');
+  assert.doesNotMatch(txt, /Phase 3/, 'placeholder copy is gone');
+  const fake = { name: 'mudimodem-console', render() {} };
+  vm.consoleComp = fake;
+  const node = walk(c.render.call(vm, h)).find((n) => n.tag === fake);
+  assert.ok(node, 'renders the loaded console component as a child vnode');
+});

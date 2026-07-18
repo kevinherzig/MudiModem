@@ -8,4 +8,8 @@ gzip -9 -n -c src/views/mudimodem.js > build/gl-sdk4-ui-mudimodem.common.js.gz
 cp src/menu/mudimodem.json build/mudimodem.json 2>/dev/null || true
 gzip -9 -n -c src/views/mudimodem-tracking.js > build/gl-sdk4-ui-mudimodem-tracking.common.js.gz
 cp src/menu/mudimodem-tracking.json build/mudimodem-tracking.json 2>/dev/null || true
+# Phase 3: merge + validate the AT library, then gzip for gzip_static.
+python3 tools/lib-validate.py
+gzip -9 -n -c build/at-library.json > build/at-library.json.gz
+gzip -9 -n -c src/views/mudimodem-console.js > build/gl-sdk4-ui-mudimodem-console.common.js.gz
 ls -l build/

@@ -562,6 +562,14 @@ Gotchas (all in the file's header):
   still need GL's `modem.CPU.AT` sub_id path (§1). ⇒ **AT console + active-SIM work: at_mdm0. The
   cross-SIM three-layer band model: keep GL's channel.**
 
+### 2026-07-18 probes (Phase 3)
+- 🟢 **No sub_id on `/dev/at_mdm0`, confirmed.** `AT+QSIMSWITCH=?`, `AT+QDSDS=?`, `AT+QMSIMCFG=?`
+  → ERROR; `AT+QCFG=?` has no sim/sub entry; `AT+QNWPREFCFG=?` lists no sub parameter. The port
+  answers in the active subscription's context (QSPN → T-Mobile). GL's `sub_id` is QMI-layer.
+- 🟢 **`port-bridge` holds `at_mdm0` permanently** (modem end of the USB-AT passthrough,
+  `/usr/bin/port-bridge at_mdm0 at_usb0 0`). Multiple clean full responses probed alongside it.
+- 🟢 `AT+QCFG=?` on this port lists 19 entries (rrc, lte/bandprior, usbnet, …) — none SIM-related.
+
 ---
 
 ## 11. Modem behaviour: dual-SIM + config durability 🟢

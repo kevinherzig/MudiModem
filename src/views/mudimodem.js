@@ -56,6 +56,10 @@ module.exports = {
       trackingComp: null,   // the loaded tracking component options, once fetched
       trackingLoading: false,
       trackingErr: "",
+      // AT console tab: same lazy-chunk pattern as Tracking.
+      consoleComp: null,
+      consoleLoading: false,
+      consoleErr: "",
       // Approximate downlink centre freq (MHz) per band, for spectrum ordering
       // and labels. Source: 3GPP TS 38.101-1 (NR) / 36.101 (LTE), rounded to the
       // marketing figure. Labels only — the modem is never sent a frequency.
@@ -169,6 +173,7 @@ module.exports = {
     tab(t) {
       if (t === "bands" && !this.bands && !this.bandsLoading) this.fetchBands();
       if (t === "lock" && !this.lockData && !this.lockLoading) this.fetchLock();
+      if (t === "at" && !this.consoleComp && !this.consoleLoading) this.loadConsole();
     }
   },
 
@@ -211,6 +216,25 @@ module.exports = {
         .catch(function (e) {
           self.trackingLoading = false;
           self.trackingErr = (e && (e.message || e.type)) || "could not load the graph";
+        });
+    },
+
+    // Fetch + eval the AT-console chunk exactly like loadTracking above.
+    loadConsole() {
+      var self = this;
+      if (this.consoleComp || this.consoleLoading) return;
+      if (typeof window === "undefined" || !window.$axios) return;
+      this.consoleLoading = true; this.consoleErr = "";
+      window.$axios.get("/views/gl-sdk4-ui-mudimodem-console.common.js?_t=" + Date.now())
+        .then(function (res) {
+          var module = { exports: {} };            // eslint-disable-line no-unused-vars
+          var comp = eval(res.data);               // chunk is `module.exports = {...}`
+          if (!comp || typeof comp.render !== "function") throw new Error("bad chunk");
+          self.consoleComp = comp; self.consoleLoading = false;
+        })
+        .catch(function (e) {
+          self.consoleLoading = false;
+          self.consoleErr = (e && e.message) || "load failed";
         });
     },
 
@@ -1071,9 +1095,16 @@ module.exports = {
           this.trackingErr ? "Couldn't load the graph: " + this.trackingErr
             : "Loading the signal graph…")]);
       }
+    } else if (this.tab === "at") {
+      if (this.consoleComp) {
+        panel = h(this.consoleComp);
+      } else {
+        panel = h("div", { staticClass: "mm-card" }, [h("div", { staticClass: "mm-soon" },
+          this.consoleErr ? "Couldn't load the AT console: " + this.consoleErr
+            : "Loading the AT console…")]);
+      }
     } else {
       var soon = {
-        at: "AT console + community library - Phase 3.",
         sim: "SIM / APN - Phase 4."
       }[this.tab];
       panel = h("div", { staticClass: "mm-card" }, [h("div", { staticClass: "mm-soon" }, soon)]);
