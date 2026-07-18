@@ -309,7 +309,7 @@ module.exports = {
     // fetch order is never mutated under us.
     scanCells() {
       var self = this;
-      if (this.scan.running) return;
+      if (this.scan.running || this.pending || this.lockBusy) return;
       this.scanConfirm = false;
       this.scan.running = true; this.scan.error = "";
       window.$rpcRequest("call", ["sid", "mudimodem", "scan_cells", {}], { timeout: 600000 })
@@ -873,7 +873,7 @@ module.exports = {
             confirming
               ? h("span", { staticStyle: { display: "flex", gap: "6px" } }, [
                   h("button", { staticClass: "mm-btn", on: { click: function () { self.lockConfirm = null; } } }, "Cancel"),
-                  h("button", { staticClass: "mm-btn primary", attrs: { disabled: self.lockBusy },
+                  h("button", { staticClass: "mm-btn primary", attrs: { disabled: self.lockBusy || !!self.pending },
                     on: { click: function () { self.lockCell(target); } } },
                     self.lockBusy ? "Locking..." : "Confirm")
                 ])
@@ -898,7 +898,9 @@ module.exports = {
                 "Scanning takes the modem OFFLINE for up to ~10 minutes. This connection will drop if it runs over cellular."),
               h("span", { staticStyle: { flex: "none", display: "flex", gap: "6px" } }, [
                 h("button", { staticClass: "mm-btn", on: { click: function () { self.scanConfirm = false; } } }, "Cancel"),
-                h("button", { staticClass: "mm-btn danger", on: { click: function () { self.scanCells(); } } }, "Scan now")
+                h("button", { staticClass: "mm-btn danger",
+                  attrs: { disabled: !!self.pending || self.lockBusy },
+                  on: { click: function () { self.scanCells(); } } }, "Scan now")
               ])
             ])
           : h("div", { staticClass: "mm-foot" }, [

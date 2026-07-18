@@ -495,6 +495,65 @@ test('lock tab: scan results render rows sorted by strength with Lock buttons', 
   assert.equal(lockBtns.length, 2);
 });
 
+test('lock tab: pending interlock disables Scan and every scan-row Lock button', () => {
+  const component = loadChunk();
+  const vm = makeVm(component, LIVE);
+  vm.tab = 'lock';
+  vm.lockData = JSON.parse(JSON.stringify(LOCKDATA_UNLOCKED));
+  vm.scan = { running: false, error: '', ts: 1, towers: [
+    { network_type: 'NR5G', pci: 99, freq: 520000, band: 41, scs: 30, cellid: 'A', strength: 2, rsrp: -101 },
+    { network_type: 'NR5G', pci: 516, freq: 127490, band: 71, scs: 15, cellid: 'B', strength: 4, rsrp: -98 }
+  ] };
+  // An active revert countdown from an EARLIER experiment (band or cell) - the
+  // interlock this covers is "one experiment at a time", regardless of kind.
+  vm.pending = { kind: 'cell', remaining: 30, window: 60, applied: {} };
+  const tree = component.render.call(vm, h);
+  const nodes = walk(tree);
+  const scanBtn = nodes.find((n) => n.tag === 'button' && textOf(n) === 'Scan for cells');
+  assert.ok(scanBtn, 'Scan for cells button still renders');
+  assert.ok(scanBtn.data.attrs && scanBtn.data.attrs.disabled,
+    'Scan for cells must be disabled while a revert is pending (this is the bug the Critical caught)');
+  const lockBtns = nodes.filter((n) => n.tag === 'button' && textOf(n) === 'Lock');
+  assert.equal(lockBtns.length, 2, 'both scan rows still render a Lock button');
+  assert.ok(lockBtns.every((n) => n.data.attrs && n.data.attrs.disabled),
+    'every scan-row Lock button must be disabled while a revert is pending');
+});
+
+test('lock tab: pending interlock also disables "Scan now" in the confirm footer', () => {
+  const component = loadChunk();
+  const vm = makeVm(component, LIVE);
+  vm.tab = 'lock';
+  vm.lockData = JSON.parse(JSON.stringify(LOCKDATA_UNLOCKED));
+  vm.scan = { running: false, error: '', ts: 0, towers: [] };
+  vm.scanConfirm = true;
+  vm.pending = { kind: 'cell', remaining: 30, window: 60, applied: {} };
+  const tree = component.render.call(vm, h);
+  const scanNowBtn = walk(tree).find((n) => n.tag === 'button' && textOf(n) === 'Scan now');
+  assert.ok(scanNowBtn, 'Scan now button renders once scanConfirm is set');
+  assert.ok(scanNowBtn.data.attrs && scanNowBtn.data.attrs.disabled,
+    'Scan now must be disabled while a revert is pending');
+});
+
+test('lock tab: 5G scan row without a confirmed scs cannot be locked; a row with scs can', () => {
+  const component = loadChunk();
+  const vm = makeVm(component, LIVE);
+  vm.tab = 'lock';
+  vm.lockData = JSON.parse(JSON.stringify(LOCKDATA_UNLOCKED));
+  vm.scan = { running: false, error: '', ts: 1, towers: [
+    { network_type: 'NR5G', pci: 77, freq: 500000, band: 78, cellid: 'NOSCS', strength: 3, rsrp: -100 },
+    { network_type: 'NR5G', pci: 516, freq: 127490, band: 71, scs: 15, cellid: 'HASSCS', strength: 4, rsrp: -98 }
+  ] };
+  // no pending - isolates the scs rule from the interlock rule.
+  const tree = component.render.call(vm, h);
+  const lockBtns = walk(tree).filter((n) => n.tag === 'button' && textOf(n) === 'Lock');
+  assert.equal(lockBtns.length, 2);
+  // Rows render sorted by strength desc, so HASSCS (516, strength 4) is first.
+  assert.ok(!(lockBtns[0].data.attrs && lockBtns[0].data.attrs.disabled),
+    'row with a confirmed scs must be lockable (falsy disabled)');
+  assert.ok(lockBtns[1].data.attrs && lockBtns[1].data.attrs.disabled,
+    'a 5G row with no scs must refuse to lock rather than guess');
+});
+
 test('lock tab: scan target uses the row scs verbatim', () => {
   const component = loadChunk();
   const vm = makeVm(component, LIVE);
