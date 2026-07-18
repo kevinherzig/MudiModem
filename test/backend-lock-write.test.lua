@@ -6,6 +6,8 @@ local STALE   = assert(os.getenv("MUDIMODEM_STALE"))
 
 local at_log = {}
 local lock5_reply = '\r\n+QNWLOCK: "common/5g",0\r\n\r\nOK\r\n'
+local lock4_reply = '\r\n+QNWLOCK: "common/4g",0\r\n\r\nOK\r\n'
+local setfeat_calls = {}
 package.loaded["oui.ubus"] = {
   call = function(object, method, params)
     if object == "modem.CPU.AT" and method == "get_result_AT" then
@@ -14,7 +16,7 @@ package.loaded["oui.ubus"] = {
       if cmd == "AT+QSPN" then
         return { data = '\r\n+QSPN: "T-Mobile","T-Mobile","",0,"310260"\r\n\r\nOK\r\n' }
       elseif cmd == 'AT+QNWLOCK="common/4g"' then
-        return { data = '\r\n+QNWLOCK: "common/4g",0\r\n\r\nOK\r\n' }
+        return { data = lock4_reply }
       elseif cmd == 'AT+QNWLOCK="common/5g"' then
         return { data = lock5_reply }
       elseif cmd == 'AT+QNWLOCK="save_ctrl"' then
@@ -29,6 +31,21 @@ package.loaded["oui.ubus"] = {
       return { modems = { { bus = "cpu", current_sim_slot = "1" } } }
     elseif object == "cellular.sim" and method == "info" then
       return { sims = { { slot = "1", mcc = "310", mnc = "260" } } }
+    elseif object == "cellular.modem" and method == "get_all_config" then
+      -- Non-empty and slot-matching on purpose: if a future regression makes
+      -- confirm() fall through past the KIND=="cell" early-return, this makes
+      -- the "if sf then" block in the general (band) path actually live,
+      -- rather than trivially nil -- so scenario 6 exercises the same code a
+      -- band confirm would, and any regression that also loosens the `any`
+      -- gate (the other thing currently keeping a cell confirm from writing
+      -- band config) has something real to write.
+      return { slot_feature = { ["s1_bcpu_test"] = {
+        network_mode = "NR5G",
+        band = { band_enable = true, band_filter_mode = 0,
+                 band_list = { LTE = {}, ["NR-SA"] = { 71 }, ["NR-NSA"] = {} } } } } }
+    elseif object == "cellular.modem" and method == "set_feature_config" then
+      setfeat_calls[#setfeat_calls + 1] = params
+      return { ok = true, changed = true }
     end
     return {}
   end
@@ -63,10 +80,11 @@ assert(type(M.clear_cell_lock) == "function", "clear_cell_lock missing")
 assert(type(M.scan_cells) == "function", "scan_cells missing")
 
 local function reset()
-  at_log = {}; glc_calls = {}; exec_cmds = {}
+  at_log = {}; glc_calls = {}; exec_cmds = {}; setfeat_calls = {}
   os.remove(PENDING); os.remove(ARMED); os.remove(STALE)
   glc_fail = false
   lock5_reply = '\r\n+QNWLOCK: "common/5g",0\r\n\r\nOK\r\n'
+  lock4_reply = '\r\n+QNWLOCK: "common/4g",0\r\n\r\nOK\r\n'
 end
 local function pget(key)
   for line in io.lines(PENDING) do
@@ -118,13 +136,18 @@ assert(r.error and tostring(r.error):find("20002044"), "GL error code not surfac
 assert(not io.open(PENDING, "r"), "pending must be removed on GL failure")
 
 -- 6. confirm on a cell pending: clears it, does NOT touch set_feature_config.
+-- set_feature_config is called via oui.ubus (the shim above), NOT via
+-- ngx.location.capture/glc_calls -- so this must scan setfeat_calls, not
+-- glc_calls, or a regression that removes the `KIND=="cell"` early-return in
+-- M.confirm (falling through into the band-durability set_feature_config
+-- path) would go undetected.
 reset()
 assert(M.set_cell_lock({ rat = "5g", pci = 516, freq = 127490, scs = 15, band = 71 }).ok)
-glc_calls = {}
+glc_calls = {}; setfeat_calls = {}
 r = M.confirm({})
 assert(r.ok and r.confirmed, "confirm failed")
 assert(not io.open(PENDING, "r"), "pending must be gone after confirm")
-for _, c in ipairs(glc_calls) do assert(not c:find("set_feature_config"), "cell confirm must not touch band config") end
+assert(#setfeat_calls == 0, "cell confirm must not touch band config (set_feature_config)")
 
 -- 7. revert_now on a cell pending: GL unlock + mode restore + pending gone.
 reset()
@@ -135,9 +158,15 @@ assert(r.ok and r.reverted, "revert_now failed")
 local unlocked
 for _, c in ipairs(glc_calls) do if c:find('"lock":false') then unlocked = true end end
 assert(unlocked, "revert_now must GL-unlock")
-local mode_restored
-for _, c in ipairs(at_log) do if c:find('mode_pref",NR5G') then mode_restored = true end end
+local mode_restored, disable_restored, savectrl_restored
+for _, c in ipairs(at_log) do
+  if c:find('mode_pref",NR5G') then mode_restored = true end
+  if c:find('nr5g_disable_mode",0') then disable_restored = true end
+  if c:find('save_ctrl",0,0') then savectrl_restored = true end
+end
 assert(mode_restored, "revert_now must restore mode_pref")
+assert(disable_restored, "revert_now must restore nr5g_disable_mode")
+assert(savectrl_restored, "revert_now must restore save_ctrl")
 assert(not io.open(PENDING, "r"), "pending must be gone after revert")
 
 -- 8. clear_cell_lock: GL unlock + stale marker removed.
@@ -153,5 +182,16 @@ reset()
 local f9 = io.open(PENDING, "w"); f9:write("KIND=cell\nSUB_ID=1\n"); f9:close()
 r = M.set_bands({ sa = { 71 } })
 assert(r.error and r.error:find("pending"), "set_bands must refuse while a pending exists")
+
+-- 10. Fail CLOSED when the lock-state read can't be verified: at_expect
+-- exhausts its 3 retries on a crossed/non-matching reply, parse_qnwlock5
+-- degrades to nil, and set_cell_lock must refuse rather than treat "unknown"
+-- the same as "unlocked" (Finding 1). No GL write, no pending file left.
+reset()
+lock5_reply = '\r\n+QNWPREFCFG: "nr5g_band",71\r\n\r\nOK\r\n'   -- matches no QNWLOCK marker -> crossed
+r = M.set_cell_lock({ rat = "5g", pci = 516, freq = 127490, scs = 15, band = 71 })
+assert(r.error and r.error:find("could not read"), "must refuse when lock state can't be read; got " .. tostring(r.error))
+for _, c in ipairs(glc_calls) do assert(not c:find("set_cell_tower"), "must not call set_cell_tower when lock state is unknown") end
+assert(not io.open(PENDING, "r"), "no pending file must remain after a failed-read refusal")
 
 print("backend-lock-write.test.lua: all ok")

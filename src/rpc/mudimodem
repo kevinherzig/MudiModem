@@ -382,10 +382,19 @@ function M.set_cell_lock(args)
 
   local sub_id, _, _, slot = resolve_active()
 
-  -- One lock at a time (keeps the revert target = "unlocked", always).
+  -- One lock at a time (keeps the revert target = "unlocked", always). Fail
+  -- CLOSED: at_expect returns nil when it exhausts its retries (crossed AT
+  -- replies under heavy polling, reference §10), and parse_qnwlock4/5 pass
+  -- that nil straight through. Treating "couldn't read" the same as
+  -- "verified unlocked" would let a write proceed over an undetected real
+  -- lock and capture a bogus PREV revert target — so an unreadable state is
+  -- refused, distinct from a readable-and-unlocked one.
   local l4 = parse_qnwlock4(at_expect('AT+QNWLOCK="common/4g"', '"common/4g"', sub_id))
   local l5 = parse_qnwlock5(at_expect('AT+QNWLOCK="common/5g"', '"common/5g"', sub_id))
-  if (l4 and l4.locked) or (l5 and l5.locked) then
+  if not l4 or not l5 then
+    return { error = "could not read current lock state; try again" }
+  end
+  if l4.locked or l5.locked then
     return { error = "a cell lock is already set; unlock first" }
   end
 
