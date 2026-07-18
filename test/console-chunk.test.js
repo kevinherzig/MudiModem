@@ -56,7 +56,11 @@ const LIB = [
   { id: '3gpp.radio', cat: 'Power', title: 'Radio off / on', cmd: 'AT+CFUN={{fun}}',
     risk: 'set', vendor: 'any', verified: [], summary: 'sum', warn: 'warn',
     source: 'src', by: 'kevin',
-    params: [{ name: 'fun', hint: '0 off, 1 on', values: ['0', '1'] }] }
+    params: [{ name: 'fun', hint: '0 off, 1 on', values: ['0', '1'] }] },
+  { id: 'demo.set-commit', cat: 'Bands', title: 'Set + commit', risk: 'nv',
+    vendor: 'any', verified: [], summary: 'sum', warn: 'warn', source: 'src', by: 'kevin',
+    steps: ['AT+QNWPREFCFG="nr5g_band",{{bands}}', 'AT+QNWPREFCFG="nr5g_band"'],
+    params: [{ name: 'bands', hint: 'colon-separated', example: '41:71' }] }
 ];
 
 // Genuinely captured on the box 2026-07-17 (NR5G-SA, includes <tac>).
@@ -256,7 +260,9 @@ test('send(): success response is classified into resp/ok lines', async () => {
   try {
     global.window = {
       $rpcRequest: () => Promise.resolve({
-        ok: true, status: 'ok', response: '+QSPN: "T-Mobile"\r\nOK\r\n', elapsed_ms: 12
+        ok: true, requested: 1, ran: 1, aborted: false, steps: [
+          { cmd: 'AT+QSPN?', status: 'ok', response: '+QSPN: "T-Mobile"\r\nOK\r\n', elapsed_ms: 12 }
+        ]
       })
     };
     vm.prompt = 'AT+QSPN?'; vm.selId = null;
@@ -277,7 +283,11 @@ test('send(): status "timeout" pushes a "no terminator" error line', async () =>
   const saved = global.window;
   try {
     global.window = {
-      $rpcRequest: () => Promise.resolve({ ok: true, status: 'timeout', response: '' })
+      $rpcRequest: () => Promise.resolve({
+        ok: true, requested: 1, ran: 1, aborted: false, steps: [
+          { cmd: 'AT+SOMETHINGSLOW', status: 'timeout', response: '' }
+        ]
+      })
     };
     vm.prompt = 'AT+SOMETHINGSLOW'; vm.selId = null;
     vm.send();
@@ -321,4 +331,75 @@ test('the chunk speaks only at_console — never GL AT paths', () => {
   assert.match(src, /"at_console"/, 'sends via mudimodem.at_console');
   assert.doesNotMatch(src, /modem\.CPU\.AT|get_result_AT|send_at_command/,
     'never GL AT surfaces');
+});
+
+test('assembled substitutes params across all steps of a steps[] entry', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, {});
+  vm.lib = LIB;
+  vm.pick(LIB.find((e) => e.id === 'demo.set-commit'));
+  vm.params.bands = '41:71';
+  assert.strictEqual(vm.assembled,
+    'AT+QNWPREFCFG="nr5g_band",41:71\nAT+QNWPREFCFG="nr5g_band"');
+  assert.deepStrictEqual(vm.stepLines,
+    ['AT+QNWPREFCFG="nr5g_band",41:71', 'AT+QNWPREFCFG="nr5g_band"']);
+});
+
+test('stepLines drops blank lines from free-typed multi-line input', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, {});
+  vm.prompt = 'AT+ONE\n\n   \nAT+TWO';
+  vm.selId = null;
+  assert.deepStrictEqual(vm.stepLines, ['AT+ONE', 'AT+TWO']);
+});
+
+test('send(): a multi-step sequence renders every returned step in order', async () => {
+  const c = loadChunk();
+  const vm = makeVm(c, {});
+  const saved = global.window;
+  try {
+    global.window = { $rpcRequest: () => Promise.resolve({
+      ok: true, requested: 2, ran: 2, aborted: false, steps: [
+        { cmd: 'AT+ONE', status: 'ok', response: 'OK\r\n', elapsed_ms: 3 },
+        { cmd: 'AT+TWO', status: 'ok', response: '+X: 1\r\nOK\r\n', elapsed_ms: 4 }
+      ] }) };
+    vm.prompt = 'AT+ONE\nAT+TWO'; vm.selId = null;
+    await vm.send();
+  } finally { global.window = saved; }
+  const cmds = vm.lines.filter((l) => l.kind === 'cmd').map((l) => l.text);
+  assert.deepStrictEqual(cmds, ['AT+ONE', 'AT+TWO'], 'both step commands shown');
+  assert.ok(vm.lines.some((l) => l.text === '+X: 1'), 'second step response shown');
+});
+
+test('send(): aborted sequence marks the remaining steps skipped', async () => {
+  const c = loadChunk();
+  const vm = makeVm(c, {});
+  const saved = global.window;
+  try {
+    global.window = { $rpcRequest: () => Promise.resolve({
+      ok: true, requested: 2, ran: 1, aborted: true, steps: [
+        { cmd: 'AT+BAD', status: 'error', response: 'ERROR\r\n', elapsed_ms: 3 }
+      ] }) };
+    vm.prompt = 'AT+BAD\nAT+NEVER'; vm.selId = null;
+    await vm.send();
+  } finally { global.window = saved; }
+  assert.ok(vm.lines.some((l) => l.kind === 'note' && /skipped/.test(l.text)),
+    'skipped note for the step that never ran');
+});
+
+test('send(): RPC timeout scales with the number of steps', async () => {
+  const c = loadChunk();
+  const vm = makeVm(c, {});
+  const saved = global.window;
+  let seenOpts = null;
+  try {
+    global.window = { $rpcRequest: (_m, _p, opts) => { seenOpts = opts;
+      return Promise.resolve({ ok: true, requested: 3, ran: 3, aborted: false, steps: [
+        { cmd: 'A', status: 'ok', response: 'OK\r\n' },
+        { cmd: 'B', status: 'ok', response: 'OK\r\n' },
+        { cmd: 'C', status: 'ok', response: 'OK\r\n' } ] }); } };
+    vm.prompt = 'A\nB\nC'; vm.selId = null;
+    await vm.send();
+  } finally { global.window = saved; }
+  assert.strictEqual(seenOpts.timeout, (8 * 3 + 10) * 1000, '3 steps -> 8*3+10 s');
 });

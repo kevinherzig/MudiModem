@@ -79,15 +79,23 @@ module.exports = {
     },
     selParams() { return (this.sel && this.sel.params) || []; },
     paramMode() { return this.selParams.length > 0; },
-    // The command that would be sent: entry cmd with {{params}} substituted
-    // (unfilled ones stay visible as {{name}}), or the free prompt.
+    // The command text that would be sent: the entry's cmd OR its steps joined
+    // by newline, with {{params}} substituted (unfilled ones stay visible).
     assembled() {
       if (!this.sel || !this.paramMode) return this.prompt;
+      var base = this.sel.steps ? this.sel.steps.join("\n") : this.sel.cmd;
       var p = this.params;
-      return this.sel.cmd.replace(/\{\{(\w+)\}\}/g, function (m, name) {
+      return base.replace(/\{\{(\w+)\}\}/g, function (m, name) {
         var v = ((p[name] || "") + "").trim();
         return v !== "" ? v : m;
       });
+    },
+    // The wire command split into individual AT steps (trimmed, blanks dropped).
+    stepLines() {
+      var v = ((this.paramMode ? this.assembled : this.prompt) || "").trim();
+      if (!v) return [];
+      return v.split(/\r?\n/).map(function (s) { return s.trim(); })
+              .filter(function (s) { return s !== ""; });
     },
     paramsFilled() {
       var p = this.params;
@@ -216,40 +224,49 @@ module.exports = {
     send() {
       var self = this;
       var entry = this.sel;
-      var cmd = ((this.paramMode ? this.assembled : this.prompt) || "").trim();
-      if (!cmd || this.sending) return;
-      if (/\{\{/.test(cmd)) { this.note("fill in every parameter before sending"); return; }
+      var steps = this.stepLines;
+      if (!steps.length || this.sending) return;
+      if (steps.some(function (s) { return /\{\{/.test(s); })) {
+        this.note("fill in every parameter before sending"); return;
+      }
       if (this.gateBlocked) {
         this.note('this is a ' + entry.risk + ' entry — tick "Enable higher-risk commands" in the banner to send it');
         return;
       }
-      this.push("cmd", cmd);
-      this.history.push(cmd); this.histIdx = null;
+      var wire = steps.join("\n");
+      steps.forEach(function (s) { self.push("cmd", s); });
+      this.history.push(wire); this.histIdx = null;
       this.decodeRows = null;
       if (typeof window === "undefined" || !window.$rpcRequest) {
-        this.push("err", "RPC unavailable");
-        return;
+        this.push("err", "RPC unavailable"); return;
       }
-      var TOOL_T = 8;   // tool deadline; rpc timeout = tool + 10 s (spec §2 chain)
+      var TOOL_T = 8;   // per-step deadline; rpc timeout = TOOL_T*steps + 10 s
       this.sending = true;
-      window.$rpcRequest("call", ["sid", "mudimodem", "at_console",
-                                  { cmd: cmd, timeout: TOOL_T }],
-                         { timeout: (TOOL_T + 10) * 1000 })
+      return window.$rpcRequest("call", ["sid", "mudimodem", "at_console",
+                                         { cmd: wire, timeout: TOOL_T }],
+                         { timeout: (TOOL_T * steps.length + 10) * 1000 })
         .then(function (r) {
           self.sending = false;
-          // Backend {error:…} arrives RESOLVED ($rpcRequest only rejects on
-          // err_msg/err_code) — check it first.
           if (r && r.error) { self.push("err", r.error); return; }
-          var resp = (r && r.response) || "";
-          resp.replace(/\r/g, "\n").split("\n").forEach(function (l) {
-            l = l.trim();
-            if (l) self.push(self.classifyLine(l), l);
+          var got = (r && r.steps) || [];
+          var combined = "";
+          got.forEach(function (st) {
+            var resp = (st.response || "");
+            combined += resp + "\n";
+            resp.replace(/\r/g, "\n").split("\n").forEach(function (l) {
+              l = l.trim();
+              if (l) self.push(self.classifyLine(l), l);
+            });
+            if (st.status === "timeout") {
+              self.push("err", "no terminator after " + TOOL_T +
+                "s — the response may still arrive; the channel is drained on the next send");
+            }
           });
-          if (r && r.status === "timeout") {
-            self.push("err", "no terminator after " + TOOL_T +
-              "s — the response may still arrive; the channel is drained on the next send");
+          if (r && r.aborted) {
+            var skipped = (r.requested || steps.length) - (r.ran || got.length);
+            for (var i = 0; i < skipped; i++) self.note("skipped — previous step failed");
           }
-          self.applyDecode(entry, cmd, resp);
+          self.applyDecode(entry, wire, combined);
         })
         .catch(function (e) {
           self.sending = false;
