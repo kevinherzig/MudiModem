@@ -565,3 +565,82 @@ test('lock tab: scan target uses the row scs verbatim', () => {
   assert.equal(t.scsAssumed, false);
   assert.deepEqual(t.extra, row);
 });
+
+test('scanCells() no-ops while an experiment is pending (method-level guard)', () => {
+  const component = loadChunk();
+  const vm = makeVm(component, LIVE);
+  vm.tab = 'lock';
+  vm.lockData = JSON.parse(JSON.stringify(LOCKDATA_UNLOCKED));
+
+  // A minimal thenable chain compatible with scanCells' `.then(...).catch(...).then(...)`
+  // usage: every link returns the same chain object, and none of the callbacks fire
+  // (we only care whether $rpcRequest itself was invoked).
+  function fakeChain() {
+    const chain = {};
+    chain.then = function () { return chain; };
+    chain.catch = function () { return chain; };
+    return chain;
+  }
+
+  let called = false;
+  const hadWindow = Object.prototype.hasOwnProperty.call(global, 'window');
+  const originalWindow = global.window;
+  global.window = { $rpcRequest: function () { called = true; return fakeChain(); } };
+  try {
+    // Guarded: an experiment (band OR cell) is already pending -> scanCells must
+    // return before ever touching $rpcRequest. This exercises the scanCells()
+    // guard directly, independent of any button `disabled` attribute.
+    vm.pending = { kind: 'cell', remaining: 30, window: 60, applied: {} };
+    vm.scan.running = false;
+    vm.lockBusy = false;
+    vm.scanCells();
+    assert.strictEqual(called, false, 'scanCells must no-op while this.pending is set');
+
+    // Same guard, different trigger: a lock/unlock RPC in flight.
+    called = false;
+    vm.pending = null;
+    vm.lockBusy = true;
+    vm.scanCells();
+    assert.strictEqual(called, false, 'scanCells must no-op while this.lockBusy is set');
+
+    // Positive control: with nothing blocking it, scanCells DOES call $rpcRequest -
+    // proves the guard is what's suppressing the call above, not a wiring mistake.
+    called = false;
+    vm.pending = null;
+    vm.scan.running = false;
+    vm.lockBusy = false;
+    vm.scanCells();
+    assert.strictEqual(called, true, 'scanCells calls $rpcRequest when nothing is blocking it');
+  } finally {
+    if (hadWindow) global.window = originalWindow; else delete global.window;
+  }
+});
+
+test('lock tab: scan-row Confirm button disabled while pending (confirming branch)', () => {
+  const component = loadChunk();
+  const vm = makeVm(component, LIVE);
+  vm.tab = 'lock';
+  vm.lockData = JSON.parse(JSON.stringify(LOCKDATA_UNLOCKED));
+  vm.scan = { running: false, error: '', ts: 1, towers: [
+    { network_type: 'NR5G', pci: 516, freq: 127490, band: 71, scs: 15, cellid: 'B', strength: 4, rsrp: -98 }
+  ] };
+  // Puts renderScanCard's row 0 into the confirming branch (Cancel + Confirm),
+  // which only paints when lockConfirm.scanIdx matches the sorted row index.
+  vm.lockConfirm = { scanIdx: 0 };
+
+  function findConfirmBtn() {
+    const tree = component.render.call(vm, h);
+    return walk(tree).find((n) => n.tag === 'button' && textOf(n) === 'Confirm');
+  }
+
+  vm.pending = null;
+  let btn = findConfirmBtn();
+  assert.ok(btn, 'Confirm button renders once lockConfirm targets this scan row');
+  assert.ok(!(btn.data.attrs && btn.data.attrs.disabled), 'Confirm enabled when nothing is pending');
+
+  vm.pending = { kind: 'cell', remaining: 30, window: 60, applied: {} };
+  btn = findConfirmBtn();
+  assert.ok(btn, 'Confirm button still renders while pending');
+  assert.ok(btn.data.attrs && btn.data.attrs.disabled,
+    'scan-row Confirm must be disabled while a revert is pending (previously uncovered)');
+});
