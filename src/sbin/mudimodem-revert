@@ -32,6 +32,16 @@ ARMED="${MUDIMODEM_ARMED:-/etc/mudimodem/armed}"
 LOG="${MUDIMODEM_LOG:-/var/log/mudimodem-revert.log}"
 WINDOW="${MUDIMODEM_WINDOW:-60}"
 DRY="${MUDIMODEM_DRY:-0}"
+HIST_DIR="${MUDIMODEM_HIST:-/tmp/mudimodem}"
+
+# Append a "dog" event to the Tracking telemetry log when we auto-revert, so the
+# timeline shows the watchdog firing even with no browser open (spec §4.1).
+append_event() {  # $1=kind $2=label $3=detail
+  mkdir -p "$HIST_DIR" 2>/dev/null
+  ts=$(( $(date +%s) * 1000 ))
+  printf '{"t":%s,"kind":"%s","label":"%s","detail":"%s"}\n' "$ts" "$1" "$2" "$3" \
+    >> "$HIST_DIR/events.jsonl" 2>/dev/null
+}
 
 # Known-good = the full module-supported SA set (CLAUDE.md §5). Not a curated
 # safe subset — simply everything the module supports.
@@ -80,6 +90,7 @@ case "${1:-}" in
     if [ -f "$PENDING" ]; then
       log "window elapsed, still pending -> reverting"
       restore_from_pending
+      append_event "dog" "Auto-revert fired" "No confirm in ${WINDOW}s — previous bands restored"
     else
       log "confirmed within window; no revert"
     fi

@@ -18,6 +18,12 @@ local M = {}
 local PENDING    = os.getenv("MUDIMODEM_PENDING") or "/etc/mudimodem/pending"
 local ARMED      = os.getenv("MUDIMODEM_ARMED")   or "/etc/mudimodem/armed"
 local REVERT_BIN = os.getenv("MUDIMODEM_BIN")     or "/usr/sbin/mudimodem-revert"
+-- History telemetry lives in tmpfs (volatile), separate from the durable /etc
+-- pending state. samples.jsonl is written by mudimodem-collectd; events.jsonl by
+-- us (user events) + the watchdog (dog events). get_history serves both.
+local HIST_DIR   = os.getenv("MUDIMODEM_HIST") or "/tmp/mudimodem"
+local SAMPLES    = HIST_DIR .. "/samples.jsonl"
+local EVENTS     = HIST_DIR .. "/events.jsonl"
 
 -- An empty Lua table encodes as {} (object); GL's set_feature_config wants []
 -- for empty band lists. cjson.empty_array is the sentinel that encodes as [].
@@ -89,6 +95,18 @@ local function file_exists(p)
   local f = io.open(p, "r")
   if f then f:close(); return true end
   return false
+end
+
+-- Append one user/watchdog event to the shared telemetry log (spec §4.1). Net
+-- (handover/failover) events are NOT written here — the page derives those from
+-- the sample stream. A single O_APPEND JSON line < PIPE_BUF is atomic, so the
+-- multiple appenders (us + the watchdog) don't corrupt each other.
+local function append_event(kind, label, detail)
+  os.execute("mkdir -p " .. HIST_DIR .. " 2>/dev/null")
+  local f = io.open(EVENTS, "a")
+  if not f then return end
+  f:write(cjson.encode({ t = os.time() * 1000, kind = kind, label = label, detail = detail or "" }) .. "\n")
+  f:close()
 end
 
 -- Extract the RPLMN (last quoted field) from a QSPN response:
@@ -276,7 +294,38 @@ function M.set_bands(args)
     applied.mode = mode
   end
 
+  -- Persist a "You applied bands" event for the Tracking timeline.
+  local bits = {}
+  if applied.sa  then bits[#bits + 1] = "SA "  .. applied.sa:gsub(":", " n"):gsub("^", "n") end
+  if applied.nsa then bits[#bits + 1] = "NSA " .. applied.nsa:gsub(":", " n"):gsub("^", "n") end
+  if applied.lte then bits[#bits + 1] = "LTE " .. applied.lte:gsub(":", " B"):gsub("^", "B") end
+  if applied.mode then bits[#bits + 1] = "mode " .. applied.mode end
+  append_event("user", "Bands applied", table.concat(bits, "; "))
+
   return { ok = true, window = 60, applied = applied, sub_id = sub_id }
+end
+
+-- READ: the recorded history (samples + user/dog events) for the Tracking page.
+-- args = { since = <epoch ms> } — return only records newer than `since`, else
+-- all (retained 24h). Files absent (collector not started) => empty arrays.
+function M.get_history(args)
+  local since = args and tonumber(args.since) or nil
+  local function read_lines(path)
+    local out = {}
+    local fh = io.open(path, "r")
+    if not fh then return out end
+    for line in fh:lines() do
+      if #line > 1 then
+        local ok, obj = pcall(cjson.decode, line)   -- cjson.decode can't yield; pcall is safe here
+        if ok and type(obj) == "table" and obj.t then
+          if not since or obj.t > since then out[#out + 1] = obj end
+        end
+      end
+    end
+    fh:close()
+    return out
+  end
+  return { samples = arr(read_lines(SAMPLES)), events = arr(read_lines(EVENTS)), now = os.time() * 1000 }
 end
 
 -- Read one key=value out of the pending file.
@@ -345,6 +394,7 @@ function M.confirm(args)
   end
 
   os.remove(PENDING)
+  append_event("user", "Kept", "Change confirmed" .. (durable and " (durable)" or ""))
   return { ok = true, confirmed = true, durable = durable }
 end
 
@@ -369,6 +419,7 @@ function M.revert_now(args)
   end
   os.remove(PENDING)
   os.remove(ARMED)
+  append_event("user", "Reverted", "Restored previous bands")
   return { ok = true, reverted = true, restored = restored }
 end
 

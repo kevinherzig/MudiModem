@@ -1,0 +1,167 @@
+#!/usr/bin/python3
+# mudimodem-collectd — background modem-history collector for MudiModem.
+#
+# Polls ubus (cellular.modem/network/sim) every POLL_INTERVAL and appends one
+# JSON sample per tick to /tmp/mudimodem/samples.jsonl. It reads GL's
+# cellular_manager CACHE over ubus — NEVER raw AT — so it adds no load on the
+# modem's AT channel and cannot cause the crossed-response contention that has
+# bitten this box (spec §3). Storage is tmpfs (RAM): survives browser reload and
+# nginx reload, lost on reboot (that's the v1 deal).
+#
+# Stdlib only (Python 3.11 on the box); no pip. Managed by procd
+# (/etc/init.d/mudimodem-collectd), respawned on crash.
+#
+# Env overrides (tests): MUDIMODEM_HIST (dir), MUDIMODEM_POLL (seconds).
+
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+POLL_INTERVAL   = float(os.environ.get("MUDIMODEM_POLL", "10"))
+SAMPLE_MAX_AGE  = 24 * 3600 * 1000     # 24 h, in ms
+SAMPLE_MAX_LINE = 10000                 # hard backstop
+TRIM_EVERY      = 30                     # ~5 min at 10 s
+EVENT_TRIM_EVERY = 360                   # ~1 h
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def ubus_call(obj, method):
+    """Return the parsed ubus result dict, or None on any failure."""
+    try:
+        out = subprocess.run(["ubus", "call", obj, method, "{}"],
+                             capture_output=True, timeout=8, text=True)
+        if out.returncode != 0 or not out.stdout:
+            return None
+        return json.loads(out.stdout)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def _num(v):
+    if v is None or v == "":
+        return None
+    try:
+        f = float(v)
+    except (ValueError, TypeError):
+        return None
+    return int(f) if f == int(f) else f
+
+
+def build_sample(modem, net, sims, t=None):
+    """Pure: assemble one sample from the three ubus payloads (or None if the
+    active slot can't be resolved). Anchors on the ACTIVE slot (current_sim_slot)
+    exactly as the UI does; an unregistered active slot yields a sample with null
+    metrics so the trace shows an honest gap."""
+    m = ((modem or {}).get("modems") or [{}])
+    m = m[0] if m else {}
+    bus = m.get("bus")
+    slot = m.get("current_sim_slot")
+    if slot is None:
+        return None
+    cell = {}
+    for n in (net or {}).get("networks") or []:
+        if str(n.get("slot")) == str(slot) and (bus is None or n.get("bus") == bus):
+            cell = n.get("cell_info") or {}
+            break
+    carrier = ""
+    for s in (sims or {}).get("sims") or []:
+        if str(s.get("slot")) == str(slot):
+            carrier = s.get("carrier") or ""
+            break
+    return {
+        "t": now_ms() if t is None else t,
+        "slot": slot,
+        "id": cell.get("id"),
+        "band": cell.get("band"),
+        "mode": cell.get("mode"),
+        "rsrp": _num(cell.get("rsrp")),
+        "sinr": _num(cell.get("sinr")),
+        "rsrq": _num(cell.get("rsrq")),
+        "rssi": _num(cell.get("rssi")),
+        "dl_bandwidth": cell.get("dl_bandwidth"),
+        "tx_channel": cell.get("tx_channel"),
+        "rsrp_level": cell.get("rsrp_level"),
+        "sinr_level": cell.get("sinr_level"),
+        "rsrq_level": cell.get("rsrq_level"),
+        "carrier": carrier,
+    }
+
+
+def collect_sample():
+    modem = ubus_call("cellular.modem", "status")
+    if not modem:
+        return None
+    return build_sample(modem,
+                        ubus_call("cellular.network", "info"),
+                        ubus_call("cellular.sim", "status"))
+
+
+def trim(path, max_age_ms, max_lines, ref_ms=None):
+    """Rewrite path keeping only lines newer than max_age and at most max_lines,
+    atomically. Skips malformed lines. No-op if the file is absent."""
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        return
+    cutoff = (now_ms() if ref_ms is None else ref_ms) - max_age_ms
+    kept = []
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            obj = json.loads(ln)
+        except ValueError:
+            continue
+        if obj.get("t", 0) >= cutoff:
+            kept.append(ln)
+    if len(kept) > max_lines:
+        kept = kept[-max_lines:]
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write("\n".join(kept) + ("\n" if kept else ""))
+    os.replace(tmp, path)
+
+
+def main():
+    hist = os.environ.get("MUDIMODEM_HIST", "/tmp/mudimodem")
+    os.makedirs(hist, exist_ok=True)
+    samples_path = os.path.join(hist, "samples.jsonl")
+    events_path = os.path.join(hist, "events.jsonl")
+
+    state = {"go": True}
+    def stop(*_a):
+        state["go"] = False
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    i = 0
+    while state["go"]:
+        try:
+            s = collect_sample()
+            if s is not None:
+                with open(samples_path, "a") as f:
+                    f.write(json.dumps(s) + "\n")
+            i += 1
+            if i % TRIM_EVERY == 0:
+                trim(samples_path, SAMPLE_MAX_AGE, SAMPLE_MAX_LINE)
+            if i % EVENT_TRIM_EVERY == 0:
+                trim(events_path, SAMPLE_MAX_AGE, 1000)
+        except Exception as e:                       # never die out of the loop
+            sys.stderr.write("collectd: %s\n" % e)
+            sys.stderr.flush()
+        # interruptible sleep so SIGTERM stops us within ~0.1 s (procd-friendly)
+        end = time.time() + POLL_INTERVAL
+        while state["go"] and time.time() < end:
+            time.sleep(0.1)
+
+
+if __name__ == "__main__":
+    main()

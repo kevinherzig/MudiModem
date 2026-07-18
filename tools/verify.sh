@@ -57,11 +57,10 @@ TBODY=$(ssh -o BatchMode=yes "root@$HOST" \
   'curl -sk -H "Accept-Encoding: gzip" "https://127.0.0.1/views/gl-sdk4-ui-mudimodem-tracking.common.js?_t=1" | gzip -dc')
 printf '%s' "$TBODY" | node -e '
   let s=""; process.stdin.on("data",d=>s+=d).on("end",()=>{
-    global.window={__mmHist:null};
     const module={exports:{}}; const c=eval(s);
     if(!c||c.name!=="mudimodem-tracking"){console.error("FAIL: tracking eval");process.exit(1);}
     if(typeof c.render!=="function"||c.template!==undefined){console.error("FAIL: not render-only");process.exit(1);}
-    if(typeof c.makeMMHist!=="function"){console.error("FAIL: recorder missing");process.exit(1);}
+    if(!/"get_history"/.test(s)){console.error("FAIL: does not read history over RPC");process.exit(1);}
     console.log("   tracking eval + render-only OK ->", c.name);
   })' || fail "tracking chunk eval failed"
 
@@ -82,11 +81,28 @@ if [ -f src/sbin/mudimodem-revert ]; then
   ssh -o BatchMode=yes "root@$HOST" 'test -x /usr/sbin/mudimodem-revert' \
     || fail "watchdog not installed (run ./tools/deploy.sh)"
   ssh -o BatchMode=yes "root@$HOST" 'cat > /tmp/mm-revert.test.sh'  < test/revert.test.sh
-  ssh -o BatchMode=yes "root@$HOST" 'sh /tmp/mm-revert.test.sh /usr/sbin/mudimodem-revert >/dev/null; rc=$?; rm -f /tmp/mm-revert.test.sh; exit $rc' \
+  ssh -o BatchMode=yes "root@$HOST" 'MUDIMODEM_HIST=/tmp/mmv-hist sh /tmp/mm-revert.test.sh /usr/sbin/mudimodem-revert >/dev/null; rc=$?; rm -rf /tmp/mm-revert.test.sh /tmp/mmv-hist; exit $rc' \
     || fail "watchdog isolation tests failed"
   ssh -o BatchMode=yes "root@$HOST" 'cat > /tmp/mm-w.test.lua' < test/backend-write.test.lua
-  ssh -o BatchMode=yes "root@$HOST" 'MUDIMODEM_PENDING=/tmp/mmv-pending MUDIMODEM_ARMED=/tmp/mmv-armed MUDIMODEM_BIN=/usr/sbin/mudimodem-revert lua /tmp/mm-w.test.lua >/dev/null; rc=$?; rm -f /tmp/mm-w.test.lua /tmp/mmv-pending /tmp/mmv-armed; exit $rc' \
+  ssh -o BatchMode=yes "root@$HOST" 'MUDIMODEM_PENDING=/tmp/mmv-pending MUDIMODEM_ARMED=/tmp/mmv-armed MUDIMODEM_BIN=/usr/sbin/mudimodem-revert MUDIMODEM_HIST=/tmp/mmv-hist lua /tmp/mm-w.test.lua >/dev/null; rc=$?; rm -rf /tmp/mm-w.test.lua /tmp/mmv-pending /tmp/mmv-armed /tmp/mmv-hist; exit $rc' \
     || fail "set_bands interlock test failed"
+fi
+
+# 7. History collector: service running + get_history parses telemetry.
+if [ -f src/sbin/mudimodem-collectd ]; then
+  echo "7. history collector running + get_history"
+  ssh -o BatchMode=yes "root@$HOST" 'test -x /usr/sbin/mudimodem-collectd' \
+    || fail "collector not installed (run ./tools/deploy.sh)"
+  ssh -o BatchMode=yes "root@$HOST" 'pgrep -f mudimodem-collectd >/dev/null' \
+    || fail "collector process not running (/etc/init.d/mudimodem-collectd start)"
+  # It should be writing samples within a couple of poll intervals.
+  ssh -o BatchMode=yes "root@$HOST" 'for i in 1 2 3 4 5 6; do [ -s /tmp/mudimodem/samples.jsonl ] && exit 0; sleep 5; done; exit 1' \
+    || fail "no samples.jsonl written after ~30s"
+  echo "   collector is sampling ($(ssh -o BatchMode=yes "root@$HOST" 'wc -l < /tmp/mudimodem/samples.jsonl' | tr -d " ") lines)"
+  # get_history parses the jsonl (fixtures under a temp HIST dir; ngx-stubbed).
+  ssh -o BatchMode=yes "root@$HOST" 'cat > /tmp/mm-hist.test.lua' < test/backend-history.test.lua
+  ssh -o BatchMode=yes "root@$HOST" 'MUDIMODEM_HIST=/tmp/mmhist-test lua /tmp/mm-hist.test.lua; rc=$?; rm -f /tmp/mm-hist.test.lua; exit $rc' \
+    || fail "get_history test failed on-device"
 fi
 
 echo "ALL CHECKS PASSED"
