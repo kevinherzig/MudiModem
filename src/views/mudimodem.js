@@ -45,6 +45,7 @@ module.exports = {
       lockError: "",
       lockBusy: false,      // a lock/unlock RPC in flight
       lockConfirm: null,    // target awaiting inline confirm ({...target,label})
+      scanConfirm: false,   // explicit confirm gate before firing the disruptive scan
       // Scanned neighbour towers (Task 5 fills the scan card); pinTarget reads
       // scan.towers now to confirm an SCS reading when one is available.
       scan: { towers: [], running: false, error: "", ts: 0 },
@@ -302,6 +303,34 @@ module.exports = {
         .then(function () { self.lockBusy = false; });
     },
 
+    // Disruptive network scan (GL's scan_cells): takes the modem offline for
+    // up to ~10 minutes. Only ever fired after an explicit scanConfirm. Stores
+    // towers UNSORTED — renderScanCard sorts a slice at paint time so the raw
+    // fetch order is never mutated under us.
+    scanCells() {
+      var self = this;
+      if (this.scan.running) return;
+      this.scanConfirm = false;
+      this.scan.running = true; this.scan.error = "";
+      window.$rpcRequest("call", ["sid", "mudimodem", "scan_cells", {}], { timeout: 600000 })
+        .then(function (res) {
+          if (!res || res.error) { self.scan.error = (res && res.error) || "scan failed"; return; }
+          self.scan.towers = res.towers || [];   // renderScanCard sorts at paint time
+          self.scan.ts = res.ts || Date.now();
+        })
+        .catch(function (e) { self.scan.error = (e && (e.type || e.message)) || "scan failed"; })
+        .then(function () { self.scan.running = false; self.fetchLock(); });
+    },
+    // Lock target from a scan row: GL's own values verbatim, whole row as extra.
+    scanTarget(row) {
+      var isNR = /5G/.test(row.network_type || "");
+      var t = { rat: isNR ? "5g" : "4g", pci: Number(row.pci), freq: Number(row.freq),
+                band: row.band !== undefined ? Number(row.band) : undefined,
+                label: "scanned cell PCI " + row.pci, extra: row };
+      if (isNR) { t.scs = Number(row.scs); t.scsAssumed = false; }
+      return t;
+    },
+
     // The interactive RATs (each maps to a set_bands arg).
     interactive(group) { return group === "sa" || group === "nsa" || group === "LTE"; },
     argKey(group) { return group === "LTE" ? "lte" : group; },   // set_bands arg name
@@ -515,6 +544,10 @@ module.exports = {
         '.mm-revert-row{display:flex;justify-content:space-between;align-items:center;gap:12px;font-size:11.5px;color:var(--warning-hover)}' +
         '.mm-revert b{font-weight:600}.mm-cd{font-variant-numeric:tabular-nums}' +
         '.mm-bar{height:2px;background:var(--warning-disabled);border-radius:1px;margin-top:8px;overflow:hidden}.mm-bar i{display:block;height:100%;background:var(--warning);transition:width 1s linear}' +
+        // nearby-cells scan card
+        '.mm-scan-row{display:flex;gap:10px;align-items:center;padding:7px 4px;border-bottom:1px solid var(--divider);font-size:12px}' +
+        '.mm-scan-row>span{min-width:0}.mm-scan-row>span:nth-child(2){flex:1}' +
+        '.mm-scan-badge{flex:none;font-size:10px;padding:1px 6px;border:1px solid var(--border);border-radius:3px;color:var(--text-badge)}' +
         '@media(max-width:640px){.mm-strip{flex-direction:column}.mm-read{border-left:0;border-top:1px solid var(--divider);text-align:left;align-items:flex-start}.mm-facts{justify-content:flex-start}.mm-revert-row{flex-direction:column;align-items:flex-start}}';
       var el = document.createElement("style");
       el.id = this.styleId; el.textContent = css;
@@ -804,6 +837,80 @@ module.exports = {
       ]);
     },
 
+    // Nearby-cells scan card. GL's scan_cells is DISRUPTIVE (modem offline up
+    // to ~10 minutes), so it never fires without an explicit confirm step, and
+    // the empty state is honest that 5G SA exposes no neighbour list at all.
+    renderScanCard(h) {
+      var self = this;
+      var locked = this.lockData && ((this.lockData.lock.l5g || {}).locked ||
+                                     (this.lockData.lock.l4g || {}).locked);
+      var head = h("div", { staticClass: "mm-grp-h" }, [
+        h("span", { staticClass: "mm-grp-t" }, "Nearby cells"),
+        this.scan.ts
+          ? h("span", { staticClass: "mm-hint" },
+              "scanned " + Math.max(1, Math.round((Date.now() - this.scan.ts) / 60000)) + " min ago")
+          : h("span", { staticClass: "mm-hint" }, "requires a scan")
+      ]);
+      var body;
+      if (this.scan.running) {
+        body = h("div", { staticClass: "mm-empty" },
+          "Scanning... the modem is offline until this finishes (up to ~10 minutes). Watch the strip.");
+      } else if (this.scan.towers.length) {
+        var sorted = this.scan.towers.slice().sort(function (a, b) {
+          return (b.strength || 0) - (a.strength || 0);
+        });
+        var rows = sorted.map(function (tw, i) {
+          var q = tw.rsrp !== undefined ? (tw.rsrp >= -95 ? "good" : (tw.rsrp >= -105 ? "fair" : "poor")) : "none";
+          var confirming = self.lockConfirm && self.lockConfirm.scanIdx === i;
+          var target = self.scanTarget(tw);
+          return h("div", { key: i, staticClass: "mm-scan-row" }, [
+            h("span", { staticClass: "mm-scan-badge" }, tw.network_type || "?"),
+            h("span", (tw.carrier || ((tw.mcc || "") + "-" + (tw.mnc || ""))) + "  " + (tw.cellid || "")),
+            h("span", (/5G/.test(tw.network_type || "") ? "n" : "B") + (tw.band !== undefined ? tw.band : "?") +
+              "  ARFCN " + tw.freq + "  PCI " + tw.pci),
+            h("span", { style: { color: self.qColor(q) } },
+              tw.rsrp !== undefined ? tw.rsrp + " dBm" : ""),
+            confirming
+              ? h("span", { staticStyle: { display: "flex", gap: "6px" } }, [
+                  h("button", { staticClass: "mm-btn", on: { click: function () { self.lockConfirm = null; } } }, "Cancel"),
+                  h("button", { staticClass: "mm-btn primary", attrs: { disabled: self.lockBusy },
+                    on: { click: function () { self.lockCell(target); } } },
+                    self.lockBusy ? "Locking..." : "Confirm")
+                ])
+              : h("button", { staticClass: "mm-btn",
+                  attrs: { disabled: !!self.pending || self.lockBusy || locked ||
+                           (/5G/.test(tw.network_type || "") && tw.scs === undefined) },
+                  on: { click: function () { self.lockConfirm = { scanIdx: i }; } } }, "Lock")
+          ]);
+        });
+        body = h("div", rows);
+      } else {
+        body = h("div", { staticClass: "mm-empty" }, this.scan.error
+          ? "Scan failed: " + this.scan.error
+          : "5G SA exposes no neighbour list - only the serving cell is visible without a scan, " +
+            "and a scan takes the modem offline for up to ~10 minutes.");
+      }
+      var foot;
+      if (!this.scan.running) {
+        foot = this.scanConfirm
+          ? h("div", { staticClass: "mm-foot" }, [
+              h("span", { staticClass: "mm-hint", staticStyle: { color: "var(--warning)" } },
+                "Scanning takes the modem OFFLINE for up to ~10 minutes. This connection will drop if it runs over cellular."),
+              h("span", { staticStyle: { flex: "none", display: "flex", gap: "6px" } }, [
+                h("button", { staticClass: "mm-btn", on: { click: function () { self.scanConfirm = false; } } }, "Cancel"),
+                h("button", { staticClass: "mm-btn danger", on: { click: function () { self.scanCells(); } } }, "Scan now")
+              ])
+            ])
+          : h("div", { staticClass: "mm-foot" }, [
+              h("span", { staticClass: "mm-hint" }, "Find every cell in range, with lockable details."),
+              h("button", { staticClass: "mm-btn",
+                attrs: { disabled: !!this.pending || this.lockBusy },
+                on: { click: function () { self.scanConfirm = true; } } }, "Scan for cells")
+            ]);
+      }
+      return h("div", { staticClass: "mm-grp" }, [head, body, foot].filter(Boolean));
+    },
+
     renderLock(h) {
       if (this.lockLoading && !this.lockData)
         return h("div", { staticClass: "mm-card" }, [h("div", { staticClass: "mm-empty" }, "Reading lock state from the modem...")]);
@@ -823,8 +930,8 @@ module.exports = {
         (this.pending && this.pending.kind === "cell") ? this.renderRevert(h) : null,
         this.lockError && this.lockData
           ? h("div", { staticClass: "mm-hint", staticStyle: { color: "var(--error)" } }, this.lockError) : null,
-        this.renderCurrentCell(h)
-        // Task 5 appends: this.renderScanCard(h)
+        this.renderCurrentCell(h),
+        this.renderScanCard(h)
         // Task 6 appends: stale banner + this.renderRecovery(h)
       ];
       return h("div", { staticClass: "mm-card" }, kids.filter(Boolean));

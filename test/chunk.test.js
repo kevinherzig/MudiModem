@@ -464,3 +464,45 @@ test('bands tab: cell pending does NOT paint the bands banner', () => {
   const text = textOf(component.render.call(vm, h));
   assert.doesNotMatch(text, /42s/);
 });
+
+// ---- Nearby-cells scan card ----
+
+test('lock tab: scan card empty state is honest about SA + disruption', () => {
+  const component = loadChunk();
+  const vm = makeVm(component, LIVE);
+  vm.tab = 'lock';
+  vm.lockData = JSON.parse(JSON.stringify(LOCKDATA_UNLOCKED));
+  const text = textOf(component.render.call(vm, h));
+  assert.match(text, /no neighbour list/i);
+  assert.match(text, /offline/i);
+  assert.match(text, /Scan for cells/);
+});
+
+test('lock tab: scan results render rows sorted by strength with Lock buttons', () => {
+  const component = loadChunk();
+  const vm = makeVm(component, LIVE);
+  vm.tab = 'lock';
+  vm.lockData = JSON.parse(JSON.stringify(LOCKDATA_UNLOCKED));
+  vm.scan = { running: false, error: '', ts: 1, towers: [
+    { network_type: 'NR5G', pci: 99, freq: 520000, band: 41, scs: 30, cellid: 'A', strength: 2, rsrp: -101 },
+    { network_type: 'NR5G', pci: 516, freq: 127490, band: 71, scs: 15, cellid: 'B', strength: 4, rsrp: -98 }
+  ] };
+  const tree = component.render.call(vm, h);
+  const text = textOf(tree);
+  // strongest first
+  assert.ok(text.indexOf('516') < text.indexOf('99'), 'rows must sort by strength desc');
+  const lockBtns = walk(tree).filter((n) => n.tag === 'button' && textOf(n) === 'Lock');
+  assert.equal(lockBtns.length, 2);
+});
+
+test('lock tab: scan target uses the row scs verbatim', () => {
+  const component = loadChunk();
+  const vm = makeVm(component, LIVE);
+  vm.lockData = JSON.parse(JSON.stringify(LOCKDATA_UNLOCKED));
+  const row = { network_type: 'NR5G', pci: 99, freq: 520000, band: 41, scs: 30, cellid: 'A' };
+  const t = vm.scanTarget(row);
+  assert.equal(t.rat, '5g');
+  assert.equal(t.scs, 30);
+  assert.equal(t.scsAssumed, false);
+  assert.deepEqual(t.extra, row);
+});
