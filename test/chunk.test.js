@@ -619,8 +619,8 @@ test('dial form renders APN chips from apn_list and an Apply button', () => {
   const chips = nodes.filter((n) => /mm-apnchip/.test(n.data.staticClass || ''));
   assert.ok(chips.length >= 3);                       // deduped apn_list for slot 1
   assert.ok(chips.some((c) => textOf(c) === 'fast.t-mobile.com'));
-  const applies = nodes.filter((n) => /mm-apply/.test(n.data.staticClass || ''));
-  assert.equal(applies.length, 1);                    // only the loaded slot has a form
+  const applies = nodes.filter((n) => /mm-apply/.test(n.data.staticClass || '') && textOf(n) === 'Apply');
+  assert.equal(applies.length, 1);                    // only the loaded slot has a form Apply
 });
 
 test('auth != NONE reveals username/password inputs', () => {
@@ -632,4 +632,52 @@ test('auth != NONE reveals username/password inputs', () => {
   const inputs = nodes.filter((n) => n.tag === 'input' &&
     ((n.data.attrs || {}).placeholder === 'Username' || (n.data.attrs || {}).placeholder === 'Password'));
   assert.equal(inputs.length, 2);
+});
+
+test('doSwitch: RMW on failover config, sets current_sim, reorders priority when auto-switch on', async () => {
+  const FCFG = { enable_switch: true, esim2_enable: false, current_sim: 1,
+    slot_priority: [1, 2], enable_timing: false, hour: '00', min: '00',
+    slot_type: [{ slot: 1, type: 0 }, { slot: 2, type: 0 }] };
+  const calls = stubRpc([FCFG, {}]);
+  try {
+    const vm = makeVm(loadChunk(), SPLIT);
+    vm.doSwitch(2);
+    await new Promise((r) => setImmediate(r));
+    assert.equal(calls[0].params[2], 'get_slot_failover_config');
+    assert.equal(calls[1].params[2], 'set_slot_failover_config');
+    const p = calls[1].params[3];
+    assert.equal(p.bus, 'cpu');
+    assert.equal(p.current_sim, 2);
+    assert.deepEqual(p.slot_priority, [2, 1]);          // manual pick becomes the preference
+    assert.equal(p.esim2_enable, false);                // passthrough intact
+    assert.deepEqual(p.slot_type, FCFG.slot_type);
+    assert.equal(vm.switchTarget, 2);
+  } finally { unstubRpc(); }
+});
+
+test('doSwitch: timeout is EXPECTED (link drops), not an error', async () => {
+  const FCFG = { enable_switch: false, current_sim: 1, slot_priority: [1, 2] };
+  const calls = stubRpc([FCFG, Object.assign(new Error('t'), { type: 'timeout' })]);
+  let vm;
+  try {
+    vm = makeVm(loadChunk(), SPLIT);
+    vm.doSwitch(2);
+    await new Promise((r) => setImmediate(r));
+    assert.equal(vm.switchErr, '');                     // no error shown
+    assert.equal(vm.switchTarget, 2);                   // still waiting on the websocket
+  } finally { vm.clearSwitchState(); unstubRpc(); }      // kill the 90s fallback timer
+});
+
+test('switch confirm: button on non-selected card only, confirm box states the cost', () => {
+  const comp = loadChunk();
+  const vm = makeVm(comp, SPLIT);
+  vm.tab = 'sim';
+  let nodes = walk(comp.render.call(vm, h));
+  const useBtns = nodes.filter((n) => textOf(n) === 'Use this SIM' && n.tag === 'button');
+  assert.equal(useBtns.length, 1);                      // only on slot 2 (non-selected)
+  vm.switchConfirm = 2;
+  nodes = walk(comp.render.call(vm, h));
+  const box = nodes.filter((n) => /mm-switchbox/.test(n.data.staticClass || ''));
+  assert.equal(box.length, 1);
+  assert.ok(textOf(box[0]).includes('drops connectivity'));
 });

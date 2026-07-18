@@ -219,11 +219,18 @@ module.exports = {
     tab(t) {
       if (t === "bands" && !this.bands && !this.bandsLoading) this.fetchBands();
       if (t === "sim") this.loadSimTab();
+    },
+    // A slot switch is done when GL's selected slot lands on the target.
+    activeSlot(v) {
+      if (this.switchTarget && String(v) === String(this.switchTarget)) {
+        this.clearSwitchState();
+        this.loadSimTab();   // fresh configs for the new arrangement
+      }
     }
   },
 
   created() { this.injectStyle(); },
-  beforeDestroy() { this.clearCountdown(); },
+  beforeDestroy() { this.clearCountdown(); this.clearSwitchState(); },
 
   methods: {
     qFromLevel(lvl) {
@@ -370,6 +377,47 @@ module.exports = {
         .catch(function (e) {
           self.failoverErr = (e && (e.type || e.message)) || "request failed";
         });
+    },
+    askSwitch(slot) { this.switchConfirm = slot; this.switchErr = ""; },
+    clearSwitchState() {
+      this.switchTarget = 0;
+      if (this.switchTimer) { clearTimeout(this.switchTimer); this.switchTimer = null; }
+    },
+    // GL's own UI switches slots by applying the failover config with
+    // current_sim set — QUIMSLOT does not exist on this modem (GL-layer only).
+    doSwitch(slot) {
+      var self = this;
+      if (this.switchTarget || typeof window === "undefined" || !window.$rpcRequest) return;
+      this.switchConfirm = 0;
+      this.switchErr = "";
+      this.switchTarget = slot;
+      window.$rpcRequest("call", ["sid", "modem", "get_slot_failover_config",
+        { bus: this.modem.bus }], { timeout: 30000 })
+        .then(function (cfg) {
+          var payload = {};
+          for (var k in cfg) payload[k] = cfg[k];        // esim2_enable, slot_type… intact
+          payload.bus = self.modem.bus;
+          payload.current_sim = slot;
+          // GL's invariant: with auto-switch on, current_sim == slot_priority[0].
+          if (payload.enable_switch) payload.slot_priority = [slot, slot === 1 ? 2 : 1];
+          return window.$rpcRequest("call", ["sid", "modem", "set_slot_failover_config",
+            payload], { timeout: 30000 });
+        })
+        .then(function () { self.armSwitchFallback(); })
+        .catch(function (e) {
+          // The data link drops mid-switch; a timeout here means "in progress",
+          // not "failed" — keep waiting for the websocket to confirm.
+          if (e && e.type === "timeout") { self.armSwitchFallback(); return; }
+          self.clearSwitchState();
+          self.switchErr = (e && (e.type || e.message)) || "request failed";
+        });
+    },
+    armSwitchFallback() {
+      var self = this;
+      if (this.switchTimer) clearTimeout(this.switchTimer);
+      // If the websocket never confirms (switch failed silently), stop showing
+      // "Switching…" after 90 s and let the cards tell the truth again.
+      this.switchTimer = setTimeout(function () { self.clearSwitchState(); }, 90000);
     },
     AUTHS() { return ["NONE", "PAP", "CHAP", "PAP/CHAP"]; },
     simDirty(slot) {
@@ -520,6 +568,30 @@ module.exports = {
               "Apply failed: " + self.simApplyErr[slot]));
           }
           kids.push(h("div", { staticClass: "mm-form" }, form));
+        }
+
+        if (!card.selected) {
+          if (self.switchConfirm === slot) {
+            kids.push(h("div", { staticClass: "mm-switchbox" }, [
+              h("div", "Switching drops connectivity for ~30 seconds while slot " + slot +
+                " connects. This admin session will stall until it does."),
+              h("div", { staticStyle: { display: "flex", gap: "9px", marginTop: "7px" } }, [
+                h("button", { staticClass: "mm-apply", on: { click: function () { self.doSwitch(slot); } } }, "Switch"),
+                h("button", { staticClass: "mm-reveal", on: { click: function () { self.switchConfirm = 0; } } }, "Cancel")
+              ])
+            ]));
+          } else {
+            kids.push(h("button", {
+              staticClass: "mm-apply",
+              staticStyle: { marginTop: "9px" },
+              attrs: { disabled: !!self.switchTarget },
+              on: { click: function () { self.askSwitch(slot); } }
+            }, self.switchTarget === slot ? "Switching…" : "Use this SIM"));
+          }
+        }
+        if (self.switchErr && !card.selected) {
+          kids.push(h("div", { staticClass: "mm-hint", staticStyle: { color: "var(--error)" } },
+            "Switch failed: " + self.switchErr));
         }
       }
       if (this.simCfgErr[slot]) {
@@ -723,6 +795,7 @@ module.exports = {
         '.mm-apnchip.on{border-color:var(--primary);color:var(--primary)}' +
         '.mm-apply{margin-top:7px;padding:5px 14px;border-radius:6px;border:none;background:var(--primary);color:#fff;font-size:12.5px;cursor:pointer}' +
         '.mm-apply:disabled{opacity:.45;cursor:default}' +
+        '.mm-switchbox{margin-top:9px;padding:9px;border:1px solid var(--warning);border-radius:8px;font-size:12.5px;color:var(--text-secondary)}' +
         // band grid
         '.mm-grp{margin-bottom:15px}.mm-grp:last-child{margin-bottom:2px}' +
         '.mm-grp-h{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:7px}' +
