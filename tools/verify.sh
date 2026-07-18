@@ -2,6 +2,8 @@
 # tools/verify.sh - assert Phase 0 landed correctly on the device.
 set -eu
 HOST="${MUDI_HOST:-mudi}"
+# MM_PW: admin password, required only for step 9b's /rpc round-trip login.
+# Unset => 9b is skipped (every other check still runs).
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
 echo "1. files present"
@@ -149,10 +151,10 @@ ssh -o BatchMode=yes "root@$HOST" 'cat > /tmp/mmtest/t.lua' < test/backend-conso
 ssh -o BatchMode=yes "root@$HOST" 'MUDIMODEM_AT_TOOL=/tmp/mmtest/fake-at.py lua /tmp/mmtest/t.lua >/dev/null; rc=$?; rm -rf /tmp/mmtest; exit $rc' \
   || fail "at_console backend test failed on-device"
 
-echo "8d. LIVE: one read-only AT through the real tool (envelope + gl_modem sleep)"
+echo "8d. LIVE: one read-only AT through the real tool (per-step envelope + gl_modem sleep)"
 ssh -o BatchMode=yes "root@$HOST" \
-  'python3 /usr/lib/mudimodem/mudimodem-at.py --envelope --timeout 6 "AT" | head -1 | grep -q "^MM-AT:ok"' \
-  || fail "live AT through /dev/at_mdm0 did not return MM-AT:ok"
+  'python3 /usr/lib/mudimodem/mudimodem-at.py --envelope --timeout 6 "AT" | head -1 | grep -qE "^MM-AT:ok:[0-9]+:1/1$"' \
+  || fail "live AT through /dev/at_mdm0 did not return a per-step MM-AT:ok frame"
 
 echo "8e. gl_modem alive and NOT left stopped (the one failure that must never survive)"
 ssh -o BatchMode=yes "root@$HOST" \
@@ -169,5 +171,28 @@ ssh -o BatchMode=yes "root@$HOST" 'test -s /usr/share/gl-validator.d/mudimodem.l
 ssh -o BatchMode=yes "root@$HOST" 'cat > /tmp/mm-validator.test.lua' < test/backend-validator.test.lua
 ssh -o BatchMode=yes "root@$HOST" 'lua /tmp/mm-validator.test.lua; rc=$?; rm -f /tmp/mm-validator.test.lua; exit $rc' \
   || fail "arg validator does not admit AT syntax (console would -32602)"
+
+# 9b. LIVE /rpc round-trip: a TWO-LINE cmd must pass the oui validator AND run
+#     both steps. This is the layer the on-device dofile tests (8c) bypass — a
+#     newline-bearing cmd could -32602 at /rpc even though the backend is fine.
+#     Needs an authenticated sid, so it runs only when MM_PW is provided.
+if [ -n "${MM_PW:-}" ]; then
+  echo "9b. multi-line cmd survives /rpc and runs both steps"
+  SID=$(ssh -o BatchMode=yes "root@$HOST" \
+    'curl -sk -X POST https://127.0.0.1/rpc -H "Content-Type: application/json" \
+       -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"login\",\"params\":{\"username\":\"root\",\"password\":\"'"$MM_PW"'\"}}" \
+     | sed -n "s/.*\"sid\":\"\([^\"]*\)\".*/\1/p"')
+  [ -n "$SID" ] || fail "login for /rpc round-trip failed (is MM_PW correct?)"
+  RESP=$(ssh -o BatchMode=yes "root@$HOST" \
+    'curl -sk -X POST https://127.0.0.1/rpc -H "Content-Type: application/json" \
+       -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"call\",\"params\":[\"'"$SID"'\",\"mudimodem\",\"at_console\",{\"cmd\":\"AT\nATI\",\"timeout\":6}]}"')
+  printf '%s' "$RESP" | grep -q -- '-32602' \
+    && fail "multi-line cmd was rejected by the arg validator (-32602): $RESP"
+  printf '%s' "$RESP" | grep -q '"ran":2' \
+    || fail "multi-line /rpc did not run 2 steps (got: $RESP)"
+  echo "   /rpc ran both steps of a multi-line cmd"
+else
+  echo "9b. SKIPPED — set MM_PW=<admin-password> to run the /rpc round-trip"
+fi
 
 echo "ALL CHECKS PASSED"
