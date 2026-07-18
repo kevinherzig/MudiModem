@@ -222,6 +222,9 @@ def main(argv):
             lock_wait = float(argv[i])
         elif a == "--no-glsleep":
             glsleep = False
+        elif a == "--":
+            cmds.extend(argv[i + 1:])
+            break
         else:
             cmds.append(a)
         i += 1
@@ -256,8 +259,10 @@ def main(argv):
                 count = len(cmds)
                 if envelope:
                     for idx, cmd in enumerate(cmds, 1):
+                        s0 = time.time()
                         resp, kind = ch.send(cmd, timeout)
-                        print("MM-AT:%s:%d:%d/%d" % (kind, ms(), idx, count))
+                        step_ms = int((time.time() - s0) * 1000)
+                        print("MM-AT:%s:%d:%d/%d" % (kind, step_ms, idx, count))
                         sys.stdout.write(resp)
                         if not resp.endswith("\n"):
                             sys.stdout.write("\n")

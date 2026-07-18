@@ -34,6 +34,10 @@ assert(r.steps[1].cmd == 'AT+QNWPREFCFG="nr5g_band"', "step cmd echoed back")
 assert(r.steps[1].response:find("--timeout 60", 1, true), "timeout clamps to 60")
 assert(r.steps[1].response:find('AT+QNWPREFCFG="nr5g_band"', 1, true), "inner quotes intact")
 
+-- The backend must pass an end-of-options `--` before the steps so a step that
+-- spells a tool flag is never parsed as one.
+assert(r.steps[1].response:find(" -- ", 1, true), "backend must emit a -- sentinel before steps")
+
 -- Timeout clamps low and defaults to 8.
 local r2 = M.at_console({ cmd = "AT", timeout = 0 })
 assert(r2.ok and r2.steps[1].response:find("--timeout 1", 1, true), "timeout clamps up to 1")
@@ -65,5 +69,15 @@ local rg = M.at_console({ cmd = "AT__GARBAGE__" })
 assert(rg.error and rg.error:find("no envelope", 1, true), "no-envelope errors")
 local rw = M.at_console({ cmd = "AT__WEIRD__" })
 assert(rw.error and rw.error:find("unexpected status", 1, true), "unknown status errors")
+
+-- Accept side of the caps: exactly 8 steps and a 256-char step are allowed.
+local eight = {}
+for i = 1, 8 do eight[i] = "AT+C" .. i end
+local r8 = M.at_console({ cmd = table.concat(eight, "\n") })
+assert(r8.ok and r8.requested == 8 and r8.ran == 8, "exactly 8 steps must be accepted")
+local at256 = "AT+" .. string.rep("X", 253)   -- 256 chars total
+assert(#at256 == 256, "fixture must be exactly 256 chars")
+local r256 = M.at_console({ cmd = at256 })
+assert(r256.ok, "a 256-char step must be accepted")
 
 print("at_console backend OK")

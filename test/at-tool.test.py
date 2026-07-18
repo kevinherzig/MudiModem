@@ -140,6 +140,21 @@ class ATToolTest(unittest.TestCase):
         self.assertRegex(heads[0], r"^MM-AT:error:\d+:1/2$")
         self.assertEqual(len(heads), 1, "no frame after an errored step")
 
+    def test_cli_end_of_options_sentinel(self):
+        # After `--`, a flag-looking token is a COMMAND, not a flag. Without the
+        # sentinel the old parser reads `--timeout` as the timeout flag and
+        # consumes the (missing) next arg -> crash; with it both tokens run.
+        fm = FakeModem(b"\r\nOK\r\n"); fm.loop = True
+        r = subprocess.run(
+            [sys.executable, TOOL, "--envelope", "--timeout", "3",
+             "--port", fm.path, "--lock", self.lock, "--no-glsleep",
+             "--", "AT+ONE", "--timeout"],
+            capture_output=True, text=True, timeout=15)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        heads = [l for l in r.stdout.splitlines() if l.startswith("MM-AT:")]
+        self.assertEqual(len(heads), 2, "both post-sentinel tokens run as commands")
+        self.assertRegex(heads[1], r"^MM-AT:ok:\d+:2/2$")
+
     def test_cli_envelope_busy(self):
         fm = FakeModem()
         holder = mm.ATChannel(port=fm.path, lock=self.lock)

@@ -779,7 +779,7 @@ function M.at_console(args)
 
   -- POSIX single-quote escaping: ' -> '\''. Build one invocation, all steps.
   local function q(s) return "'" .. s:gsub("'", "'\\''") .. "'" end
-  local parts = { "python3", q(AT_TOOL), "--envelope", "--timeout", tostring(timeout) }
+  local parts = { "python3", q(AT_TOOL), "--envelope", "--timeout", tostring(timeout), q("--") }
   for _, s in ipairs(steps) do parts[#parts + 1] = q(s) end
   local f = io.popen(table.concat(parts, " ") .. " 2>/dev/null")
   if not f then return { error = "failed to spawn the AT tool" } end

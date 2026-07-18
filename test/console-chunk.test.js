@@ -60,7 +60,10 @@ const LIB = [
   { id: 'demo.set-commit', cat: 'Bands', title: 'Set + commit', risk: 'nv',
     vendor: 'any', verified: [], summary: 'sum', warn: 'warn', source: 'src', by: 'kevin',
     steps: ['AT+QNWPREFCFG="nr5g_band",{{bands}}', 'AT+QNWPREFCFG="nr5g_band"'],
-    params: [{ name: 'bands', hint: 'colon-separated', example: '41:71' }] }
+    params: [{ name: 'bands', hint: 'colon-separated', example: '41:71' }] },
+  { id: 'demo.steps-plain', cat: 'Bands', title: 'Two reads', risk: 'read',
+    vendor: 'any', verified: [], summary: 'sum', source: 'src', by: 'kevin',
+    steps: ['AT+ONE', 'AT+TWO'] }
 ];
 
 // Genuinely captured on the box 2026-07-17 (NR5G-SA, includes <tac>).
@@ -324,6 +327,17 @@ test('onPromptInput: hand-editing away from the picked entry drops selId to free
   assert.strictEqual(vm.selId, LIB[0].id, 'selection kept while text matches the entry cmd');
   vm.onPromptInput('AT+SOMETHINGELSE');   // hand-edited away
   assert.strictEqual(vm.selId, null, 'edited away from the entry cmd -> free-typed');
+});
+
+test('onPromptInput clears selId when editing away from a no-param steps entry', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, {});
+  vm.lib = LIB;
+  vm.pick(LIB.find((e) => e.id === 'demo.steps-plain'));
+  assert.strictEqual(vm.selId, 'demo.steps-plain');
+  assert.strictEqual(vm.prompt, 'AT+ONE\nAT+TWO', 'pick fills prompt with joined steps');
+  vm.onPromptInput('AT+ONE\nAT+CHANGED');           // diverge from steps.join("\n")
+  assert.strictEqual(vm.selId, null, 'editing away from the steps text de-selects');
 });
 
 test('the chunk speaks only at_console — never GL AT paths', () => {

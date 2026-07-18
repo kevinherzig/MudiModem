@@ -53,6 +53,14 @@ class SchemaTest(unittest.TestCase):
         e = base(steps=["AT+FOO"], decode={"prefix": "+FOO", "fields": ["x"]})
         self.assertTrue(any("decode" in m and "steps" in m for m in self.errs(e)))
 
+    def test_over_256_char_rejected(self):
+        self.assertTrue(any("256" in m for m in self.errs(base(cmd="AT+" + "X" * 254))))   # 257
+        self.assertTrue(any("256" in m for m in self.errs(base(steps=["AT", "A" + "X" * 256]))))  # step 2 = 257
+
+    def test_exactly_8_steps_and_256_char_accepted(self):
+        self.assertEqual(self.errs(base(steps=["AT"] * 8)), [])
+        self.assertEqual(self.errs(base(cmd="AT+" + "X" * 253)), [])   # exactly 256
+
 
 if __name__ == "__main__":
     unittest.main()

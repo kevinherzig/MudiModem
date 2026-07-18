@@ -15,6 +15,7 @@ REQUIRED = ["id", "cat", "title", "risk", "vendor", "verified", "summary", "sour
 # the sort in main() would raise a raw TypeError instead of a clean per-entry msg.
 STR_REQUIRED = ["id", "cat", "title", "vendor", "summary", "source", "by"]
 MAX_STEPS = 8
+MAX_CMD_LEN = 256
 PLACEHOLDER = re.compile(r"\{\{(\w+)\}\}")
 
 
@@ -77,6 +78,11 @@ def validate(entries):
                         step_texts.append(s)
         elif has_cmd and isinstance(e["cmd"], str):
             step_texts = [e["cmd"]]
+
+        for txt in step_texts:
+            if len(txt) > MAX_CMD_LEN:
+                errs.append("%s: each command/step must be <= %d chars (has %d)"
+                            % (eid, MAX_CMD_LEN, len(txt)))
 
         # Placeholder coverage over the UNION across cmd/steps.
         ph = set()
