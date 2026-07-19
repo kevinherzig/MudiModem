@@ -425,6 +425,28 @@ AT+QNWLOCK="save_ctrl",0,0             ← GL sets on unlock; 0 = lock gone on r
 
 **Design consuming all this:** `docs/superpowers/specs/2026-07-18-cell-lock-tab-design.md`.
 
+### ⚠️ Cell lock drops a REMOTE admin session — root cause 2026-07-19 🟢
+**Symptom:** locking a cell "sometimes" kills the RPC/web connection afterwards; it recovers on its
+own; it happens even when the active WAN is the **wlan4 WiFi-repeater**, not cellular.
+
+**Root cause — GL's own hotplug, NOT MudiModem.** The admin session reaches the box over **Tailscale**
+(verified: `/rpc` + `/ws` client `100.117.x` arrives `dev tailscale0`). Applying a lock →
+`modem.set_cell_tower` → the modem **re-registers** → the cellular iface (`rmnet_data1`) emits a
+netifd `ifup`. `/etc/hotplug.d/iface/19-tailscale-iface` reacts to **any** non-loopback `ifup` by
+running **`/usr/bin/gl_tailscale restart &`** — tearing down the tunnel carrying the session. Piling
+on: `20-ts-fix` (`ts-fix-reapply`, a `tailscale up --reset` follow-up), `70-pbr`
+(`delete_conntrack_on_wan_event_pbr`), and `01-router-block-non-lan-ip`
+(`/etc/init.d/firewall reload` + `echo f > /proc/net/nf_conntrack`).
+- Explains **all three** observations: self-heals (tailscale reconnects), WAN-agnostic (restart kills
+  the tunnel regardless of which uplink it rode), intermittent (only when the re-reg actually
+  drops+re-establishes the PDN so netifd fires `ifup`).
+- **Not fixable in our code without touching GL system scripts** (rejected as fragile on a travel
+  router). Mitigation shipped 2026-07-19, chunk-only: (1) a "Remote sessions" warning on the
+  Cell-lock tab; (2) `set_cell_lock`'s `.catch` no longer cries "failed" on a connection drop — it
+  runs `verifyLockAfterDrop` (re-queries `get_lock` as the tunnel recovers) and surfaces an
+  **uncertain** revert panel (Keep/Revert, no false countdown) if the lock actually applied. Auth/param
+  errors still report as real failures.
+
 ---
 
 ## 7. What the manual does **not** cover

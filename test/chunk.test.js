@@ -1388,3 +1388,65 @@ test('bands tab: no lock → mode selector fully enabled (regression guard)', ()
   ['Auto', '5G only', '4G only'].forEach((l) =>
     assert.ok(!dis(modeSeg(c, vm, l)), l + ' enabled when no lock is set'));
 });
+
+// --- cell-lock: surviving the self-inflicted tunnel drop -------------------
+// Applying a lock re-registers the modem, which bounces the cellular ifup,
+// which makes GL restart Tailscale and flush conntrack - dropping the very RPC
+// that applied it. That drop is EXPECTED and must not be reported as failure.
+
+test('lockCell: a mid-flight connection drop is verified, not reported as failure', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });   // stop the 2.5s probe timer from leaking
+  stubRpc([Object.assign(new Error('t'), { type: 'timeout' })]);
+  try {
+    const vm = makeVm(loadChunk(), LIVE);
+    vm.lockCell({ rat: '5g', pci: 632, freq: 501390, scs: 30, band: 41 });
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    assert.notEqual(vm.lockError, 'lock failed');      // NOT declared a failure
+    assert.equal(vm.pending && vm.pending.verifying, true);   // entered verify instead
+    assert.equal(vm.lockVerifying, true);
+  } finally { unstubRpc(); }
+});
+
+test('lockCell: an accessDenied is a real failure, not an ambiguous drop', async () => {
+  stubRpc([Object.assign(new Error('x'), { type: 'accessDenied' })]);
+  try {
+    const vm = makeVm(loadChunk(), LIVE);
+    vm.lockCell({ rat: '5g', pci: 632, freq: 501390, scs: 30, band: 41 });
+    await new Promise((r) => setImmediate(r));
+    assert.equal(vm.lockError, 'accessDenied');        // surfaced as an error
+    assert.equal(vm.lockVerifying, false);             // no verify path
+    assert.equal(vm.pending, null);
+    assert.equal(vm.lockBusy, false);
+  } finally { unstubRpc(); }
+});
+
+test('renderRevert: uncertain state offers Keep/Revert with no false countdown', () => {
+  const vm = makeVm(loadChunk(), LIVE);
+  vm.pending = { kind: 'cell', applied: { rat: '5g', pci: 632, freq: 501390 },
+                 uncertain: true, armed: true };
+  const node = vm.renderRevert(h);
+  const txt = textOf(node);
+  assert.ok(/did apply/.test(txt), 'must state the lock applied');
+  const btns = walk(node).filter((n) => n.tag === 'button').map(textOf);
+  assert.ok(btns.includes('Keep') && btns.includes('Revert now'), 'both actions offered');
+  // No LIVE countdown: neither the ticking mm-cd span nor the mm-bar progress
+  // bar (we don't know the real remaining time after a drop). "~60s" prose is ok.
+  assert.equal(walk(node).filter((n) => /mm-cd|mm-bar/.test((n.data && n.data.staticClass) || '')).length,
+    0, 'no live countdown span or progress bar');
+  assert.ok(!/Reverting in/.test(txt), 'no false live-timer phrasing');
+});
+
+test('renderRevert: verifying state shows a checking message, no buttons', () => {
+  const vm = makeVm(loadChunk(), LIVE);
+  vm.pending = { kind: 'cell', verifying: true };
+  const node = vm.renderRevert(h);
+  assert.ok(/checking whether it took/.test(textOf(node)));
+  assert.equal(walk(node).filter((n) => n.tag === 'button').length, 0, 'no actions while checking');
+});
+
+test('cell tab recovery note warns that remote sessions may drop', () => {
+  const vm = makeVm(loadChunk(), LIVE);
+  const txt = textOf(vm.renderRecovery(h));
+  assert.ok(/Remote sessions/.test(txt), 'names the remote-session hazard');
+  assert.ok(/reconnects on its own/.test(txt), 'reassures it self-heals');
+});

@@ -46,6 +46,7 @@ module.exports = {
       lockLoading: false,
       lockError: "",
       lockBusy: false,      // a lock/unlock RPC in flight
+      lockVerifying: false, // set_cell_lock dropped mid-flight; probing get_lock
       lockConfirm: null,    // target awaiting inline confirm ({...target,label})
       scanConfirm: false,   // explicit confirm gate before firing the disruptive scan
       // Scanned neighbour towers (Task 5 fills the scan card); pinTarget reads
@@ -419,8 +420,72 @@ module.exports = {
           self.lockConfirm = null;
           self.startCountdown(res.window || 60, res.applied, "cell");
         })
-        .catch(function (e) { self.lockError = (e && (e.type || e.message)) || "lock failed"; })
-        .then(function () { self.lockBusy = false; });
+        .catch(function (e) {
+          var t = e && (e.type || e.message);
+          // A connection drop mid-round-trip is EXPECTED here, not a failure:
+          // applying the lock re-registers the modem, which bounces the
+          // cellular ifup, which makes GL restart Tailscale (19-tailscale-iface)
+          // and flush conntrack - killing this very request even though the
+          // lock very likely APPLIED server-side and is now on the 60s revert
+          // timer. Auth/param errors mean the lock truly didn't take; anything
+          // else (timeout, rpcCancel, network reset) is ambiguous - go verify.
+          if (t === "invalidParams" || t === "accessDenied") {
+            self.lockError = t || "lock failed";
+            return;
+          }
+          self.verifyLockAfterDrop({ rat: args.rat, pci: args.pci, freq: args.freq });
+        })
+        .then(function () {
+          // verifyLockAfterDrop owns lockBusy while it probes; don't clear it here.
+          if (!self.lockVerifying) self.lockBusy = false;
+        });
+    },
+    // set_cell_lock's reply never arrived (the lock bounced our own tunnel).
+    // Find out what actually happened: give the tunnel a moment, then re-query
+    // get_lock a few times. If a lock is present / a revert is armed, surface
+    // an (uncertain) revert panel so a good lock can still be kept; otherwise
+    // report a clean no-op. Owns lockBusy/lockVerifying for its lifetime.
+    verifyLockAfterDrop(applied) {
+      var self = this;
+      this.lockVerifying = true;
+      this.lockBusy = true;
+      this.lockError = "";
+      this.pending = { kind: "cell", verifying: true };
+      var attempts = 0, MAX = 6;
+      var probe = function () {
+        attempts += 1;
+        window.$rpcRequest("call", ["sid", "mudimodem", "get_lock", {}], { timeout: 15000 })
+          .then(function (res) {
+            var lk = res && res.lock;
+            var locked = (lk && lk.l4g && lk.l4g.locked) || (lk && lk.l5g && lk.l5g.locked);
+            var armed = res && res.pending_kind === "cell";
+            self.lockData = res;
+            if (locked || armed) {
+              self.lockConfirm = null;
+              self.pending = { kind: "cell", applied: applied, uncertain: true, armed: !!armed };
+              self.finishVerify();
+            } else if (attempts < MAX) {
+              setTimeout(probe, 2500);
+            } else {
+              self.pending = null;
+              self.lockError = "The lock request was cut off by a connection drop and no lock is set - try again.";
+              self.finishVerify();
+            }
+          })
+          .catch(function () {
+            if (attempts < MAX) { setTimeout(probe, 2500); }
+            else {
+              self.pending = null;
+              self.lockError = "Connection dropped while locking and hasn't recovered yet - refresh once you're back to see the current lock state.";
+              self.finishVerify();
+            }
+          });
+      };
+      setTimeout(probe, 2500);
+    },
+    finishVerify() {
+      this.lockVerifying = false;
+      this.lockBusy = false;
     },
     unlockCell() {
       var self = this;
@@ -1308,6 +1373,33 @@ module.exports = {
           h("span", { staticClass: "mm-revert-row" }, doneMsg)
         ]);
       }
+      // The set_cell_lock reply never came back (the lock bounced our own remote
+      // tunnel). We're re-querying to learn the real state - hold this panel.
+      if (p.verifying) {
+        return h("div", { staticClass: "mm-revert" }, [
+          h("span", { staticClass: "mm-revert-row" },
+            "Connection dropped while applying the lock - checking whether it took...")
+        ]);
+      }
+      // Verified: a lock IS present, but the drop cost us the exact countdown.
+      // Offer Keep / Revert without a false timer.
+      if (p.uncertain) {
+        var ua = p.applied || {};
+        return h("div", { staticClass: "mm-revert" }, [
+          h("div", { staticClass: "mm-revert-row" }, [
+            h("span", [
+              "Your connection dropped during the lock, but the ",
+              h("b", (ua.rat === "4g" ? "LTE" : "5G") + " lock PCI " + ua.pci + " / ARFCN " + ua.freq),
+              " did apply. If the auto-revert is still running it will undo this within ~60s - ",
+              h("b", "Keep"), " to make it stick, or ", h("b", "Revert"), " to remove it now."
+            ]),
+            h("span", { staticStyle: { flex: "none", display: "flex", gap: "6px" } }, [
+              h("button", { staticClass: "mm-btn danger", on: { click: function () { self.revertBands(); } } }, "Revert now"),
+              h("button", { staticClass: "mm-btn keep", on: { click: function () { self.keepBands(); } } }, "Keep")
+            ])
+          ])
+        ]);
+      }
       // Summarise what changed (applied = { mode, sa, nsa, lte } for bands;
       // { rat, pci, freq } for a cell lock).
       var a = p.applied || {}, bits = [];
@@ -1651,6 +1743,13 @@ module.exports = {
           "watchdog fires even if this page is closed. If the router ever becomes unreachable over ",
           "the web, the ssh way back is: ", h("b", "ssh root@<router> /usr/sbin/mudimodem-revert panic"),
           " - it unlocks both RATs, resets lock persistence, and restores the known-good bands."
+        ]),
+        h("div", { staticClass: "mm-hint", staticStyle: { lineHeight: "1.6", marginTop: "8px", color: "var(--warning-hover)" } }, [
+          h("b", "Remote sessions: "),
+          "applying a lock briefly re-registers the modem, which can drop a remote (Tailscale / VPN) ",
+          "connection to this router for a few seconds. It reconnects on its own - if the request ",
+          "seems to hang or fail, wait a moment; the lock likely applied and this page will offer to ",
+          "keep or revert it once you're back."
         ])
       ]);
     }
