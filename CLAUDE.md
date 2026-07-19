@@ -466,9 +466,14 @@ So our page calls: `window.$rpcRequest("call", ["sid", "mudimodem", "get_status"
 ## 7a. The AT command library (design direction, 2026-07-17)
 Kevin's ask: a community-contributed AT snippet library, "similar to code snippets", shipped on the
 router and searchable. It's a differentiator no router UI has.
-- **Distribution:** entries live in-repo (`src/at-library/<vendor>.json`), deploy to
-  `/www/mudimodem/at-library.json.gz`, fetched with axios. **No backend, no RPC**, and updatable
-  without rebuilding the chunk. Served unauthenticated — fine, AT commands are public knowledge.
+- **Distribution (CHANGED 2026-07-18 — now a separate repo):** sources live in
+  **`github.com/kevinherzig/mudi7-at-library`** (public), whose CI validates + publishes a merged,
+  content-`revision`-stamped `dist/at-library.json` + tiny `dist/version.json`. The base repo ships a
+  baked snapshot (`src/at-library.snapshot.json`) as the offline/first-install cache at
+  `/www/mudimodem/at-library.json.gz`; `tools/mudimodem-lib` (backend `refresh_library`) pulls the
+  latest into that cache on a **manual** button, and `library_status` does an on-load version check
+  (router-mediated curl → same-origin browser). Browser still fetches with axios. Served
+  unauthenticated — fine, AT commands are public knowledge.
 - **The killer field is `decode`** — a list of field names for the response. It turns
   `+QENG: "servingcell","NOCONN","NR5G-SA",…,-98,-11,8` (13 commas of nothing) into a labelled
   table **with no per-command code**. Pure data ⇒ contributable by people who don't write JS.
@@ -575,7 +580,7 @@ MudiModem/
 ├── src/
 │   ├── views/mudimodem.js       ← chunk SOURCE (plain JS; gzipped at build → the shipped .gz)
 │   ├── menu/mudimodem.json      ← menu registration + global_sockets (level 1, icon "modem")
-│   └── at-library/<vendor>.json ← community AT snippets (§7a) — not yet created
+│   └── at-library.snapshot.json ← baked fallback; sources in kevinherzig/mudi7-at-library (§7a)
 ├── tools/
 │   ├── build.sh                 ← "build" = gzip to gl-sdk4-ui-mudimodem.common.js.gz
 │   ├── deploy.sh                ← model-guarded push over ssh `cat` (no scp: no sftp-server)
@@ -644,7 +649,7 @@ MudiModem/
 - ⏭ **Next:** (a) make `set_bands` **durable** via `modem.set_sim_config` (else it reverts on
   `cellular_manager` restart — §5a durability gap); (b) cell-lock tab on `QNWLOCK` (§6a).
 - ✅ **Phase 3 done (2026-07-18)** — AT console tab (lazy chunk `mudimodem-console`) + community
-  library (`src/at-library/*.json` → `/www/mudimodem/at-library.json.gz`, build-validated).
+  library (now EXTERNAL — `kevinherzig/mudi7-at-library`; router pulls via `mudimodem-lib`, baked snapshot fallback).
   Transport: `mudimodem.at_console` spawns `/usr/lib/mudimodem/mudimodem-at.py` — flock-serialized,
   `gl_modem` SIGSTOPped during the send (paired CONT + startup recovery; verify.sh 8e asserts no
   stopped daemon survives). Gate: set/nv library entries need the banner checkbox; free-typed always

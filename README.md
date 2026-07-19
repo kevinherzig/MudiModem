@@ -122,11 +122,12 @@ See [`CLAUDE.md`](CLAUDE.md) for the full reverse-engineering notes and
 ```
 src/views/mudimodem.js        ← chunk source (plain JS; gzipped at build)
 src/menu/mudimodem.json       ← menu registration + global_sockets
-src/at-library/<vendor>.json  ← community AT snippets
+src/at-library.snapshot.json  ← baked fallback library (sources: github.com/kevinherzig/mudi7-at-library)
 tools/build.sh                ← gzip to the shipped .common.js.gz
 tools/deploy.sh               ← model-guarded push over ssh `cat` (no scp: box has no sftp-server)
 tools/verify.sh               ← on-device assertions
 tools/mudimodem-at.py         ← the AT channel for the console
+tools/mudimodem-lib           ← check/refresh the community library from the external repo
 docs/screenshots/             ← the images above
 reference/                    ← nginx config, oui internals, AT reference
 ```
