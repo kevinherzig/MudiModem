@@ -70,24 +70,29 @@ type, and roaming state, with an editable dial profile, a one-click slot switch,
 
 ## Installing it
 
-MudiModem installs over ssh — no app store, no firmware flash. You need:
-
-- A **GL-E5800 ("Mudi")** you can reach as `root` over ssh (key auth recommended).
-- This repo checked out on your machine, with Node available for the build.
+One line, over ssh — no app store, no firmware flash. From a machine that can reach the router as
+`root`:
 
 ```sh
-# point the tooling at your router (host alias or IP)
-export MUDI_HOST=mudi        # or e.g. 10.0.0.1
-
-./tools/deploy.sh            # builds, then pushes every file over ssh
+ssh root@mudi 'curl -fsSL https://raw.githubusercontent.com/kevinherzig/MudiModem/main/install.sh | sh'
 ```
 
-`deploy.sh` **refuses to run against anything that isn't a GL-E5800** (it checks the model first — a
-safeguard because GL's default `192.168.8.1` may be a different router on your LAN). It's idempotent, so
-re-running it just updates the files. Then **reload the GL admin in your browser** — a new **MODEM** item
-appears in the top navigation. That's it; there's no reboot.
+The installer runs **on the router**: it downloads every file from GitHub, gzips the page chunks with the
+box's own `gzip`, and drops them into place — no toolchain, nothing to build. Then **reload the GL admin
+in your browser** and a **MODEM** item appears in the top navigation. There's no reboot.
 
-To confirm everything landed correctly, run `./tools/verify.sh`.
+**Uninstall** is the mirror image:
+
+```sh
+ssh root@mudi 'curl -fsSL https://raw.githubusercontent.com/kevinherzig/MudiModem/main/uninstall.sh | sh'
+```
+
+Both scripts **refuse to run against anything that isn't a GL-E5800** (they check the model first — a
+safeguard because GL's default `192.168.8.1` may be a *different* router on your LAN), are idempotent, and
+register/de-register the files in `/etc/sysupgrade.conf` so a firmware upgrade doesn't wipe them.
+
+> Developing on it? `./tools/deploy.sh` pushes your local checkout to the box over ssh (set
+> `MUDI_HOST`), and `./tools/verify.sh` runs the on-device assertions.
 
 > **Heads up — it's a travel router on cellular.** If you administer the Mudi *over* its own cellular
 > link, a bad band or cell lock can drop the connection you're using. MudiModem's confirm-or-revert
