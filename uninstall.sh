@@ -3,8 +3,9 @@
 # installer placed, de-registers them from sysupgrade.conf, and restarts nginx.
 # Idempotent. Does NOT touch the modem's band/cell-lock NV — clear those from the
 # panel (or the ssh panic-restore) BEFORE uninstalling if you want them gone.
+# Run it from a root shell on the router (ssh root@<router> first if remote):
 #
-#   ssh root@mudi 'curl -fsSL https://raw.githubusercontent.com/kevinherzig/MudiModem/main/uninstall.sh | sh'
+#   curl -fsSL https://raw.githubusercontent.com/kevinherzig/MudiModem/main/uninstall.sh | sh
 set -eu
 
 MODEL=$(cat /proc/device-tree/model 2>/dev/null | tr -d '\0')

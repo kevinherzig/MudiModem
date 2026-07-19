@@ -70,21 +70,21 @@ type, and roaming state, with an editable dial profile, a one-click slot switch,
 
 ## Installing it
 
-One line, over ssh — no app store, no firmware flash. From a machine that can reach the router as
-`root`:
+One line — no app store, no firmware flash. From a **root shell on the router** (`ssh root@<router>`
+first if you're remote):
 
 ```sh
-ssh root@mudi 'curl -fsSL https://raw.githubusercontent.com/kevinherzig/MudiModem/main/install.sh | sh'
+curl -fsSL https://raw.githubusercontent.com/kevinherzig/MudiModem/main/install.sh | sh
 ```
 
-The installer runs **on the router**: it downloads every file from GitHub, gzips the page chunks with the
-box's own `gzip`, and drops them into place — no toolchain, nothing to build. Then **reload the GL admin
-in your browser** and a **MODEM** item appears in the top navigation. There's no reboot.
+The installer downloads every file from GitHub, gzips the page chunks with the box's own `gzip`, and drops
+them into place — no toolchain, nothing to build. Then **reload the GL admin in your browser** and a
+**MODEM** item appears in the top navigation. There's no reboot.
 
 **Uninstall** is the mirror image:
 
 ```sh
-ssh root@mudi 'curl -fsSL https://raw.githubusercontent.com/kevinherzig/MudiModem/main/uninstall.sh | sh'
+curl -fsSL https://raw.githubusercontent.com/kevinherzig/MudiModem/main/uninstall.sh | sh
 ```
 
 Both scripts **refuse to run against anything that isn't a GL-E5800** (they check the model first — a

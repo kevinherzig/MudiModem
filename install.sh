@@ -2,8 +2,9 @@
 # MudiModem installer — run ON the GL-E5800 ("Mudi"). Self-contained: fetches
 # every source file from GitHub and installs it, gzipping the view chunks on the
 # box (busybox gzip). No toolchain, no committed artifacts. Idempotent.
+# Run it from a root shell on the router (ssh root@<router> first if remote):
 #
-#   ssh root@mudi 'curl -fsSL https://raw.githubusercontent.com/kevinherzig/MudiModem/main/install.sh | sh'
+#   curl -fsSL https://raw.githubusercontent.com/kevinherzig/MudiModem/main/install.sh | sh
 #
 # Env: MUDIMODEM_REF (branch/tag, default main), MUDIMODEM_BASE (override raw URL).
 set -eu
