@@ -326,6 +326,21 @@ blocks.
 
 🟢 `AT+QNVFR=?` → `+QNVFR: <nv_files>` — per-file NV read exists. ❓ Undocumented anywhere we have.
 
+### 5a. 📘 Community IMEI-repair / NV-save sequence (GL.iNet forum "Mudi 7 Mega Post", 2026-07-18)
+📘 **All unverified on our box** — extracted from a GL.iNet/Reddit "Mudi 7" community thread. Three
+commands, used together as an IMEI-restore procedure. ⚠️ **Writing an IMEI is legally restricted in
+many jurisdictions** — this is documented for *restoring a device's own* IMEI, not spoofing.
+
+| Cmd | What the thread claims | Note |
+|---|---|---|
+| `AT+EGMR=1,7,"<IMEI>"` | Write the IMEI for **SIM1's** subscription (`1`=write, `7`=IMEI field 1). Keep the quotes. | A reply says **`1,11` targets SIM2 / eSIM** instead of `1,7`. `AT+EGMR` is a broad (non-Quectel-specific) modem command. |
+| `AT+QPRTPARA=1` | The **save step for SIM1** — persist the write so it survives reboot. | ✅ **Corroborates §5 above:** `=1` is the *back-up/save* action. Still no on-box confirmation of the full `(1-4)` mapping. |
+| `AT+QEFSSYNC=0` | The **save step for SIM2 / eSIM** — the thread stresses it is a *different* sequence than SIM1's `QPRTPARA`. | New command, not previously in this doc. EFS→NV flush. |
+
+Procedure as posted: request/**copy the current IMEI first** (it's lost if unsaved) → `AT+EGMR=1,7,"…"`
+→ `AT+QPRTPARA=1` (SIM1) *or* `AT+QEFSSYNC=0` (SIM2/eSIM) → **reboot** → verify. Nobody in-thread
+shows a `=4` counter before/after, so treat "it persisted" as a claim, not proof.
+
 ---
 
 ## 6. Hayes profile — `AT&V` / `AT&W` 🟢📘

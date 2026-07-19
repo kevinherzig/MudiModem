@@ -107,5 +107,27 @@
     "cmd": "AT+QNWLOCK=\"save_ctrl\"", "risk": "read", "vendor": "quectel",
     "verified": ["RG650V-NA"],
     "summary": "Two 0/1 flags controlling whether cell locks persist (exact mapping unconfirmed; this box reads 0,0). Unlike band config, cell lock appears to have a non-persist option.",
-    "source": "captured on box 2026-07-17 (reference §6a)", "by": "kevin" }
+    "source": "captured on box 2026-07-17 (reference §6a)", "by": "kevin" },
+
+  { "id": "quectel.set-imei-sim1", "cat": "Identity", "title": "Set the IMEI (SIM1)",
+    "cmd": "AT+EGMR=1,7,\"{{imei}}\"", "risk": "nv", "vendor": "quectel", "verified": [],
+    "summary": "Write the IMEI for SIM1's subscription (index 1,7). A community IMEI-repair step — must be followed by a save (QPRTPARA=1) and a reboot, or it won't stick.",
+    "warn": "Writes device identity to NV (survives reboot/factory reset). Changing an IMEI is LEGALLY RESTRICTED in many countries — only for restoring your own device's IMEI. Unverified on the RG650V; 1,7 = SIM1, 1,11 = SIM2/eSIM per community reports. Copy your current IMEI first: it is lost if you don't save it.",
+    "source": "GL.iNet forum 'Mudi 7 Mega Post', community-reported 2026-07-18 (reference §5a)",
+    "by": "community",
+    "params": [ { "name": "imei", "hint": "The 15-digit IMEI to write (keep the quotes). This form targets SIM1 (1,7); for SIM2/eSIM use index 1,11.", "example": "350000000000006" } ] },
+
+  { "id": "quectel.nv-save-qprtpara", "cat": "Identity", "title": "Persist the change — SIM1 (QPRTPARA)",
+    "cmd": "AT+QPRTPARA=1", "risk": "nv", "vendor": "quectel", "verified": [],
+    "summary": "Save/back up modem NV so a SIM1 change (e.g. an IMEI write) survives reboot. The '1' selects the backup action; QPRTPARA=? on this box returns (1-4).",
+    "warn": "Action, not a query — writes NAND. The 1-4 argument mapping is not fully verified on the RG650V (community and a different-family app note both read =1 as the save/back-up step). Do not power off mid-execute; don't run it frequently (NAND wear).",
+    "source": "GL.iNet forum 'Mudi 7 Mega Post', 2026-07-18; QPRTPARA=? range seen on box (reference §5)",
+    "by": "community" },
+
+  { "id": "quectel.nv-save-qefssync", "cat": "Identity", "title": "Persist the change — SIM2 / eSIM (QEFSSYNC)",
+    "cmd": "AT+QEFSSYNC=0", "risk": "nv", "vendor": "quectel", "verified": [],
+    "summary": "The save step for SIM2 / eSIM changes — the community reports this is the correct sequence for slot 2, distinct from SIM1's QPRTPARA.",
+    "warn": "Action that flushes the modem's EFS to NV. Unverified on the RG650V; argument 0 per community report. Use this (not QPRTPARA) after an EGMR write with index 1,11 (SIM2/eSIM).",
+    "source": "GL.iNet forum 'Mudi 7 Mega Post', community-reported 2026-07-18 (reference §5a)",
+    "by": "community" }
 ]
