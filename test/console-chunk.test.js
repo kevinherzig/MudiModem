@@ -477,3 +477,76 @@ test('send(): RPC timeout scales with the number of steps', async () => {
   } finally { global.window = saved; }
   assert.strictEqual(seenOpts.timeout, (8 * 3 + 10) * 1000, '3 steps -> 8*3+10 s');
 });
+
+test('checkLibraryStatus stores the status; render shows "Update available" + button', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, {});
+  const saved = global.window;
+  try {
+    global.window = { $rpcRequest: () => Promise.resolve(
+      { checked: true, update_available: true, local_revision: 'old111', remote_revision: 'new222' }) };
+    return vm.checkLibraryStatus().then(() => {
+      assert.ok(vm.libStatus && vm.libStatus.update_available);
+      const txt = textOf(c.render.call(vm, h));
+      assert.match(txt, /Update available/);
+      assert.match(txt, /Refresh now/);
+    });
+  } finally { global.window = saved; }
+});
+
+test('render shows "Up to date · rev" when checked and current', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, {});
+  vm.libStatus = { checked: true, update_available: false, local_revision: 'abc123' };
+  const txt = textOf(c.render.call(vm, h));
+  assert.match(txt, /Up to date/);
+  assert.match(txt, /abc123/);
+  assert.doesNotMatch(txt, /Refresh now/);
+});
+
+test('render shows only the local rev when the check did not complete (offline)', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, {});
+  vm.libStatus = { checked: false, update_available: false, local_revision: 'abc123' };
+  const txt = textOf(c.render.call(vm, h));
+  assert.match(txt, /rev abc123/);
+  assert.doesNotMatch(txt, /Update available/);
+});
+
+test('refreshLibrary success re-fetches the library and re-checks', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, {});
+  let libFetches = 0, statusCalls = 0;
+  const saved = global.window;
+  // NB: restoring `global.window` via a plain try/finally here would run the
+  // `finally` synchronously right after `refreshLibrary()` returns its
+  // promise — BEFORE its internal `.then` microtask (which calls fetchLib(),
+  // itself re-reading `window`) actually executes. Chain `.finally()` on the
+  // promise instead so teardown happens after the whole chain settles.
+  global.window = {
+    $axios: { get: () => { libFetches++; return Promise.resolve({ data: { entries: [] } }); } },
+    $rpcRequest: (_m, p) => {
+      if (p[2] === 'refresh_library') return Promise.resolve({ ok: true, revision: 'new222', count: 7 });
+      if (p[2] === 'library_status') { statusCalls++; return Promise.resolve({ checked: true, update_available: false, local_revision: 'new222' }); }
+      return Promise.resolve({});
+    }
+  };
+  return vm.refreshLibrary().then(() => {
+    assert.strictEqual(vm.refreshing, false);
+    assert.ok(libFetches >= 1, 'library re-fetched after refresh');
+    assert.ok(statusCalls >= 1, 're-checked status after refresh');
+  }).finally(() => { global.window = saved; });
+});
+
+test('checkLibraryStatus is fail-silent (rejection -> null, no throw)', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, {});
+  const saved = global.window;
+  try {
+    global.window = { $rpcRequest: () => Promise.reject({ type: 'timeout' }) };
+    return vm.checkLibraryStatus().then(() => {
+      assert.strictEqual(vm.libStatus, null);
+      assert.doesNotThrow(() => c.render.call(vm, h));
+    });
+  } finally { global.window = saved; }
+});

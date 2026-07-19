@@ -32,7 +32,10 @@ module.exports = {
       params: {},           // param values for the selected entry
       sending: false,
       decodeRows: null,     // [[{f,v,hi},…] per matched response line]
-      decodeSrc: ""
+      decodeSrc: "",
+      libStatus: null,        // {local_revision, remote_revision, update_available, checked}
+      refreshing: false,
+      refreshMsg: ""
     };
   },
 
@@ -118,6 +121,7 @@ module.exports = {
       this.riskOK = window.localStorage.getItem("mudimodem.riskEnabled") === "1";
     }
     this.fetchLib();
+    this.checkLibraryStatus();
   },
 
   methods: {
@@ -134,6 +138,32 @@ module.exports = {
         .catch(function (e) {
           self.libLoading = false;
           self.libErr = (e && e.message) || "load failed";
+        });
+    },
+    checkLibraryStatus() {
+      var self = this;
+      if (typeof window === "undefined" || !window.$rpcRequest) return Promise.resolve();
+      return window.$rpcRequest("call", ["sid", "mudimodem", "library_status", {}], { timeout: 12000 })
+        .then(function (r) { self.libStatus = r || null; })
+        .catch(function () { self.libStatus = null; });   // fail-silent
+    },
+    refreshLibrary() {
+      var self = this;
+      if (this.refreshing || typeof window === "undefined" || !window.$rpcRequest) return Promise.resolve();
+      this.refreshing = true; this.refreshMsg = "";
+      return window.$rpcRequest("call", ["sid", "mudimodem", "refresh_library", {}], { timeout: 30000 })
+        .then(function (r) {
+          self.refreshing = false;
+          if (r && r.ok) {
+            self.refreshMsg = "updated — rev " + (r.revision || "");
+            self.fetchLib();
+            return self.checkLibraryStatus();
+          }
+          self.refreshMsg = (r && r.error) || "refresh failed";
+        })
+        .catch(function (e) {
+          self.refreshing = false;
+          self.refreshMsg = (e && (e.message || e.type)) || "refresh failed";
         });
     },
     toggleGate() {
@@ -368,6 +398,10 @@ module.exports = {
         '.mmc-ta:focus{outline:0;border-color:var(--primary)}' +
         '.mmc-steps{margin-top:8px;display:flex;flex-direction:column;gap:3px}' +
         '.mmc-step{font-family:monospace;font-size:11px;color:var(--text-weak);background:var(--bg-title);border-radius:3px;padding:4px 8px}' +
+        '.mmc-librow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px;font-size:11.5px}' +
+        '.mmc-libupd{font-weight:600;color:var(--primary)}' +
+        '.mmc-refresh{font-size:11px;font-weight:600;background:var(--primary);color:#fff;border:1px solid var(--primary);border-radius:3px;padding:3px 9px;cursor:pointer;font-family:inherit}' +
+        '.mmc-refresh:disabled{opacity:.5;cursor:default}' +
         '@media(prefers-reduced-motion:reduce){.mmc *{transition:none!important}}';
       var el = document.createElement("style");
       el.id = this.styleId;
@@ -401,6 +435,26 @@ module.exports = {
         h("span", { staticClass: "mmc-hint" },
           this.lib ? String(this.entries.length) + " commands" : "")
       ]),
+      (function () {
+        var st = self.libStatus, kids = [];
+        if (st) {
+          var rev = st.local_revision || "unknown";
+          if (st.checked && st.update_available) {
+            kids.push(h("span", { staticClass: "mmc-libupd" }, "Update available"));
+            kids.push(h("button", {
+              staticClass: "mmc-refresh",
+              attrs: { disabled: self.refreshing },
+              on: { click: function () { self.refreshLibrary(); } }
+            }, self.refreshing ? "Refreshing…" : "Refresh now"));
+          } else if (st.checked) {
+            kids.push(h("span", { staticClass: "mmc-hint" }, "Up to date · rev " + rev));
+          } else {
+            kids.push(h("span", { staticClass: "mmc-hint" }, "rev " + rev));
+          }
+        }
+        if (self.refreshMsg) kids.push(h("span", { staticClass: "mmc-hint" }, self.refreshMsg));
+        return kids.length ? h("div", { staticClass: "mmc-librow" }, kids) : null;
+      })(),
       h("input", {
         staticClass: "mmc-search",
         attrs: { placeholder: "Search — band, lock, signal…", "aria-label": "Search library" },
@@ -442,7 +496,7 @@ module.exports = {
       body = h("div", { staticClass: "mmc-libbody" }, items);
     }
     libKids.push(body);
-    var rail = h("div", { staticClass: "mmc-card" }, libKids);
+    var rail = h("div", { staticClass: "mmc-card" }, libKids.filter(Boolean));
 
     // ---- transcript ----
     var termKids = this.lines.length
