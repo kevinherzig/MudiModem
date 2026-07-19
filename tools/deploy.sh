@@ -36,6 +36,12 @@ ssh -o BatchMode=yes "root@$HOST" 'mkdir -p /usr/lib/mudimodem && cat > /usr/lib
   < tools/mudimodem-at.py
 echo "console chunk + AT library + AT tool deployed"
 
+# Library check/refresh tool — pulls the community AT library from the
+# external mudi7-at-library repo (fail-silent when unreachable; §4).
+ssh -o BatchMode=yes "root@$HOST" 'mkdir -p /usr/lib/mudimodem && cat > /usr/lib/mudimodem/mudimodem-lib && chmod 0755 /usr/lib/mudimodem/mudimodem-lib' \
+  < tools/mudimodem-lib
+echo "library check/refresh tool deployed"
+
 # Confirm-or-revert watchdog + panic restore (§5). Inert until invoked; install
 # it BEFORE the backend so set_bands can always find it.
 if [ -f src/sbin/mudimodem-revert ]; then
@@ -94,6 +100,7 @@ ssh -o BatchMode=yes "root@$HOST" 'f=/etc/sysupgrade.conf; touch "$f"; for p in 
   /www/mudimodem/at-library.json.gz \
   /usr/lib/mudimodem/mudimodem-at.py \
   /usr/share/gl-validator.d/mudimodem.lua \
+  /usr/lib/mudimodem/mudimodem-lib \
   ; do \
   grep -qxF "$p" "$f" || echo "$p" >> "$f" ; done'
 echo "sysupgrade.conf registered"

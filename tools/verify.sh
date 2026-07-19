@@ -161,6 +161,17 @@ ssh -o BatchMode=yes "root@$HOST" \
   'pids=$(pidof gl_modem); [ -n "$pids" ] || exit 1; for p in $pids; do s=$(cut -d" " -f3 "/proc/$p/stat"); [ "$s" = "T" ] && exit 1; done; exit 0' \
   || fail "gl_modem missing or left in state T after the AT call"
 
+echo "8f. library check/refresh tool installed + backend methods present"
+ssh -o BatchMode=yes "root@$HOST" 'test -x /usr/lib/mudimodem/mudimodem-lib' \
+  || fail "mudimodem-lib not installed (run ./tools/deploy.sh)"
+# `check` must always return valid JSON, even when the remote repo/dist is absent
+# (fail-silent -> checked:false). Tolerant: we only assert it emits parseable JSON.
+ssh -o BatchMode=yes "root@$HOST" 'python3 /usr/lib/mudimodem/mudimodem-lib check | python3 -c "import json,sys;d=json.load(sys.stdin);assert \"local_revision\" in d and \"checked\" in d"' \
+  || fail "mudimodem-lib check did not emit a valid status envelope"
+# Backend exposes both methods (dofile under the ngx stub is overkill here; grep the source is enough).
+ssh -o BatchMode=yes "root@$HOST" 'grep -q "function M.library_status" /usr/lib/oui-httpd/rpc/mudimodem && grep -q "function M.refresh_library" /usr/lib/oui-httpd/rpc/mudimodem' \
+  || fail "backend missing library_status/refresh_library"
+
 # 9. Arg validator: the AT console's /rpc gate. Without this, oui's default
 #    string validator -32602's every AT command containing + = " (only bare
 #    ATI/AT slip through). This asserts the override admits real AT syntax —
