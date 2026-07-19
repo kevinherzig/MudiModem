@@ -50,14 +50,17 @@ two backend methods, the version-check UI, and a baked fallback.
 
 ## 3. The revision — content identity, not a hand-bumped number
 
-CI stamps each build with a **`revision`** = short git SHA of the source commit + build timestamp
-(e.g. `"abc1234@2026-07-18T12:00:00Z"`). `lib-validate.py` (in the new repo) is extended to:
-- read the revision from `--revision <str>` / `MM_LIB_REVISION` env (CI passes `${{ github.sha }}`),
+CI derives a **content-based `revision`** = first 12 hex chars of the sha256 of the canonical JSON
+(`sort_keys=True`, compact separators) of the merged, sorted `entries`. `lib-validate.py` (in the
+new repo) is extended to:
+- compute `revision` deterministically from the built entries (same content ⇒ same revision),
 - write it as a top-level `revision` field in `dist/at-library.json` (alongside `version`, `entries`),
-- emit `dist/version.json` = `{ "revision": <str>, "updated": <iso8601>, "count": <n> }`.
+- emit `dist/version.json` = `{ "revision": <str>, "count": <n> }`.
 
-"Update available" ≡ `remote.revision != local.revision`. No manual versioning; any content change
-moves the SHA.
+"Update available" ≡ `remote.revision != local.revision`. A **content hash — not a git SHA or a
+timestamp** — means a docs-only or no-op commit never triggers a spurious "update available", and the
+committed `dist/` files change iff the library content changes. CI therefore commits `dist/` only when
+`git status` shows a diff, and the artifacts carry no wall-clock field.
 
 ## 4. Router refresh/check script (base repo)
 
