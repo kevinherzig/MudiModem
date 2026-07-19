@@ -125,6 +125,20 @@ class LibToolTest(unittest.TestCase):
         rc, r = run("refresh", self.url, self.cache)
         self.assertFalse(r["ok"]); self.assertIn("large", r["error"])
 
+    def test_check_missing_curl_fail_silent(self):
+        write_cache(self.cache, "abc123")
+        write_remote(self.url, "abc123")
+        rc, r = run("check", self.url, self.cache,
+                    extra_env={"MUDIMODEM_CURL": "/nonexistent-curl-xyz"})
+        self.assertFalse(r["checked"]); self.assertIn("error", r)   # OSError, not a crash
+        self.assertEqual(r["local_revision"], "abc123")
+
+    def test_refresh_missing_curl_errors_cleanly(self):
+        write_remote(self.url, "fresh9")
+        rc, r = run("refresh", self.url, self.cache,
+                    extra_env={"MUDIMODEM_CURL": "/nonexistent-curl-xyz"})
+        self.assertFalse(r["ok"]); self.assertIn("fetch failed", r["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

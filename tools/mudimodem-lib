@@ -80,7 +80,7 @@ def cmd_check():
             out["remote_revision"] = remote
             out["checked"] = True
             out["update_available"] = remote != out["local_revision"]
-    except (RuntimeError, ValueError) as e:
+    except (OSError, RuntimeError, ValueError) as e:   # OSError: curl binary missing
         out["error"] = str(e)
     return out
 
@@ -90,7 +90,7 @@ def cmd_refresh():
         return {"ok": False, "error": "refusing: not a GL-E5800"}
     try:
         data = json.loads(fetch(base_url() + "/at-library.json", 20).decode())
-    except (RuntimeError, ValueError) as e:
+    except (OSError, RuntimeError, ValueError) as e:   # OSError: curl binary missing
         return {"ok": False, "error": "fetch failed: %s" % e}
     if not (isinstance(data, dict) and isinstance(data.get("entries"), list)
             and data["entries"] and data.get("revision")
