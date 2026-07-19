@@ -3,7 +3,6 @@
 The Mudi 7 is a great cell modem/router but I found one thing a bit lacking, which is modem control.   I spent a weekend vibe coding a new modem control panel that brings all things modem into one section of the built in UI.
 
 
-
 ---
 
 ## Features
