@@ -444,7 +444,7 @@ module.exports = (function () {
         var self = this;
         var evs = this.allEvents.slice().reverse();
         var rows = evs.map(function (e, i) {
-          var src = { user: "You", dog: "Watchdog", net: "Network" }[e.kind];
+          var src = { user: "User", dog: "Watchdog", net: "Network" }[e.kind];
           return h("tr", { key: i }, [
             h("td", { staticClass: "tm" }, self.clock(e.t)),
             h("td", [h("span", { staticClass: "mmt-chip " + e.kind }, src)]),
@@ -494,7 +494,7 @@ module.exports = (function () {
           body = h("div", { staticClass: "mmt-empty" }, msg);
         }
         var foot = h("div", { staticClass: "mmt-foot" }, [
-          h("span", { staticClass: "mmt-lg" }, "■ You"),
+          h("span", { staticClass: "mmt-lg" }, "■ User"),
           h("span", { staticClass: "mmt-lg" }, "▲ Watchdog"),
           h("span", { staticClass: "mmt-lg" }, "○ Network"),
           h("span", "a tick marks the moment — everything to its right is the radio's answer")

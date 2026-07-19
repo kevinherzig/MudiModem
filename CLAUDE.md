@@ -4,16 +4,6 @@
 band lock, cell lock, live diagnostics, raw AT console, SIM/APN, and a community **AT command
 library**. It adds a page *alongside* GL's own; it patches nothing.
 
-⚠️ **The pitch is NOT "GL can't do this" — that was wrong (§7).** GL ships nearly every control.
-The real gaps, all verified 2026-07-17:
-1. **Undiscoverable** — band selection lives at Internet → SIM → dial config → *Advanced* → enable
-   band filter. Kevin (who wrote this box's band lock by hand) didn't know it existed.
-2. **Scattered** — modem controls are spread across the Internet page, modem details, SIM dialogs,
-   and a *hidden* view (`modemsignallog` is `level:0` — GL built a signal log and left it out of
-   the menu entirely).
-3. **It lies.** GL's UI offers all 18 module-supported SA bands, but carrier policy permits 6 (§5a).
-   The other 12 write cleanly, report success, and never take. GL also can't see AT-set locks (§5a).
-
 Sibling project: **`../MudiUI`** (front-LCD renderer). Different surface, same box. MudiUI's
 `CLAUDE.md` is the reference for **modem/AT/ubus knowledge** (its §6 data sources, §7 band+cell
 lock) — don't re-derive it here.
@@ -23,18 +13,12 @@ box over this doc if they ever disagree** — then fix the doc.
 
 ## Working agreements (inherited from MudiUI — they still apply)
 - **Deploy transfer:** the box has **no sftp-server**, so `scp` fails — use `ssh host 'cat > /path' < file`.
-- **Commit only when Kevin asks.** Single `main`.
-- **Don't reboot the Mudi remotely** — travel router; a reboot can drop the cellular ssh link.
 - **Keep the real router IP out of this repo** (it's public). Use `<router-ip>` in docs.
 - MudiModem never touches `/dev/fb0` — no interaction with gl_screen or MudiUI. The two add-ons
   are independent and can be installed separately.
 
 ## 1. Device access
 - **SSH:** `ssh root@mudi` (hostname alias; key auth). BusyBox `ash`.
-- ⚠️ **`192.168.8.1` is NOT the Mudi** — on this LAN that address is a *different* GL router
-  (an **AXT1800**/Slate AX) that also answers ssh as root. The GL default is a trap here. Every
-  deploy/install script **must model-guard** on `E5800` (`cat /proc/device-tree/model`) before
-  writing anything. `tools/deploy.sh` does this.
 - **Hardware:** GL.iNet **GL-E5800** ("Mudi"), Qualcomm **SDXPINN**, `aarch64_cortex-a53`,
   GL firmware **4.8.5** / OpenWrt 23.05.4, kernel 5.15.170, musl.
 - **Modem: Quectel `RG650V-NA`** (`ATI`) — the **NA** variant, not EU (GL's code branches on
@@ -248,8 +232,6 @@ Payoffs: survives nginx reload, and the same script is the **ssh-callable panic 
 **Known-good full band lists** (from MudiUI §7 — the panic restore writes these):
 - SA: `AT+QNWPREFCFG="nr5g_band",2:5:7:12:13:14:25:26:29:30:38:41:48:66:70:71:77:78`
 - NSA: `AT+QNWPREFCFG="nsa_nr5g_band",2:5:7:12:14:25:26:30:38:41:48:66:71:77:78`
-- ⚠️ Box is **currently locked to n71** (deliberate, 2026-07-15 — improved RSRP -105→-98, SINR 2→8).
-  Don't "fix" it; it's the current desired state.
 - ✅ **These two lists are exactly the module-supported sets** (verified 2026-07-17 against
   `cellular.modem info`, band-for-band). "Known-good" is a misnomer: it isn't a curated safe subset,
   it's simply *everything the module supports*. Note that is **not** everything that *works* — see §5a.
@@ -284,7 +266,7 @@ Measured on this box — **both SIMs, because policy is per-SIM**:
 | config `lte_band` | 19 (adds **7**, **38**) | 19 |
 | **⇒ capability** LTE | **17** ✅ | **17** ✅ |
 
-- **LTE bands 7 and 38 are configured on both SIMs and silently dropped** — the lie, live, on Kevin's box.
+- **LTE bands 7 and 38 are configured on both SIMs and silently dropped** — the misrepresentation, live, on the box.
 - ✅ **`0` means EMPTY, not "all"** (resolves the old `nsa_nr5g_band,0` question). AT&T has no SA
   policy ⇒ no SA capability, despite an unrestricted config.
 - ⚠️ **The band grid is therefore per-SIM.** Policy *and* config change with the subscription;
@@ -293,7 +275,7 @@ Measured on this box — **both SIMs, because policy is per-SIM**:
 **Consequences — this is what MudiModem is for:**
 - **GL's band dialog offers 18 SA checkboxes; policy permits 6.** The other 12 write cleanly, return
   success, and the modem never uses them. GL never queries `policy_band` (zero hits for
-  `QNWPREFCFG` anywhere in its frontend). **The UI lies, and one AT query proves it.**
+  `QNWPREFCFG` anywhere in its frontend). **The UI misrepresents, and one AT query proves it.**
 - The band grid therefore needs a state we'd never designed: *module-supported but policy-blocked* —
   shown, explained, **not selectable**.
 - **`policy_band` is the number that matters**, not the module list. Show all three; lead with policy.
@@ -312,7 +294,7 @@ returns GL's stored band config **already parsed**:
   is in `cellular.modem get_feature_config`, not `sim get_config`.** Trust the box.
 
 **What GL config still does NOT surface: `policy_band` / `ue_capability_band`.** Those are AT-only
-(§ reference §2). So the three-layer *lie* stands — GL offers all 18 module bands as checkboxes and
+(§ reference §2). So the three-layer *misrepresentation* stands — GL offers all 18 module bands as checkboxes and
 never shows that policy permits 6.
 
 📌 **CONFIG + MODE read path (settled 2026-07-17 after two reversals): `get_feature_config` (ubus).**
@@ -348,7 +330,7 @@ reboot/manager-restart is a *free* second revert path to GL's stored bands.) Ful
 - ⚠️ **`AT+QNWPREFCFG="restore_band"` is an ACTION, not a query** — it takes no argument in the test
   form. Running it would very likely wipe the deliberate n71 lock. **Never run it to "look".** It may
   be a better panic path than our hardcoded list (it's the modem's own default), but that needs
-  verifying somewhere other than Kevin's only cellular link.
+  verifying somewhere other than the box's only cellular link.
 - `AT+QNWPREFCFG=?` also exposes: `gw_band`, `srv_domain`, `voice_domain`, `roam_pref`,
   `ue_usage_setting`, `rat_acq_order`, `nr5g_disable_mode`, `rf_band`, `policy_mode`.
 
@@ -461,10 +443,10 @@ So our page calls: `window.$rpcRequest("call", ["sid", "mudimodem", "get_status"
 - ❌ ~~**"MudiModem exposes controls GL's UI doesn't have."**~~ **This premise was WRONG** and is
   retired (2026-07-17). GL ships band masking, tower lock, operator lock, AT console, SIM failover,
   data caps and 3GPP-rel selection. See the header for the three gaps that actually justify the
-  project — **undiscoverable, scattered, and lying**. Don't re-argue this; it cost a whole session.
+  project — **undiscoverable, scattered, and misrepresenting**. Don't re-argue this; it cost a whole session.
 
 ## 7a. The AT command library (design direction, 2026-07-17)
-Kevin's ask: a community-contributed AT snippet library, "similar to code snippets", shipped on the
+The ask: a community-contributed AT snippet library, "similar to code snippets", shipped on the
 router and searchable. It's a differentiator no router UI has.
 - **Distribution (CHANGED 2026-07-18 — now a separate repo):** sources live in
   **`github.com/kevinherzig/mudi7-at-library`** (public), whose CI validates + publishes a merged,
@@ -481,7 +463,7 @@ router and searchable. It's a differentiator no router UI has.
   `read` (query only) · `set` (runtime, gone on reboot) · `nv` (**writes NV; survives factory reset**).
   Badge shown everywhere the entry appears. **Nothing ever auto-runs** — clicking fills the prompt.
   Entries with `{{params}}` refuse to send until filled. Gated behind an **"enable higher-risk
-  commands"** checkbox (Kevin, 2026-07-17).
+  commands"** checkbox (2026-07-17).
 - **`verified: []` + `source` are load-bearing** — an unverified community command must render as
   "*nobody yet*", not hide. Keeps the library from becoming a folk-remedy collection. AT is
   vendor- *and* firmware-specific; `AT+QNWPREFCFG` is Quectel-only.
@@ -674,11 +656,11 @@ MudiModem/
 - **`gl_modem` is the AT traffic source** (`/usr/bin/gl_modem -B cpu -S 1 connect-auto`);
   `modem_AT` is the ubus AT *server* — sleep the former during console sends, never the latter.
 - T-Mobile `nr5g_band` read `25:41:48:66:71:77` (full policy set), NOT the documented n71-only
-  lock — GL's stored config or an experiment widened it. Flagged to Kevin, not "fixed".
+  lock — GL's stored config or an experiment widened it. Flagged, not "fixed".
 
 ### Open questions (do not guess these — verify)
 📖 All AT detail + evidence lives in **`reference/quectel-at-reference.md`**.
-1. ✅ **`AT+QNWLOCK` — SOLVED on capability + syntax (2026-07-17).** Kevin confirms cell lock works;
+1. ✅ **`AT+QNWLOCK` — SOLVED on capability + syntax (2026-07-17).** Cell lock confirmed working;
    the box's `AT+QNWLOCK=?` gave the exact forms (ref §6a): `"common/4g",(0-10),<freq>,<pci>` and
    `"common/5g",<pci>,<freq>,<scs>,<band>` — **NR is PCI-first** (the mockup's guess was backwards).
    There's a `save_ctrl` persistence toggle too. *Still open:* set-side param semantics (`<mode>`,
@@ -690,7 +672,7 @@ MudiModem/
    `=4` baseline → `=1` → `=4` again, confirm `<CEFS_backup_cnt>` incremented.
    ❓ Unknown whether it even covers band config (it backs up the modem *file system*).
 3. **`AT+QNWPREFCFG="restore_band"`** — takes no argument ⇒ an **action**, not a query. **Do not run
-   it to look.** Likely a better panic path than our hardcoded list. Verify off Kevin's only link.
+   it to look.** Likely a better panic path than our hardcoded list. Verify off the box's only link.
 4. **Band→frequency table** — MHz labels in the UI are *ours*; source from **3GPP TS 38.101-1 (NR) /
    36.101 (LTE)**, not memory. The whole spectrum-ordering design rests on them being right.
 5. **Is `policy_band` writable?** `policy_mode` exists (undocumented). If policy can be widened, §5a
@@ -702,7 +684,7 @@ MudiModem/
    Don't decode it positionally until resolved.
 8. **Does `modem.set_sim_config` make a band change durable?** (verify) — the fix for the durability
    gap (§5a). Send GL its config `{band_enable, band_filter_mode, band_list}` alongside our raw-AT
-   write, then restart `cellular_manager` and confirm the band survives. Do it off Kevin's only link.
+   write, then restart `cellular_manager` and confirm the band survives. Do it off the box's only link.
 9. ✅ **RESOLVED (2026-07-18): the direct port CANNOT target a sub_id.** No subscription selector
    exists on `/dev/at_mdm0` (`QSIMSWITCH`/`QDSDS`/`QMSIMCFG` all ERROR; `QCFG=?`/`QNWPREFCFG=?`
    list nothing sub-related). GL's `sub_id` is a QMI-layer thing behind `modem_AT`. Cross-SIM data
