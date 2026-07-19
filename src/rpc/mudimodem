@@ -820,4 +820,33 @@ function M.at_console(args)
   return result
 end
 
+-- ======================= Phase: AT library sync (check/refresh) ==============
+-- library_status / refresh_library spawn mudimodem-lib (a separate tool; see
+-- reference) with a fixed literal mode arg ("check"/"refresh") — no user input
+-- reaches the shell, so no injection concern. Neither touches ubus, so no
+-- cosocket concern with the pcall(cjson.decode, ...) below (§8: never pcall a
+-- ubus call; cjson.decode is a plain C function, can't yield, pcall is safe).
+local LIB_TOOL = os.getenv("MUDIMODEM_LIB_TOOL") or "/usr/lib/mudimodem/mudimodem-lib"
+
+local function run_lib(mode)
+  local q = "'" .. LIB_TOOL:gsub("'", "'\\''") .. "'"
+  local f = io.popen("python3 " .. q .. " " .. mode .. " 2>/dev/null")
+  if not f then return { error = "failed to spawn the library tool" } end
+  local out = f:read("*a") or ""
+  f:close()
+  local ok, obj = pcall(cjson.decode, out)   -- cjson.decode can't yield; pcall is safe (§8)
+  if not ok or type(obj) ~= "table" then
+    return { error = "library tool returned no JSON" }
+  end
+  return obj
+end
+
+function M.library_status(args)
+  return run_lib("check")
+end
+
+function M.refresh_library(args)
+  return run_lib("refresh")
+end
+
 return M
