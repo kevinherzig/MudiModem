@@ -107,8 +107,11 @@ const SPLIT = {
     { slot: '2', iccid: '89320420000000000002', carrier: 'AT&T', status: 6, apn: 'internet.proximus.be' }
   ] },
   'cellular.networks_status': { networks: [
-    { slot: '1', iccid: '89012601000000000001', dial_status: 0 },
-    { slot: '2', iccid: '89320420000000000002', dial_status: 1 }
+    // Split state: slot 1 selected but DISCONNECTED (status 2); slot 2 CONNECTED
+    // (status 0) and carrying data via failover. status is GL's connection enum
+    // {CONNECTED:0, CONNECTING:1, DISCONNECTED:2}, which is what drives the badge.
+    { slot: '1', iccid: '89012601000000000001', status: 2, dial_status: 0 },
+    { slot: '2', iccid: '89320420000000000002', status: 0, dial_status: 0 }
   ] }
 };
 
@@ -635,23 +638,51 @@ test('lock tab: scan card empty state is honest about SA + disruption', () => {
   assert.match(text, /Scan for cells/);
 });
 
-test('lock tab: scan results sort by carrier (A–Z) then strongest RSRP', () => {
+test('lock tab: scan results float the serving carrier first, then A–Z, then strongest RSRP', () => {
   const component = loadChunk();
-  const vm = makeVm(component, LIVE);
+  const vm = makeVm(component, LIVE);   // active SIM = T-Mobile (slot 1)
   vm.tab = 'lock';
   vm.lockData = JSON.parse(JSON.stringify(LOCKDATA_UNLOCKED));
   vm.scan = { running: false, error: '', ts: 1, towers: [
-    // T-Mobile is stronger overall, but AT&T sorts first (carrier A–Z).
-    { network_type: 'LTE', carrier: 'T-Mobile', pci: 115, freq: 5035, band: 12, cellid: 'TMO1', strength: 4, rsrp: -96 },
-    // Within AT&T, the RSRP value (not the coarse strength bucket) breaks the tie.
+    // AT&T's strongest cell beats every T-Mobile cell on raw RSRP, but T-Mobile is
+    // the serving carrier so its cells float to the top regardless — other
+    // carriers' cells almost never work.
+    { network_type: 'LTE', carrier: 'AT&T', pci: 89, freq: 5330, band: 66, cellid: 'ATT_HI', strength: 4, rsrp: -80 },
     { network_type: 'LTE', carrier: 'AT&T', pci: 4,  freq: 975,  band: 12, cellid: 'ATT_LO', strength: 3, rsrp: -102 },
-    { network_type: 'LTE', carrier: 'AT&T', pci: 89, freq: 5330, band: 66, cellid: 'ATT_HI', strength: 3, rsrp: -91 }
+    // Two T-Mobile cells: the weaker one must still outrank all of AT&T, and
+    // within T-Mobile the stronger RSRP comes first.
+    { network_type: 'LTE', carrier: 'T-Mobile', pci: 115, freq: 5035, band: 12, cellid: 'TMO_LO', strength: 2, rsrp: -108 },
+    { network_type: 'LTE', carrier: 'T-Mobile', pci: 130, freq: 5110, band: 71, cellid: 'TMO_HI', strength: 4, rsrp: -96 }
   ] };
   const text = textOf(component.render.call(vm, h));
-  assert.ok(text.indexOf('ATT_HI') < text.indexOf('TMO1'), 'AT&T group precedes T-Mobile (carrier A–Z)');
+  assert.ok(text.indexOf('TMO_LO') < text.indexOf('ATT_HI'),
+    'serving carrier (T-Mobile) cells float above every other carrier, even a weaker one');
+  assert.ok(text.indexOf('TMO_HI') < text.indexOf('TMO_LO'), 'within the serving carrier, strongest RSRP first');
   assert.ok(text.indexOf('ATT_HI') < text.indexOf('ATT_LO'), 'within a carrier, strongest RSRP first');
   const lockBtns = walk(component.render.call(vm, h)).filter((n) => n.tag === 'button' && textOf(n) === 'Lock');
-  assert.equal(lockBtns.length, 3);
+  assert.equal(lockBtns.length, 4);
+});
+
+test('lock tab: within a carrier, 5G cells float above LTE even when LTE is stronger', () => {
+  const component = loadChunk();
+  const vm = makeVm(component, LIVE);   // active SIM = T-Mobile (slot 1)
+  vm.tab = 'lock';
+  vm.lockData = JSON.parse(JSON.stringify(LOCKDATA_UNLOCKED));
+  vm.scan = { running: false, error: '', ts: 1, towers: [
+    // T-Mobile LTE has the stronger RSRP, but the T-Mobile 5G cell still sorts
+    // first — 5G outranks LTE within the serving carrier.
+    { network_type: 'LTE',  carrier: 'T-Mobile', pci: 115, freq: 5035, band: 12, cellid: 'TMO_LTE', scs: undefined, rsrp: -88 },
+    { network_type: 'NR5G', carrier: 'T-Mobile', pci: 130, freq: 519000, band: 71, cellid: 'TMO_5G', scs: 30, rsrp: -101 },
+    // Non-serving carrier stays below both, and 5G-over-LTE holds there too.
+    { network_type: 'LTE',  carrier: 'AT&T', pci: 4,  freq: 975,  band: 12, cellid: 'ATT_LTE', rsrp: -80 },
+    { network_type: 'NR5G', carrier: 'AT&T', pci: 89, freq: 520000, band: 66, cellid: 'ATT_5G', scs: 30, rsrp: -95 }
+  ] };
+  const text = textOf(component.render.call(vm, h));
+  assert.ok(text.indexOf('TMO_5G') < text.indexOf('TMO_LTE'),
+    'serving-carrier 5G floats above serving-carrier LTE despite weaker RSRP');
+  assert.ok(text.indexOf('TMO_LTE') < text.indexOf('ATT_5G'),
+    'all serving-carrier cells stay above every other carrier');
+  assert.ok(text.indexOf('ATT_5G') < text.indexOf('ATT_LTE'), 'within AT&T, 5G floats above LTE too');
 });
 
 test('lock tab: pending interlock disables Scan and every scan-row Lock button', () => {
@@ -989,6 +1020,38 @@ test('SIM tab renders two slot cards with honest DSDS badges', () => {
   // Roaming honesty on card 2.
   assert.ok(textOf(cards[1]).includes('Proximus BE'));
   assert.ok(textOf(cards[1]).includes('Roaming on AT&T'));
+});
+
+test('SIM tab: "Carrying data" tracks the CONNECTED network, not a dialing retry', () => {
+  // Live capture 2026-07-19: slot 1 (T-Mobile) is the data slot — network
+  // status 0 (CONNECTED), holds the IP + default route. Slot 2 (AT&T) is
+  // DISCONNECTED (status 2) but stuck mid dial-retry (dial_status 1). The badge
+  // must follow the connection status, NOT dial_status — else AT&T, which
+  // carries no data, wrongly shows "Carrying data".
+  const REAL = {
+    'cellular.modems_info': LIVE['cellular.modems_info'],
+    'cellular.modems_status': { modems: [{ bus: 'cpu', current_sim_slot: '1' }] },
+    'cellular.sims_info': { sims: [
+      { slot: '1', bus: 'cpu', iccid: '89012601000000000001', mcc: '310', mnc: '260' },
+      { slot: '2', bus: 'cpu', iccid: '89320420000000000002', mcc: '310', mnc: '410' }
+    ] },
+    'cellular.sims_status': { sims: [
+      { slot: '1', carrier: 'T-Mobile', status: 6 },
+      { slot: '2', carrier: 'AT&T', status: 6 }
+    ] },
+    'cellular.networks_status': { networks: [
+      { slot: '1', status: 0, dial_status: 0 },   // CONNECTED — the real data slot
+      { slot: '2', status: 2, dial_status: 1 }    // DISCONNECTED, retrying to dial
+    ] }
+  };
+  const comp = loadChunk();
+  const vm = makeVm(comp, REAL);
+  vm.tab = 'sim';
+  const cards = walk(comp.render.call(vm, h))
+    .filter((n) => /mm-slot\b/.test(n.data.staticClass || ''));
+  assert.equal(cards.length, 2);
+  assert.ok(textOf(cards[0]).includes('Carrying data'), 'connected slot 1 (T-Mobile) carries data');
+  assert.ok(!textOf(cards[1]).includes('Carrying data'), 'disconnected slot 2 (AT&T) must NOT show carrying data');
 });
 
 test('SIM tab shows full identifiers by default, hides them on toggle', () => {

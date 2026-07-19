@@ -174,7 +174,12 @@ module.exports = {
         return {
           slot: slot,
           selected: String(self.activeSlot) === String(slot),
-          data: net.dial_status === 1,
+          // "Carrying data" = the network is actually CONNECTED. GL's network
+          // status enum is {CONNECTED:0, CONNECTING:1, DISCONNECTED:2,
+          // CONNECTION_FAILED:3}. dial_status is NOT this: dial_status===1 is a
+          // transient "dialing" retry that a DISCONNECTED slot shows while it
+          // keeps trying — using it painted a stalled AT&T slot as the data slot.
+          data: net.status === 0,
           reg: st.status,
           // A SIM is PRESENT per GL's own status codes (5 searching / 6 registered).
           // status 0 = No SIM: the modem may still report a stale/garbage iccid
@@ -1513,13 +1518,28 @@ module.exports = {
         body = h("div", { staticClass: "mm-empty" },
           "Scanning... the modem is offline until this finishes (up to ~10 minutes). Watch the strip.");
       } else if (this.scan.towers.length) {
-        // Group by carrier (A–Z), then strongest RSRP within each carrier; cells
-        // with no RSRP sink to the bottom of their group. Carrier key mirrors the
-        // row's own display fallback (carrier name, else mcc-mnc).
+        // Our serving carrier's cells float to the very top — those are the ones
+        // that can actually work; other carriers' cells almost never will. Match
+        // on the serving network NAME (roaming-aware; from sim status) with an
+        // MCC+MNC fallback against the active SIM's home PLMN.
+        var servingC = this.servingCarrier;
+        var simMcc = this.activeSim.mcc, simMnc = this.activeSim.mnc;
+        var isOurs = function (t) {
+          if (servingC && t.carrier && self.nameOverlap(servingC, t.carrier)) return true;
+          return !!simMcc && String(t.mcc) === String(simMcc) && String(t.mnc) === String(simMnc);
+        };
+        // Then 5G above LTE, then group by carrier (A–Z), then strongest RSRP;
+        // cells with no RSRP sink to the bottom of their group. Carrier key
+        // mirrors the row's own display fallback (carrier name, else mcc-mnc).
         var ckey = function (t) {
           return (t.carrier || ((t.mcc || "") + "-" + (t.mnc || ""))).toLowerCase();
         };
+        var is5g = function (t) { return /5G/.test(t.network_type || "") ? 0 : 1; };
         var sorted = this.scan.towers.slice().sort(function (a, b) {
+          var oa = isOurs(a) ? 0 : 1, ob = isOurs(b) ? 0 : 1;
+          if (oa !== ob) return oa - ob;   // serving carrier first
+          var ra = is5g(a), rb = is5g(b);
+          if (ra !== rb) return ra - rb;   // 5G above LTE
           var ca = ckey(a), cb = ckey(b);
           if (ca !== cb) return ca < cb ? -1 : 1;
           if (a.rsrp === undefined && b.rsrp === undefined) return 0;
@@ -1573,7 +1593,7 @@ module.exports = {
             ])
           : h("div", { staticClass: "mm-foot" }, [
               h("span", { staticClass: "mm-hint" }, "Find every cell in range, with lockable details."),
-              h("button", { staticClass: "mm-btn",
+              h("button", { staticClass: "mm-btn primary",
                 attrs: { disabled: !!this.pending || this.lockBusy },
                 on: { click: function () { self.scanConfirm = true; } } }, "Scan for cells")
             ]);
@@ -1696,8 +1716,8 @@ module.exports = {
     // ---- tabs ----
     // "tracking" is an in-page tab like the rest — the strip + tab bar stay put;
     // its graph chunk is lazy-loaded into the panel on first open.
-    var TABS = [["tracking", "Tracking"], ["bands", "Bands"], ["lock", "Cell lock"],
-      ["at", "AT console"], ["sim", "SIM"]];
+    var TABS = [["tracking", "Tracking"], ["sim", "SIM"], ["lock", "Cell lock"],
+      ["bands", "Bands"], ["at", "AT console"]];
     var tabs = h("div", { staticClass: "mm-tabs" }, TABS.map(function (t) {
       return h("button", {
         key: t[0], staticClass: "mm-tab" + (self.tab === t[0] ? " on" : ""),
