@@ -52,9 +52,10 @@ def fetch(url, max_time):
 def local_revision():
     try:
         with gzip.open(cache_path(), "rb") as f:
-            return json.loads(f.read().decode()).get("revision", "unknown")
-    except (OSError, ValueError):
-        return "unknown"
+            data = json.loads(f.read().decode())
+        return data.get("revision", "unknown") if isinstance(data, dict) else "unknown"
+    except Exception:
+        return "unknown"   # status display is best-effort — never crash the check
 
 
 def is_e5800():
@@ -71,10 +72,14 @@ def cmd_check():
     out = {"local_revision": local_revision(), "remote_revision": None,
            "update_available": False, "checked": False}
     try:
-        remote = json.loads(fetch(base_url() + "/version.json", 8).decode()).get("revision")
-        out["remote_revision"] = remote
-        out["checked"] = True
-        out["update_available"] = bool(remote) and remote != out["local_revision"]
+        obj = json.loads(fetch(base_url() + "/version.json", 8).decode())
+        remote = obj.get("revision") if isinstance(obj, dict) else None
+        if not remote:
+            out["error"] = "remote version.json malformed"
+        else:
+            out["remote_revision"] = remote
+            out["checked"] = True
+            out["update_available"] = remote != out["local_revision"]
     except (RuntimeError, ValueError) as e:
         out["error"] = str(e)
     return out
@@ -88,7 +93,8 @@ def cmd_refresh():
     except (RuntimeError, ValueError) as e:
         return {"ok": False, "error": "fetch failed: %s" % e}
     if not (isinstance(data, dict) and isinstance(data.get("entries"), list)
-            and data["entries"] and data.get("revision")):
+            and data["entries"] and data.get("revision")
+            and data.get("version") is not None):
         return {"ok": False, "error": "fetched library failed sanity check"}
     path = cache_path()
     d = os.path.dirname(path) or "."
@@ -98,6 +104,7 @@ def cmd_refresh():
         fd, tmp = tempfile.mkstemp(dir=d, suffix=".gz.tmp")
         with os.fdopen(fd, "wb") as f, gzip.GzipFile(fileobj=f, mode="wb", mtime=0) as gz:
             gz.write(json.dumps(data, separators=(",", ":")).encode())
+        os.chmod(tmp, 0o644)
         os.replace(tmp, path)
     except OSError as e:
         if tmp:

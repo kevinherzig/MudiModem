@@ -86,6 +86,45 @@ class LibToolTest(unittest.TestCase):
         # dev box has no /proc/device-tree/model -> not E5800 -> refuse
         self.assertFalse(r["ok"]); self.assertIn("E5800", r["error"])
 
+    def test_check_malformed_remote_fail_silent(self):
+        write_cache(self.cache, "abc123")
+        os.makedirs(self.url, exist_ok=True)
+        with open(os.path.join(self.url, "version.json"), "w") as f:
+            f.write("[]")                       # valid JSON, wrong shape
+        rc, r = run("check", self.url, self.cache)
+        self.assertFalse(r["checked"]); self.assertFalse(r["update_available"])
+        self.assertIn("error", r); self.assertEqual(r["local_revision"], "abc123")
+
+    def test_check_truncated_local_cache_is_unknown(self):
+        with open(self.cache, "wb") as f:
+            f.write(b"\x1f\x8b\x08\x00broken-not-a-real-gzip")   # truncated gz
+        write_remote(self.url, "new222")
+        rc, r = run("check", self.url, self.cache)
+        self.assertEqual(r["local_revision"], "unknown")         # must not crash
+        self.assertTrue(r["update_available"])
+
+    def test_refresh_missing_version_rejected(self):
+        os.makedirs(self.url, exist_ok=True)
+        with open(os.path.join(self.url, "at-library.json"), "w") as f:
+            json.dump({"revision": "x", "entries": [{"id": "e"}]}, f)   # no "version"
+        rc, r = run("refresh", self.url, self.cache)
+        self.assertFalse(r["ok"]); self.assertIn("sanity", r["error"])
+
+    def test_refresh_keeps_cache_world_readable(self):
+        write_remote(self.url, "fresh9", n=2)
+        rc, r = run("refresh", self.url, self.cache)
+        self.assertTrue(r["ok"])
+        mode = os.stat(self.cache).st_mode & 0o777
+        self.assertEqual(mode & 0o044, 0o044, "cache must stay group/other-readable, got %o" % mode)
+
+    def test_refresh_rejects_oversized(self):
+        os.makedirs(self.url, exist_ok=True)
+        big = {"version": 1, "revision": "big1", "entries": [{"id": "e", "pad": "x" * (1 << 21)}]}
+        with open(os.path.join(self.url, "at-library.json"), "w") as f:
+            json.dump(big, f)                   # > 1 MiB
+        rc, r = run("refresh", self.url, self.cache)
+        self.assertFalse(r["ok"]); self.assertIn("large", r["error"])
+
 
 if __name__ == "__main__":
     unittest.main()
