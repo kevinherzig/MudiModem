@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""MudiModem community-library check/refresh. Pulls the library from the external
+repo (kevinherzig/mudi7-at-library) to the local cache. MANUAL only — invoked by
+the backend (library_status/refresh_library), never by cron.
+
+Modes:
+  mudimodem-lib check    -> JSON {local_revision, remote_revision, update_available, checked, error?}
+  mudimodem-lib refresh  -> JSON {ok, revision, count, error?}
+
+CPython stdlib only. curl handles TLS (proven on the box; system CA bundle).
+Env overrides (tests/forks):
+  MUDIMODEM_LIB_URL          base raw dir URL (default = pinned official repo)
+  MUDIMODEM_CACHE            cache .gz path (default /www/mudimodem/at-library.json.gz)
+  MUDIMODEM_CURL             curl binary (default 'curl')
+  MUDIMODEM_SKIP_MODEL_GUARD '1' to bypass the E5800 write guard (tests only)
+"""
+import gzip, json, os, subprocess, sys, tempfile
+
+DEFAULT_URL = "https://raw.githubusercontent.com/kevinherzig/mudi7-at-library/main/dist"
+DEFAULT_CACHE = "/www/mudimodem/at-library.json.gz"
+MAX_BYTES = 1 << 20   # 1 MiB sanity cap
+
+
+def base_url():
+    env = os.getenv("MUDIMODEM_LIB_URL")
+    if env:
+        return env.rstrip("/")
+    try:
+        with open("/etc/mudimodem/library-url") as f:
+            u = f.read().strip()
+            if u:
+                return u.rstrip("/")
+    except OSError:
+        pass
+    return DEFAULT_URL
+
+
+def cache_path():
+    return os.getenv("MUDIMODEM_CACHE", DEFAULT_CACHE)
+
+
+def fetch(url, max_time):
+    p = subprocess.run([os.getenv("MUDIMODEM_CURL", "curl"), "-fsS",
+                        "--max-time", str(max_time), url], capture_output=True)
+    if p.returncode != 0:
+        raise RuntimeError(p.stderr.decode(errors="replace").strip() or ("curl exit %d" % p.returncode))
+    if len(p.stdout) > MAX_BYTES:
+        raise RuntimeError("response too large")
+    return p.stdout
+
+
+def local_revision():
+    try:
+        with gzip.open(cache_path(), "rb") as f:
+            return json.loads(f.read().decode()).get("revision", "unknown")
+    except (OSError, ValueError):
+        return "unknown"
+
+
+def is_e5800():
+    if os.getenv("MUDIMODEM_SKIP_MODEL_GUARD") == "1":
+        return True
+    try:
+        with open("/proc/device-tree/model") as f:
+            return "E5800" in f.read()
+    except OSError:
+        return False
+
+
+def cmd_check():
+    out = {"local_revision": local_revision(), "remote_revision": None,
+           "update_available": False, "checked": False}
+    try:
+        remote = json.loads(fetch(base_url() + "/version.json", 8).decode()).get("revision")
+        out["remote_revision"] = remote
+        out["checked"] = True
+        out["update_available"] = bool(remote) and remote != out["local_revision"]
+    except (RuntimeError, ValueError) as e:
+        out["error"] = str(e)
+    return out
+
+
+def cmd_refresh():
+    if not is_e5800():
+        return {"ok": False, "error": "refusing: not a GL-E5800"}
+    try:
+        data = json.loads(fetch(base_url() + "/at-library.json", 20).decode())
+    except (RuntimeError, ValueError) as e:
+        return {"ok": False, "error": "fetch failed: %s" % e}
+    if not (isinstance(data, dict) and isinstance(data.get("entries"), list)
+            and data["entries"] and data.get("revision")):
+        return {"ok": False, "error": "fetched library failed sanity check"}
+    path = cache_path()
+    d = os.path.dirname(path) or "."
+    tmp = None
+    try:
+        os.makedirs(d, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=d, suffix=".gz.tmp")
+        with os.fdopen(fd, "wb") as f, gzip.GzipFile(fileobj=f, mode="wb", mtime=0) as gz:
+            gz.write(json.dumps(data, separators=(",", ":")).encode())
+        os.replace(tmp, path)
+    except OSError as e:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        return {"ok": False, "error": "write failed: %s" % e}
+    return {"ok": True, "revision": data["revision"], "count": len(data["entries"])}
+
+
+def main(argv):
+    mode = argv[0] if argv else ""
+    if mode == "check":
+        print(json.dumps(cmd_check()))
+        return 0
+    if mode == "refresh":
+        r = cmd_refresh()
+        print(json.dumps(r))
+        return 0 if r.get("ok") else 1
+    print(json.dumps({"error": "usage: mudimodem-lib check|refresh"}))
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
