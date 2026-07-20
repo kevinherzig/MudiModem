@@ -42,6 +42,11 @@ ssh -o BatchMode=yes "root@$HOST" 'mkdir -p /usr/lib/mudimodem && cat > /usr/lib
   < tools/mudimodem-lib
 echo "library check/refresh tool deployed"
 
+# Phase 5: installed-version marker, read by mudimodem.app_version.
+ssh -o BatchMode=yes "root@$HOST" 'mkdir -p /etc/mudimodem && cat > /etc/mudimodem/version.json' \
+  < version.json
+echo "version.json deployed (/etc/mudimodem/version.json)"
+
 # Confirm-or-revert watchdog + panic restore (§5). Inert until invoked; install
 # it BEFORE the backend so set_bands can always find it.
 if [ -f src/sbin/mudimodem-revert ]; then
@@ -101,6 +106,7 @@ ssh -o BatchMode=yes "root@$HOST" 'f=/etc/sysupgrade.conf; touch "$f"; for p in 
   /usr/lib/mudimodem/mudimodem-at.py \
   /usr/share/gl-validator.d/mudimodem.lua \
   /usr/lib/mudimodem/mudimodem-lib \
+  /etc/mudimodem/version.json \
   ; do \
   grep -qxF "$p" "$f" || echo "$p" >> "$f" ; done'
 echo "sysupgrade.conf registered"

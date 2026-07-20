@@ -849,4 +849,54 @@ function M.refresh_library(args)
   return run_lib("refresh")
 end
 
+-- ======================= Phase 5: MudiModem version check ====================
+-- app_version reads the installed version from a local file and the latest from
+-- version.json on GitHub main. No ubus here (a plain file read + a curl
+-- subprocess), so pcall(cjson.decode, ...) is safe (§8: pcall is only unsafe
+-- around a ubus cosocket call). The URL is a fixed constant — no RPC arg reaches
+-- the shell. Fail-silent: any network/parse failure sets error + checked=false.
+local VERSION_FILE = os.getenv("MUDIMODEM_VERSION_FILE") or "/etc/mudimodem/version.json"
+local VERSION_URL  = os.getenv("MUDIMODEM_VERSION_URL")
+  or "https://raw.githubusercontent.com/kevinherzig/MudiModem/main/version.json"
+local CURL         = os.getenv("MUDIMODEM_CURL") or "curl"
+
+local function read_version_file()
+  local f = io.open(VERSION_FILE, "r")
+  if not f then return "unknown" end
+  local s = f:read("*a") or ""
+  f:close()
+  local ok, obj = pcall(cjson.decode, s)   -- cjson.decode can't yield; pcall safe (§8)
+  if ok and type(obj) == "table" and obj.version then return tostring(obj.version) end
+  return "unknown"
+end
+
+function M.app_version(args)
+  local out = { installed = read_version_file(), latest = nil,
+                update_available = false, checked = false }
+  -- Fixed URL, shell-escaped defensively even though it never contains user input.
+  local q = "'" .. VERSION_URL:gsub("'", "'\\''") .. "'"
+  local f = io.popen(CURL .. " -fsS --max-time 8 " .. q .. " 2>/dev/null")
+  if not f then out.error = "curl spawn failed"; return out end
+  local body = f:read("*a") or ""
+  f:close()
+  local ok, obj = pcall(cjson.decode, body)
+  if not ok or type(obj) ~= "table" or not obj.version then
+    out.error = "remote version.json unreachable or malformed"
+    return out
+  end
+  out.latest = tostring(obj.version)
+  out.checked = true
+  out.update_available = (out.latest ~= out.installed)
+  return out
+end
+
+-- device_info: model + CPU for the Config tab. The browser-facing `system` rpc
+-- object has no `board` method, so we read it server-side via ubus (through
+-- ucall — never pcall, per §8).
+function M.device_info(args)
+  local r = ucall("system", "board", {})
+  if type(r) ~= "table" then return { model = "", cpu = "" } end
+  return { model = r.model or "", cpu = r.system or "" }
+end
+
 return M
