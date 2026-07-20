@@ -1450,3 +1450,121 @@ test('cell tab recovery note warns that remote sessions may drop', () => {
   assert.ok(/Remote sessions/.test(txt), 'names the remote-session hazard');
   assert.ok(/reconnects on its own/.test(txt), 'reassures it self-heals');
 });
+
+test('config tab renders device info from the store + system.board', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, LIVE);           // modem name RG650V-NA is in modems_info
+  vm.tab = 'config';
+  vm.deviceInfo = { model: 'GL.iNet GL-E5800', cpu: 'ARMv8 Processor rev 4' };
+  vm.appVer = { installed: '1.0.0', latest: null, update_available: false, checked: false };
+  const txt = textOf(c.render.call(vm, h));
+  assert.match(txt, /GL-E5800/, 'shows the device model');
+  assert.match(txt, /ARMv8/, 'shows the CPU');
+  assert.match(txt, /RG650V-NA/, 'shows the modem type from modems_info');
+});
+
+test('config tab shows installed version alone when up to date / not yet checked', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, LIVE);
+  vm.tab = 'config';
+  vm.appVer = { installed: '1.0.0', latest: '1.0.0', update_available: false, checked: true };
+  const txt = textOf(c.render.call(vm, h));
+  assert.match(txt, /MudiModem v1\.0\.0/, 'shows installed version');
+  assert.doesNotMatch(txt, /available/, 'no update clause when up to date');
+});
+
+test('config tab shows the update-available clause + Update now', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, LIVE);
+  vm.tab = 'config';
+  vm.appVer = { installed: '1.0.0', latest: '1.0.2', update_available: true, checked: true };
+  const txt = textOf(c.render.call(vm, h));
+  assert.match(txt, /MudiModem v1\.0\.0/, 'installed version');
+  assert.match(txt, /1\.0\.2 available/, 'latest version clause');
+  assert.match(txt, /Update now/, 'offers the update action');
+});
+
+test('config tab: failed version check shows installed only (fail-silent)', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, LIVE);
+  vm.tab = 'config';
+  vm.appVer = { installed: '1.0.0', latest: null, update_available: false, checked: false, error: 'offline' };
+  const txt = textOf(c.render.call(vm, h));
+  assert.match(txt, /MudiModem v1\.0\.0/, 'still shows installed');
+  assert.doesNotMatch(txt, /available/, 'no update clause on failed check');
+  assert.doesNotMatch(txt, /offline/, 'never surfaces the error text');
+});
+
+test('config tab: Update now arms a confirm step before calling self_update', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, LIVE);
+  vm.tab = 'config';
+  vm.appVer = { installed: '1.0.0', latest: '1.0.2', update_available: true, checked: true };
+  // First click arms confirm — no RPC yet.
+  vm.armUpdate();
+  assert.strictEqual(vm.updateConfirm, true, 'first click arms confirm');
+  const txt = textOf(c.render.call(vm, h));
+  assert.match(txt, /confirm/i, 'shows the confirm affordance');
+});
+
+// --- Config tab fix wave: pollUpdate teardown, poll cap, device_info retry --
+
+test('pollUpdate: a request already in flight when the component tears down does not reschedule', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const calls = stubRpc([{ ok: true }, {}]);   // self_update ok, then update_status: still running
+  try {
+    const c = loadChunk();
+    const vm = makeVm(c, LIVE);
+    await vm.confirmUpdate();                   // resolves self_update, schedules the first poll
+    assert.equal(calls.length, 1, 'only self_update so far');
+
+    t.mock.timers.tick(3000);                    // fires the poll timer -> issues update_status
+    assert.equal(calls.length, 2, 'the in-flight update_status call was made');
+
+    // Torn down WHILE that request is in flight — before its .then runs.
+    c.beforeDestroy.call(vm);
+    assert.equal(vm.pollStopped, true);
+
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    assert.equal(calls.length, 2, 'the in-flight continuation must not reschedule another call');
+
+    t.mock.timers.tick(3000);                    // nothing was scheduled — confirm no new timer fired
+    assert.equal(calls.length, 2, 'no further update_status calls after teardown');
+  } finally { unstubRpc(); }
+});
+
+test('pollUpdate: gives up after POLL_MAX attempts with a clear message', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const calls = stubRpc([{ ok: true }, {}]);   // self_update ok, then update_status: still running
+  try {
+    const vm = makeVm(loadChunk(), LIVE);
+    vm.POLL_MAX = 1;                             // reach the cap on the very first poll
+    await vm.confirmUpdate();
+    t.mock.timers.tick(3000);
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    assert.equal(vm.updating, false, 'stops the spinner');
+    assert.match(vm.updateMsg, /taking longer than expected/, 'gives up with a clear message');
+    assert.equal(calls.length, 2, 'self_update + exactly one poll — no further reschedule past the cap');
+  } finally { unstubRpc(); }
+});
+
+test('config tab: device_info retries on a later tab open after a first failure', async () => {
+  const c = loadChunk();
+  const calls = stubRpc([
+    new Error('boom'), {},                                                     // 1st open: fails
+    { model: 'GL.iNet GL-E5800', cpu: 'ARMv8 Processor rev 4' }, {}            // 2nd open: succeeds
+  ]);
+  try {
+    const vm = makeVm(c, LIVE);
+    c.watch.tab.call(vm, 'config');              // 1st open
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    assert.equal(vm.deviceInfo, null, 'still null after the failed fetch — not retried yet');
+
+    c.watch.tab.call(vm, 'config');              // 2nd open — must retry since deviceInfo is still null
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    assert.ok(vm.deviceInfo && /GL-E5800/.test(vm.deviceInfo.model), 'retried and got the device info');
+
+    const deviceCalls = calls.filter((x) => x.params[2] === 'device_info');
+    assert.equal(deviceCalls.length, 2, 'fetchDeviceInfo was called on both tab opens');
+  } finally { unstubRpc(); }
+});
