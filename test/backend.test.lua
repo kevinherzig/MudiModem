@@ -14,12 +14,17 @@ package.loaded["oui.ubus"] = {
 local M = dofile(os.getenv("MM_PLUGIN") or "/usr/lib/oui-httpd/rpc/mudimodem")
 assert(type(M) == "table", "plugin must return a table")
 assert(type(M.get_bands) == "function", "get_bands missing")
+assert(type(M.app_version) == "function", "app_version missing")
+assert(type(M.device_info) == "function", "device_info missing")
+assert(type(M.self_update) == "function", "self_update missing")
+assert(type(M.update_status) == "function", "update_status missing")
 
 -- Every function in the returned table becomes a callable RPC method; only the
 -- known surface may be exposed (writes are limited to the watchdog-protected pair).
 local ALLOWED = { get_bands = true, set_bands = true, confirm = true, revert_now = true, get_history = true, at_console = true,
                   get_lock = true, set_cell_lock = true, clear_cell_lock = true, scan_cells = true,
-                  library_status = true, refresh_library = true }
+                  library_status = true, refresh_library = true,
+                  app_version = true, device_info = true, self_update = true, update_status = true }
 for k, v in pairs(M) do
   if type(v) == "function" then
     assert(ALLOWED[k], "unexpected RPC method exposed: " .. k)

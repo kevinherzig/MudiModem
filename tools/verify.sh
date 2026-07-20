@@ -206,4 +206,27 @@ else
   echo "9b. SKIPPED — set MM_PW=<admin-password> to run the /rpc round-trip"
 fi
 
+# 10. Phase 5: Config tab / version check / self-update.
+echo "10. Phase 5: version check + self-update"
+ssh -o BatchMode=yes "root@$HOST" 'test -s /etc/mudimodem/version.json' \
+  || fail "version.json not installed (run ./tools/deploy.sh)"
+ssh -o BatchMode=yes "root@$HOST" 'test -x /usr/sbin/mudimodem-selfupdate' \
+  || fail "self-update script not installed"
+ssh -o BatchMode=yes "root@$HOST" 'grep -q "function M.app_version" /usr/lib/oui-httpd/rpc/mudimodem && grep -q "function M.device_info" /usr/lib/oui-httpd/rpc/mudimodem && grep -q "function M.self_update" /usr/lib/oui-httpd/rpc/mudimodem && grep -q "function M.update_status" /usr/lib/oui-httpd/rpc/mudimodem' \
+  || fail "backend missing app_version/device_info/self_update/update_status"
+
+echo "10a. app_version isolation test (offline, fake curl)"
+ssh -o BatchMode=yes "root@$HOST" 'cat > /tmp/mm-ver.test.lua' < test/backend-version.test.lua
+ssh -o BatchMode=yes "root@$HOST" 'MM_TMP=/tmp/mm-ver-test MUDIMODEM_VERSION_FILE=/tmp/mm-ver-test/local.json MUDIMODEM_CURL=/tmp/mm-ver-test/curl.sh lua /tmp/mm-ver.test.lua; rc=$?; rm -rf /tmp/mm-ver.test.lua /tmp/mm-ver-test; exit $rc' \
+  || fail "app_version isolation test failed"
+
+echo "10b. self-update script isolation test (no real install)"
+ssh -o BatchMode=yes "root@$HOST" 'cat > /tmp/mm-su.test.sh' < test/selfupdate.test.sh
+ssh -o BatchMode=yes "root@$HOST" 'sh /tmp/mm-su.test.sh /usr/sbin/mudimodem-selfupdate; rc=$?; rm -f /tmp/mm-su.test.sh; exit $rc' \
+  || fail "self-update isolation test failed"
+
+echo "10c. app_version answers over /rpc (real network; fail-silent tolerated)"
+ssh -o BatchMode=yes "root@$HOST" 'lua -e '\''package.loaded["oui.ubus"]={call=function()end}; local M=dofile("/usr/lib/oui-httpd/rpc/mudimodem"); local r=M.app_version({}); assert(type(r)=="table" and r.installed~=nil, "app_version shape"); print("app_version live shape OK: installed="..tostring(r.installed).." checked="..tostring(r.checked))'\''' \
+  || fail "app_version live shape check failed"
+
 echo "ALL CHECKS PASSED"
