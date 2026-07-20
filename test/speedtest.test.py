@@ -142,6 +142,7 @@ class MainEndToEnd(unittest.TestCase):
     def tearDown(self):
         self.server.shutdown()
         self.thread.join(timeout=2)
+        self.server.server_close()
 
     def _base(self):
         return "http://127.0.0.1:%d" % self.port
