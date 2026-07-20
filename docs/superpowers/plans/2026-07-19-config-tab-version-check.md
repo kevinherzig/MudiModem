@@ -69,6 +69,15 @@ If it does NOT expose those fields (or `system` object isn't web-callable throug
 
 Write one line under this task: `DECISION: <system.board | device_info fallback> — <fields observed>`.
 
+**DECISION (2026-07-19): `device_info` fallback.** The browser-facing `system` oui-httpd rpc object
+(a Lua plugin) exposes `get_info`/`get_status`/… but **no `board` method** — `board` is only
+reachable via ubus from a shell, not through `/rpc`/`$rpcRequest`. And `/proc/cpuinfo` on this
+aarch64 box has no `model name`/`Hardware`/`Processor` line (only `CPU part`/`CPU implementer`), so
+the readable CPU string must come from `ubus call system board` (`.system` = `"ARMv8 Processor rev 0"`;
+`.model` = `"GL.iNet E5800, Qualcomm Technologies, Inc. SDXPINN IDP MBB"`). Therefore `device_info`
+is implemented as a **server-side ubus `system board` call** (Task 2), and Task 4's `fetchDeviceInfo`
+calls `mudimodem.device_info` (reading `r.model`/`r.cpu`), not `system.board`.
+
 - [ ] **Step 3: Commit the decision note**
 
 ```bash
@@ -88,7 +97,9 @@ git commit -m "docs(plan): record system.board probe decision for Config tab"
 - Test: `test/backend-version.test.lua` (new)
 
 **Interfaces:**
-- Produces: `mudimodem.app_version(args) → { installed, latest, update_available, checked, error? }` where `installed`/`latest` are strings (or `installed="unknown"`), `update_available`/`checked` are booleans, `error` is a string present only on failure. Consumed by the frontend in Task 4 and asserted in Task 5's ALLOWED list.
+- Produces:
+  - `mudimodem.app_version(args) → { installed, latest, update_available, checked, error? }` where `installed`/`latest` are strings (or `installed="unknown"`), `update_available`/`checked` are booleans, `error` is a string present only on failure. Consumed by the frontend in Task 4 and asserted in Task 5's ALLOWED list.
+  - `mudimodem.device_info(args) → { model, cpu }` (both strings, `""` on failure) via a server-side ubus `system board` call (per Task 1's decision). Consumed by Task 4's `fetchDeviceInfo`; added to Task 5's ALLOWED list.
 
 - [ ] **Step 1: Create `version.json`**
 
@@ -102,11 +113,17 @@ Create `version.json` at the repo root:
 Create `test/backend-version.test.lua`. It stubs `oui.ubus` (the plugin `require`s it at load), points the version-file and curl at test doubles, and asserts each branch. `MUDIMODEM_CURL` is set to a wrapper script the test writes, which ignores its args and prints a fixture — so no network is touched.
 
 ```lua
--- On-device isolation test for mudimodem.app_version.
--- dofiles the REAL plugin with oui.ubus shimmed (app_version uses no ubus, but
--- the plugin requires it at load). Overrides VERSION_FILE + CURL via env so the
--- check is deterministic and offline. Run by verify.sh. Exit 0 = pass.
-package.loaded["oui.ubus"] = { call = function() return nil, "unused" end }
+-- On-device isolation test for mudimodem.app_version + device_info.
+-- dofiles the REAL plugin with oui.ubus shimmed (app_version uses no ubus;
+-- device_info calls ubus system board, which the shim answers). Overrides
+-- VERSION_FILE + CURL via env so the check is deterministic and offline.
+-- Run by verify.sh. Exit 0 = pass.
+package.loaded["oui.ubus"] = { call = function(obj, method)
+  if obj == "system" and method == "board" then
+    return { model = "GL.iNet E5800 TEST", system = "ARMv8 TEST" }
+  end
+  return nil, "unused"
+end }
 
 local TMP = os.getenv("MM_TMP") or "/tmp/mm-ver-test"
 os.execute("rm -rf " .. TMP .. "; mkdir -p " .. TMP)
@@ -154,6 +171,12 @@ os.remove(os.getenv("MUDIMODEM_VERSION_FILE"))
 writef(TMP .. "/remote.json", '{"version":"1.0.2"}')
 local d = M.app_version({})
 assert(d.installed == "unknown", "D installed unknown: " .. tostring(d.installed))
+
+-- Case E: device_info returns model + cpu from the ubus board shim.
+assert(type(M.device_info) == "function", "device_info missing")
+local dv = M.device_info({})
+assert(dv.model == "GL.iNet E5800 TEST", "E device_info model: " .. tostring(dv.model))
+assert(dv.cpu == "ARMv8 TEST", "E device_info cpu: " .. tostring(dv.cpu))
 
 os.execute("rm -rf " .. TMP)
 print("backend-version OK")
@@ -212,6 +235,16 @@ function M.app_version(args)
   out.checked = true
   out.update_available = (out.latest ~= out.installed)
   return out
+end
+
+-- device_info: model + CPU for the Config tab. The browser-facing `system` rpc
+-- object has no `board` method, so we read it server-side via ubus. This IS a
+-- ubus call — NEVER wrap it in pcall (§8: cosocket yields across the C-call
+-- boundary). ubus.call returns (nil, err) on failure without throwing.
+function M.device_info(args)
+  local r = ubus.call("system", "board", {})
+  if type(r) ~= "table" then return { model = "", cpu = "" } end
+  return { model = r.model or "", cpu = r.system or "" }
 end
 ```
 
@@ -585,7 +618,8 @@ In the `watch.tab(t)` handler (around line 254), add:
 
 - [ ] **Step 7: Add the methods**
 
-In `methods`, add (place near the other fetch methods). If Task 1 chose the `device_info` fallback, change the `fetchDeviceInfo` RPC call to `["sid","mudimodem","device_info",{}]` and read `r.model`/`r.cpu` (same field names).
+In `methods`, add (place near the other fetch methods). Per Task 1's decision, `fetchDeviceInfo`
+calls our own `mudimodem.device_info` (the browser-facing `system` rpc has no `board` method).
 
 ```js
     modemName() {
@@ -594,9 +628,9 @@ In `methods`, add (place near the other fetch methods). If Task 1 chose the `dev
     fetchDeviceInfo() {
       var self = this;
       if (typeof window === "undefined" || !window.$rpcRequest) return Promise.resolve();
-      return window.$rpcRequest("call", ["sid", "system", "board", {}], { timeout: 8000 })
+      return window.$rpcRequest("call", ["sid", "mudimodem", "device_info", {}], { timeout: 8000 })
         .then(function (r) {
-          self.deviceInfo = { model: (r && r.model) || "", cpu: (r && r.system) || "" };
+          self.deviceInfo = { model: (r && r.model) || "", cpu: (r && r.cpu) || "" };
         })
         .catch(function (e) { self.deviceErr = (e && (e.message || e.type)) || "unavailable"; });
     },
@@ -761,11 +795,12 @@ In `test/backend.test.lua`, update the `ALLOWED` table (around line 22) to inclu
 local ALLOWED = { get_bands = true, set_bands = true, confirm = true, revert_now = true, get_history = true, at_console = true,
                   get_lock = true, set_cell_lock = true, clear_cell_lock = true, scan_cells = true,
                   library_status = true, refresh_library = true,
-                  app_version = true, self_update = true, update_status = true }
+                  app_version = true, device_info = true, self_update = true, update_status = true }
 ```
 And after `assert(type(M.get_bands) == "function", "get_bands missing")`:
 ```lua
 assert(type(M.app_version) == "function", "app_version missing")
+assert(type(M.device_info) == "function", "device_info missing")
 assert(type(M.self_update) == "function", "self_update missing")
 assert(type(M.update_status) == "function", "update_status missing")
 ```
@@ -780,8 +815,8 @@ ssh -o BatchMode=yes "root@$HOST" 'test -s /etc/mudimodem/version.json' \
   || fail "version.json not installed (run ./tools/deploy.sh)"
 ssh -o BatchMode=yes "root@$HOST" 'test -x /usr/sbin/mudimodem-selfupdate' \
   || fail "self-update script not installed"
-ssh -o BatchMode=yes "root@$HOST" 'grep -q "function M.app_version" /usr/lib/oui-httpd/rpc/mudimodem && grep -q "function M.self_update" /usr/lib/oui-httpd/rpc/mudimodem && grep -q "function M.update_status" /usr/lib/oui-httpd/rpc/mudimodem' \
-  || fail "backend missing app_version/self_update/update_status"
+ssh -o BatchMode=yes "root@$HOST" 'grep -q "function M.app_version" /usr/lib/oui-httpd/rpc/mudimodem && grep -q "function M.device_info" /usr/lib/oui-httpd/rpc/mudimodem && grep -q "function M.self_update" /usr/lib/oui-httpd/rpc/mudimodem && grep -q "function M.update_status" /usr/lib/oui-httpd/rpc/mudimodem' \
+  || fail "backend missing app_version/device_info/self_update/update_status"
 
 echo "10a. app_version isolation test (offline, fake curl)"
 ssh -o BatchMode=yes "root@$HOST" 'cat > /tmp/mm-ver.test.lua' < test/backend-version.test.lua
