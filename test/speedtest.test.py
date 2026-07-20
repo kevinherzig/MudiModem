@@ -2,6 +2,7 @@
 """Unit tests for tools/mudimodem-speedtest.py's pure parts.
 Run: python3 test/speedtest.test.py"""
 import importlib.util
+import json
 import os
 import unittest
 
@@ -98,6 +99,97 @@ class BuildSnapshot(unittest.TestCase):
 
     def test_no_active_slot_is_empty_dict(self):
         self.assertEqual(st.build_snapshot({"modems": [{}]}, self.NET, self.SIMS), {})
+
+
+import http.server
+import tempfile
+import threading
+from urllib.parse import urlparse, parse_qs
+
+
+class FakeSpeedHandler(http.server.BaseHTTPRequestHandler):
+    """Stands in for speed.cloudflare.com: GET ?bytes=N returns N bytes,
+    POST reads+discards the body. Both return 200 so curl's -w json trailer
+    reports a real (if instant, since it's loopback) transfer."""
+    def do_GET(self):
+        q = parse_qs(urlparse(self.path).query)
+        n = int((q.get("bytes") or ["0"])[0])
+        self.send_response(200)
+        self.send_header("Content-Length", str(n))
+        self.end_headers()
+        if n:
+            self.wfile.write(b"x" * n)
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        self.rfile.read(length)
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *a):
+        pass
+
+
+class MainEndToEnd(unittest.TestCase):
+    def setUp(self):
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), FakeSpeedHandler)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.thread.join(timeout=2)
+
+    def _base(self):
+        return "http://127.0.0.1:%d" % self.port
+
+    def test_happy_path_appends_history_and_writes_done_status(self):
+        hist = os.path.join(self.tmp, "speedtests.jsonl")
+        status = os.path.join(self.tmp, "status.json")
+        lock = os.path.join(self.tmp, "st.lock")
+        rc = st.main(["--device", "lo", "--down-url", self._base(), "--up-url", self._base(),
+                      "--down-bytes", "10000", "--up-bytes", "10000",
+                      "--hist", hist, "--status", status, "--lock", lock,
+                      "--trigger", "manual", "--iface", "cellular"])
+        self.assertEqual(rc, 0)
+        with open(hist) as f:
+            lines = [json.loads(l) for l in f if l.strip()]
+        self.assertEqual(len(lines), 1)
+        r = lines[0]
+        self.assertEqual(r["trigger"], "manual")
+        self.assertEqual(r["iface"], "cellular")
+        self.assertGreater(r["down_mbps"], 0)
+        self.assertGreater(r["up_mbps"], 0)
+        self.assertIsNotNone(r["latency_ms"])
+        with open(status) as f:
+            s = json.load(f)
+        self.assertEqual(s["phase"], "done")
+        self.assertFalse(s["running"])
+
+    def test_lock_busy_refuses_a_second_concurrent_run(self):
+        lock = os.path.join(self.tmp, "busy.lock")
+        held = st.acquire_lock(lock)
+        try:
+            rc = st.main(["--device", "lo", "--down-url", self._base(), "--up-url", self._base(),
+                          "--hist", os.path.join(self.tmp, "h.jsonl"),
+                          "--status", os.path.join(self.tmp, "s.json"), "--lock", lock])
+        finally:
+            held.close()
+        self.assertEqual(rc, 2)
+
+    def test_trims_history_to_max_lines(self):
+        hist = os.path.join(self.tmp, "many.jsonl")
+        with open(hist, "w") as f:
+            for i in range(st.HIST_MAX_LINES + 10):
+                f.write(json.dumps({"t": i}) + "\n")
+        st.append_result(hist, {"t": 999999})
+        with open(hist) as f:
+            lines = [json.loads(l) for l in f if l.strip()]
+        self.assertEqual(len(lines), st.HIST_MAX_LINES)
+        self.assertEqual(lines[-1]["t"], 999999)
 
 
 if __name__ == "__main__":

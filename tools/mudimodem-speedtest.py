@@ -110,5 +110,217 @@ def build_snapshot(modem, net, sims):
     }
 
 
+def ubus_call(obj, method, args=None):
+    """Return the parsed ubus result dict, or None on any failure."""
+    try:
+        cmd = ["ubus", "call", obj, method, json.dumps(args or {})]
+        out = subprocess.run(cmd, capture_output=True, timeout=8, text=True)
+        if out.returncode != 0 or not out.stdout:
+            return None
+        return json.loads(out.stdout)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def resolve_iface(which):
+    return resolve_iface_from_dump(ubus_call("network.interface", "dump"), which)
+
+
+def curl_probe(url, extra_args, timeout):
+    """Run curl, discarding the response body (-o /dev/null), capturing ONLY
+    the -w JSON trailer on stdout. Returns the parsed dict, or None on any
+    failure (process error, timeout, or bad JSON)."""
+    cmd = ["curl", "-s", "-m", str(timeout), "-o", "/dev/null", "-w", "%{json}"] + list(extra_args) + [url]
+    try:
+        out = subprocess.run(cmd, capture_output=True, timeout=timeout + 5)
+    except subprocess.TimeoutExpired:
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        return json.loads(out.stdout.decode(errors="replace"))
+    except ValueError:
+        return None
+
+
+def _ok(probe):
+    return bool(probe) and 200 <= (probe.get("http_code") or 0) < 300
+
+
+def run_download(device, cfg):
+    r = curl_probe(cfg["down_url"], ["--interface", device, "-G", "--data-urlencode",
+                                      "bytes=%d" % cfg["down_bytes"]], cfg["timeout"])
+    return mbps(r.get("speed_download")) if _ok(r) else None
+
+
+def run_upload(device, cfg, upload_path):
+    r = curl_probe(cfg["up_url"], ["--interface", device, "--data-binary", "@" + upload_path], cfg["timeout"])
+    return mbps(r.get("speed_upload")) if _ok(r) else None
+
+
+def run_latency(device, cfg):
+    samples = []
+    for _ in range(LATENCY_N):
+        r = curl_probe(cfg["down_url"], ["--interface", device, "-G", "--data-urlencode", "bytes=0"], cfg["timeout"])
+        if _ok(r):
+            samples.append(r.get("time_starttransfer"))
+    return latency_stats(samples)
+
+
+def acquire_lock(path):
+    """Non-blocking flock. Returns the open file handle (caller must close()
+    to release), or None if another instance already holds it."""
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    f = open(path, "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    return f
+
+
+def write_status(path, obj):
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(json.dumps(obj))
+    os.replace(tmp, path)
+
+
+def trim_history(path, max_lines=HIST_MAX_LINES):
+    try:
+        with open(path) as f:
+            lines = [l for l in f.readlines() if l.strip()]
+    except FileNotFoundError:
+        return
+    if len(lines) <= max_lines:
+        return
+    kept = lines[-max_lines:]
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.writelines(kept)
+    os.replace(tmp, path)
+
+
+def append_result(path, result):
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps(result) + "\n")
+    trim_history(path)
+
+
+def parse_args(argv):
+    """Manual argv parsing (matches mudimodem-at.py's style -- no argparse
+    elsewhere in this codebase). --device is a debug/testing override that
+    skips ubus resolution entirely; the Lua backend and the scheduler daemon
+    never pass it -- only --iface, which is always resolved live."""
+    cfg = {
+        "trigger": "manual", "iface": "cellular", "timeout": 20.0, "device": None,
+        "down_url": DOWN_URL, "up_url": UP_URL,
+        "down_bytes": DOWN_BYTES, "up_bytes": UP_BYTES,
+        "hist": HIST_PATH, "status": STATUS_PATH, "lock": LOCK_PATH,
+    }
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--trigger":
+            i += 1; cfg["trigger"] = argv[i]
+        elif a == "--iface":
+            i += 1; cfg["iface"] = argv[i]
+        elif a == "--device":
+            i += 1; cfg["device"] = argv[i]
+        elif a == "--timeout":
+            i += 1; cfg["timeout"] = float(argv[i])
+        elif a == "--down-url":
+            i += 1; cfg["down_url"] = argv[i]
+        elif a == "--up-url":
+            i += 1; cfg["up_url"] = argv[i]
+        elif a == "--down-bytes":
+            i += 1; cfg["down_bytes"] = int(argv[i])
+        elif a == "--up-bytes":
+            i += 1; cfg["up_bytes"] = int(argv[i])
+        elif a == "--hist":
+            i += 1; cfg["hist"] = argv[i]
+        elif a == "--status":
+            i += 1; cfg["status"] = argv[i]
+        elif a == "--lock":
+            i += 1; cfg["lock"] = argv[i]
+        else:
+            raise SystemExit("unknown arg: %s" % a)
+        i += 1
+    if cfg["iface"] not in ("cellular", "wired"):
+        raise SystemExit("--iface must be 'cellular' or 'wired'")
+    return cfg
+
+
+def main(argv):
+    cfg = parse_args(argv)
+    lock = acquire_lock(cfg["lock"])
+    if lock is None:
+        write_status(cfg["status"], {"running": False, "phase": "error",
+                                      "message": "another test is already running"})
+        return 2
+    try:
+        if cfg["device"]:
+            device, up = cfg["device"], True
+        else:
+            device, up = resolve_iface(cfg["iface"])
+        if not up or not device:
+            write_status(cfg["status"], {"running": False, "phase": "error",
+                                          "message": cfg["iface"] + " is not connected", "iface": cfg["iface"]})
+            return 3
+
+        snapshot = build_snapshot(ubus_call("cellular.modem", "status"),
+                                   ubus_call("cellular.network", "info"),
+                                   ubus_call("cellular.sim", "status"))
+
+        write_status(cfg["status"], {"running": True, "phase": "download", "iface": cfg["iface"]})
+        down = run_download(device, cfg)
+        if down is None:
+            write_status(cfg["status"], {"running": False, "phase": "error",
+                                          "message": "download failed", "iface": cfg["iface"]})
+            return 4
+
+        write_status(cfg["status"], {"running": True, "phase": "upload", "iface": cfg["iface"]})
+        upload_path = tempfile.mktemp(prefix="mudimodem-st-")
+        with open(upload_path, "wb") as f:
+            f.write(os.urandom(cfg["up_bytes"]))
+        try:
+            up_mbps = run_upload(device, cfg, upload_path)
+        finally:
+            try:
+                os.remove(upload_path)
+            except OSError:
+                pass
+        if up_mbps is None:
+            write_status(cfg["status"], {"running": False, "phase": "error",
+                                          "message": "upload failed", "iface": cfg["iface"]})
+            return 4
+
+        write_status(cfg["status"], {"running": True, "phase": "latency", "iface": cfg["iface"]})
+        latency_ms, jitter_ms = run_latency(device, cfg)
+        if latency_ms is None:
+            write_status(cfg["status"], {"running": False, "phase": "error",
+                                          "message": "latency probe failed", "iface": cfg["iface"]})
+            return 4
+
+        result = {"t": int(time.time() * 1000), "trigger": cfg["trigger"], "iface": cfg["iface"],
+                  "down_mbps": down, "up_mbps": up_mbps,
+                  "latency_ms": latency_ms, "jitter_ms": jitter_ms}
+        result.update(snapshot)
+        append_result(cfg["hist"], result)
+        write_status(cfg["status"], {"running": False, "phase": "done", "result": result})
+        return 0
+    finally:
+        lock.close()
+
+
 if __name__ == "__main__":
-    sys.exit(0)
+    sys.exit(main(sys.argv[1:]))
