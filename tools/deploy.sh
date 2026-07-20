@@ -55,6 +55,15 @@ if [ -f src/sbin/mudimodem-revert ]; then
   echo "watchdog installed (/usr/sbin/mudimodem-revert)"
 fi
 
+# Self-update script (Task 3). Detached, lockdir-guarded; install.sh restarts
+# nginx at the end, so mudimodem.self_update launches this rather than running
+# install.sh in-handler (which would drop the /rpc connection).
+if [ -f src/sbin/mudimodem-selfupdate ]; then
+  ssh -o BatchMode=yes "root@$HOST" 'cat > /usr/sbin/mudimodem-selfupdate && chmod 0755 /usr/sbin/mudimodem-selfupdate' \
+    < src/sbin/mudimodem-selfupdate
+  echo "self-update script installed (/usr/sbin/mudimodem-selfupdate)"
+fi
+
 # Arg validator for the mudimodem object. ⚠️ REQUIRED for the AT console: without
 # it, oui applies a default allowlist that rejects '+', '=', '"' — so every real
 # AT command -32602's before the backend runs (only bare ATI/AT slip through).
@@ -99,6 +108,7 @@ ssh -o BatchMode=yes "root@$HOST" 'f=/etc/sysupgrade.conf; touch "$f"; for p in 
   /usr/share/oui/menu.d/mudimodem-tracking.json \
   /usr/lib/oui-httpd/rpc/mudimodem \
   /usr/sbin/mudimodem-revert \
+  /usr/sbin/mudimodem-selfupdate \
   /usr/sbin/mudimodem-collectd \
   /etc/init.d/mudimodem-collectd \
   /www/views/gl-sdk4-ui-mudimodem-console.common.js.gz \
