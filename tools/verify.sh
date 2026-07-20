@@ -225,7 +225,7 @@ ssh -o BatchMode=yes "root@$HOST" 'cat > /tmp/mm-su.test.sh' < test/selfupdate.t
 ssh -o BatchMode=yes "root@$HOST" 'sh /tmp/mm-su.test.sh /usr/sbin/mudimodem-selfupdate; rc=$?; rm -f /tmp/mm-su.test.sh; exit $rc' \
   || fail "self-update isolation test failed"
 
-echo "10c. app_version answers over /rpc (real network; fail-silent tolerated)"
+echo "10c. app_version live shape (direct dofile call, real network)"
 ssh -o BatchMode=yes "root@$HOST" 'lua -e '\''package.loaded["oui.ubus"]={call=function()end}; local M=dofile("/usr/lib/oui-httpd/rpc/mudimodem"); local r=M.app_version({}); assert(type(r)=="table" and r.installed~=nil, "app_version shape"); print("app_version live shape OK: installed="..tostring(r.installed).." checked="..tostring(r.checked))'\''' \
   || fail "app_version live shape check failed"
 

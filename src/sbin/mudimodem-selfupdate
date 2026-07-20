@@ -15,6 +15,14 @@ RESULT="${MUDIMODEM_UPDATE_RESULT:-/etc/mudimodem/update-result.json}"
 LOG="${MUDIMODEM_UPDATE_LOG:-/var/log/mudimodem-update.log}"
 CMD="${MUDIMODEM_UPDATE_CMD:-curl -fsSL https://raw.githubusercontent.com/kevinherzig/MudiModem/main/install.sh | sh}"
 
+STALE_MIN="${MUDIMODEM_LOCK_STALE_MIN:-10}"
+# A prior run killed by SIGKILL/OOM/power-loss can't fire its EXIT trap, leaving
+# the lockdir behind forever. Reap a lockdir older than STALE_MIN minutes so the
+# feature self-heals instead of wedging (recovery would otherwise need ssh).
+if [ -d "$LOCK" ] && [ -n "$(find "$LOCK" -maxdepth 0 -type d -mmin "+$STALE_MIN" 2>/dev/null)" ]; then
+  rmdir "$LOCK" 2>/dev/null || true
+fi
+
 # Atomic lock: if the dir already exists another update is in flight — no-op.
 if ! mkdir "$LOCK" 2>/dev/null; then
   exit 0

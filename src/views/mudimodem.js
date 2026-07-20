@@ -84,7 +84,6 @@ module.exports = {
       failoverConfirm: false,            // failover Apply would switch slots — confirm first
       // ---- Config tab (Phase 5) ----
       deviceInfo: null,       // { model, cpu } — fetched once via system.board
-      deviceErr: "",
       appVer: null,           // app_version result { installed, latest, update_available, checked, error? }
       updateConfirm: false,   // "Update now" armed, awaiting a second click
       updateConfirmTimer: null,
@@ -627,7 +626,7 @@ module.exports = {
         .then(function (r) {
           self.deviceInfo = { model: (r && r.model) || "", cpu: (r && r.cpu) || "" };
         })
-        .catch(function (e) { self.deviceErr = (e && (e.message || e.type)) || "unavailable"; });
+        .catch(function () { /* fail-silent: next tab-open retries via the !deviceInfo watcher */ });
     },
     checkAppVersion() {
       var self = this;
