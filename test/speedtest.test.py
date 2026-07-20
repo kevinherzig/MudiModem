@@ -239,6 +239,32 @@ class ReadSchedule(unittest.TestCase):
         finally:
             os.remove(path)
 
+    def test_write_last_run_preserves_concurrent_edits(self):
+        """Prove read-modify-write: concurrent edits to enabled/interval_seconds
+        made while a test was running must not be clobbered."""
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            # Start with enabled=true, interval_seconds=3600
+            f.write(json.dumps({"enabled": True, "interval_seconds": 3600, "last_run": 0}))
+            path = f.name
+        try:
+            # Simulate a concurrent edit: the user disables the schedule via the UI
+            # while the test is running
+            with open(path, "w") as f:
+                json.dump({"enabled": False, "interval_seconds": 3600, "last_run": 0}, f)
+
+            # Now write_last_run() is called after the test finishes
+            # It should preserve enabled:false (the concurrent edit), not clobber it back to true
+            now = 999999
+            std.write_last_run(path, now)
+
+            # Verify the result preserves the concurrent edit
+            result = std.read_schedule(path)
+            self.assertFalse(result["enabled"], "enabled should still be False after concurrent edit")
+            self.assertEqual(result["last_run"], now, "last_run should be updated to the new timestamp")
+            self.assertEqual(result["interval_seconds"], 3600, "interval_seconds should be preserved")
+        finally:
+            os.remove(path)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -40,8 +40,11 @@ def read_schedule(path):
     return out
 
 
-def write_last_run(path, cfg, now):
-    cfg = dict(cfg)
+def write_last_run(path, now):
+    """Read-modify-write: update ONLY last_run, preserving whatever enabled/
+    interval_seconds are currently on disk -- a schedule edit made via the UI
+    while a test was running must not be clobbered by this write."""
+    cfg = read_schedule(path)
     cfg["last_run"] = now
     d = os.path.dirname(path)
     if d:
@@ -80,7 +83,7 @@ def main():
             if is_due(cfg, now_ms()):
                 subprocess.run(["python3", SPEEDTEST_BIN, "--trigger", "schedule", "--iface", "cellular"],
                                 timeout=120)
-                write_last_run(SCHEDULE_PATH, cfg, now_ms())
+                write_last_run(SCHEDULE_PATH, now_ms())
         except Exception as e:                        # never die out of the loop
             sys.stderr.write("speedtestd: %s\n" % e)
             sys.stderr.flush()
