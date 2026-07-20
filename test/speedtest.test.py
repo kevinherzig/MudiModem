@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Unit tests for tools/mudimodem-speedtest.py's pure parts.
 Run: python3 test/speedtest.test.py"""
+import importlib.machinery
 import importlib.util
 import json
 import os
+import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -12,12 +14,19 @@ ST_SRC = os.path.join(HERE, "..", "tools", "mudimodem-speedtest.py")
 
 def load(path, name):
     spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None:
+        # Handle files without .py extension (Python 3.13+)
+        loader = importlib.machinery.SourceFileLoader(name, path)
+        spec = importlib.util.spec_from_loader(name, loader)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
 
 
 st = load(ST_SRC, "mudimodem_speedtest")
+
+STD_SRC = os.path.join(HERE, "..", "src", "sbin", "mudimodem-speedtestd")
+std = load(STD_SRC, "mudimodem_speedtestd")
 
 
 class Mbps(unittest.TestCase):
@@ -102,7 +111,6 @@ class BuildSnapshot(unittest.TestCase):
 
 
 import http.server
-import tempfile
 import threading
 from urllib.parse import urlparse, parse_qs
 
@@ -191,6 +199,45 @@ class MainEndToEnd(unittest.TestCase):
             lines = [json.loads(l) for l in f if l.strip()]
         self.assertEqual(len(lines), st.HIST_MAX_LINES)
         self.assertEqual(lines[-1]["t"], 999999)
+
+
+class IsDue(unittest.TestCase):
+    def test_disabled_never_due(self):
+        self.assertFalse(std.is_due({"enabled": False, "interval_seconds": 60, "last_run": 0}, 10 ** 9))
+
+    def test_due_when_interval_elapsed(self):
+        cfg = {"enabled": True, "interval_seconds": 3600, "last_run": 0}
+        self.assertTrue(std.is_due(cfg, 3600 * 1000))
+        self.assertFalse(std.is_due(cfg, 3600 * 1000 - 1))
+
+    def test_zero_interval_never_due(self):
+        self.assertFalse(std.is_due({"enabled": True, "interval_seconds": 0, "last_run": 0}, 10 ** 9))
+
+
+class ReadSchedule(unittest.TestCase):
+    def test_missing_file_returns_default_off(self):
+        cfg = std.read_schedule("/tmp/mm-does-not-exist-speedtest-schedule.json")
+        self.assertEqual(cfg, std.DEFAULT_SCHEDULE)
+
+    def test_malformed_file_returns_default_off(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write("not json")
+            path = f.name
+        try:
+            self.assertEqual(std.read_schedule(path), std.DEFAULT_SCHEDULE)
+        finally:
+            os.remove(path)
+
+    def test_partial_file_fills_in_defaults(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write(json.dumps({"enabled": True}))
+            path = f.name
+        try:
+            cfg = std.read_schedule(path)
+            self.assertTrue(cfg["enabled"])
+            self.assertEqual(cfg["interval_seconds"], std.DEFAULT_SCHEDULE["interval_seconds"])
+        finally:
+            os.remove(path)
 
 
 if __name__ == "__main__":

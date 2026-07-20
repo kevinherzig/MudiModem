@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""mudimodem-speedtestd -- optional background speed-test scheduler.
+
+Off by default. Wakes every WAKE_INTERVAL and re-reads the schedule config
+each time (so a UI change to enabled/interval_seconds takes effect without
+restarting this service). When due, invokes tools/mudimodem-speedtest.py
+(deployed to /usr/lib/mudimodem/) with --trigger schedule --iface cellular
+and BLOCKS until it finishes -- this is a single-purpose background process,
+so blocking during the ~10-20s test is harmless; the script's own flock is
+what actually prevents overlap with a concurrent manual run.
+
+Schedule config: /etc/mudimodem/speedtest-schedule.json =
+  {"enabled": bool, "interval_seconds": int, "last_run": <epoch ms>}
+"""
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+WAKE_INTERVAL = float(os.environ.get("MUDIMODEM_SPEEDTESTD_WAKE", "60"))
+SCHEDULE_PATH = os.environ.get("MUDIMODEM_ST_SCHEDULE", "/etc/mudimodem/speedtest-schedule.json")
+SPEEDTEST_BIN = os.environ.get("MUDIMODEM_SPEEDTEST_BIN", "/usr/lib/mudimodem/mudimodem-speedtest.py")
+
+DEFAULT_SCHEDULE = {"enabled": False, "interval_seconds": 6 * 3600, "last_run": 0}
+
+
+def read_schedule(path):
+    """Read the schedule config, tolerating an absent/malformed file (falls
+    back to fully off)."""
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return dict(DEFAULT_SCHEDULE)
+    out = dict(DEFAULT_SCHEDULE)
+    if isinstance(cfg, dict):
+        out.update({k: cfg[k] for k in DEFAULT_SCHEDULE if k in cfg})
+    return out
+
+
+def write_last_run(path, cfg, now):
+    cfg = dict(cfg)
+    cfg["last_run"] = now
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f)
+    os.replace(tmp, path)
+
+
+def is_due(cfg, now_ms):
+    """Pure: is a scheduled run due right now?"""
+    if not cfg.get("enabled"):
+        return False
+    interval_ms = int(cfg.get("interval_seconds", 0)) * 1000
+    if interval_ms <= 0:
+        return False
+    return (now_ms - int(cfg.get("last_run", 0))) >= interval_ms
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def main():
+    state = {"go": True}
+
+    def stop(*_a):
+        state["go"] = False
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    while state["go"]:
+        try:
+            cfg = read_schedule(SCHEDULE_PATH)
+            if is_due(cfg, now_ms()):
+                subprocess.run(["python3", SPEEDTEST_BIN, "--trigger", "schedule", "--iface", "cellular"],
+                                timeout=120)
+                write_last_run(SCHEDULE_PATH, cfg, now_ms())
+        except Exception as e:                        # never die out of the loop
+            sys.stderr.write("speedtestd: %s\n" % e)
+            sys.stderr.flush()
+        end = time.time() + WAKE_INTERVAL
+        while state["go"] and time.time() < end:
+            time.sleep(0.5)
+
+
+if __name__ == "__main__":
+    main()
