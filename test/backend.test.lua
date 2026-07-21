@@ -19,7 +19,10 @@ assert(type(M.get_bands) == "function", "get_bands missing")
 -- known surface may be exposed (writes are limited to the watchdog-protected pair).
 local ALLOWED = { get_bands = true, set_bands = true, confirm = true, revert_now = true, get_history = true, at_console = true,
                   get_lock = true, set_cell_lock = true, clear_cell_lock = true, scan_cells = true,
-                  library_status = true, refresh_library = true }
+                  library_status = true, refresh_library = true,
+                  get_speedtest_interfaces = true, run_speedtest = true, get_speedtest_status = true,
+                  get_speedtest_history = true, clear_speedtest_history = true,
+                  get_speedtest_schedule = true, set_speedtest_schedule = true }
 for k, v in pairs(M) do
   if type(v) == "function" then
     assert(ALLOWED[k], "unexpected RPC method exposed: " .. k)

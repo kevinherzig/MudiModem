@@ -13,4 +13,6 @@ cp src/menu/mudimodem-tracking.json build/mudimodem-tracking.json 2>/dev/null ||
 # the baked initial/offline cache; gzip it to the filename the router serves.
 gzip -9 -n -c src/at-library.snapshot.json > build/at-library.json.gz
 gzip -9 -n -c src/views/mudimodem-console.js > build/gl-sdk4-ui-mudimodem-console.common.js.gz
+gzip -9 -n -c src/views/mudimodem-speedtest.js > build/gl-sdk4-ui-mudimodem-speedtest.common.js.gz
+cp src/menu/mudimodem-speedtest.json build/mudimodem-speedtest.json 2>/dev/null || true
 ls -l build/

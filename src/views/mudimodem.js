@@ -63,6 +63,10 @@ module.exports = {
       consoleComp: null,
       consoleLoading: false,
       consoleErr: "",
+      // Speedtest tab: same lazy-chunk pattern as Tracking/AT console.
+      speedtestComp: null,
+      speedtestLoading: false,
+      speedtestErr: "",
       // ---- SIM tab (Phase 4) — all writes browser-direct to GL's own undotted
       // RPC (modem.*); zero mudimodem-backend involvement. Keys 1/2 are the two
       // physical slots, predeclared so plain assignment stays reactive.
@@ -344,6 +348,26 @@ module.exports = {
         .catch(function (e) {
           self.consoleLoading = false;
           self.consoleErr = (e && e.message) || "load failed";
+        });
+    },
+
+    // Open the in-page Speedtest tab, lazy-loading its chunk on first use.
+    openSpeedtest() { this.tab = "speedtest"; this.loadSpeedtest(); },
+    loadSpeedtest() {
+      var self = this;
+      if (this.speedtestComp || this.speedtestLoading) return;
+      if (typeof window === "undefined" || !window.$axios) return;
+      this.speedtestLoading = true; this.speedtestErr = "";
+      window.$axios.get("/views/gl-sdk4-ui-mudimodem-speedtest.common.js?_t=" + Date.now())
+        .then(function (res) {
+          var module = { exports: {} };            // eslint-disable-line no-unused-vars
+          var comp = eval(res.data);
+          if (!comp || typeof comp.render !== "function") throw new Error("bad chunk");
+          self.speedtestComp = comp; self.speedtestLoading = false;
+        })
+        .catch(function (e) {
+          self.speedtestLoading = false;
+          self.speedtestErr = (e && (e.message || e.type)) || "could not load the speed test";
         });
     },
 
@@ -1816,11 +1840,15 @@ module.exports = {
     // "tracking" is an in-page tab like the rest — the strip + tab bar stay put;
     // its graph chunk is lazy-loaded into the panel on first open.
     var TABS = [["tracking", "Tracking"], ["sim", "SIM"], ["lock", "Cell lock"],
-      ["bands", "Bands"], ["at", "AT console"]];
+      ["bands", "Bands"], ["at", "AT console"], ["speedtest", "Speedtest"]];
     var tabs = h("div", { staticClass: "mm-tabs" }, TABS.map(function (t) {
       return h("button", {
         key: t[0], staticClass: "mm-tab" + (self.tab === t[0] ? " on" : ""),
-        on: { click: function () { if (t[0] === "tracking") self.openTracking(); else self.tab = t[0]; } }
+        on: { click: function () {
+          if (t[0] === "tracking") self.openTracking();
+          else if (t[0] === "speedtest") self.openSpeedtest();
+          else self.tab = t[0];
+        } }
       }, t[1]);
     }));
 
@@ -1850,6 +1878,14 @@ module.exports = {
       }
     } else if (this.tab === "sim") {
       panel = this.renderSim(h);
+    } else if (this.tab === "speedtest") {
+      if (this.speedtestComp) {
+        panel = h(this.speedtestComp, { props: { embedded: true } });
+      } else {
+        panel = h("div", { staticClass: "mm-card" }, [h("div", { staticClass: "mm-soon" },
+          this.speedtestErr ? "Couldn't load the speed test: " + this.speedtestErr
+            : "Loading the speed test…")]);
+      }
     } else {
       panel = h("div", { staticClass: "mm-card" }, [h("div", { staticClass: "mm-soon" }, "Unknown tab.")]);
     }

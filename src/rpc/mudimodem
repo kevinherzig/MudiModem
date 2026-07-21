@@ -849,4 +849,155 @@ function M.refresh_library(args)
   return run_lib("refresh")
 end
 
+-- ============================ Speedtest ============================
+-- On-demand (+ optional scheduled) download/upload/latency test. The test
+-- itself is pure IP traffic run by tools/mudimodem-speedtest.py, spawned
+-- DETACHED (like mudimodem-revert) because a fixed-size test takes ~10-20s --
+-- too long for a single $rpcRequest. Results persist in /etc/mudimodem (NOT
+-- /tmp, unlike the RF-history telemetry) so they survive a normal reboot.
+local SPEEDTEST_BIN      = os.getenv("MUDIMODEM_SPEEDTEST_BIN")      or "/usr/lib/mudimodem/mudimodem-speedtest.py"
+local SPEEDTEST_HIST     = os.getenv("MUDIMODEM_SPEEDTEST_HIST")     or "/etc/mudimodem/speedtests.jsonl"
+local SPEEDTEST_STATUS   = os.getenv("MUDIMODEM_SPEEDTEST_STATUS")   or "/tmp/mudimodem/speedtest-status.json"
+local SPEEDTEST_SCHEDULE = os.getenv("MUDIMODEM_ST_SCHEDULE")        or "/etc/mudimodem/speedtest-schedule.json"
+
+-- Allowed schedule cadences (seconds) -- the UI's fixed dropdown (30m/1h/2h/
+-- 6h/12h/24h); set_speedtest_schedule refuses anything else.
+local SCHEDULE_SECONDS = { [1800] = true, [3600] = true, [7200] = true,
+                           [21600] = true, [43200] = true, [86400] = true }
+
+local function nullish(v) return v == nil or v == cjson.null end
+
+-- Resolve an outbound interface ("cellular"|"wired") to its LIVE Linux device
+-- via ubus network.interface dump -- NEVER hardcoded. This box's own eth0 is
+-- bridged into LAN rather than acting as WAN, and the cellular device index
+-- has been observed to change (rmnet_data0 <-> rmnet_data1) after a modem
+-- reconnect, so resolving fresh every call is the only correct approach.
+-- Returns { device = <string|nil>, up = <bool> }.
+local function resolve_iface(which)
+  local dump = ucall("network.interface", "dump", {})
+  local ifaces = (dump and dump.interface) or {}
+  local function pick(dev)
+    if nullish(dev) then return nil end
+    return dev
+  end
+  if which == "cellular" then
+    for _, i in ipairs(ifaces) do
+      local name = tostring(i.interface or "")
+      if i.proto == "rmnet" and not name:match("_6$") then
+        local dev = pick(i.l3_device) or pick(i.device)
+        return { device = dev, up = (i.up == true) and dev ~= nil }
+      end
+    end
+  elseif which == "wired" then
+    for _, i in ipairs(ifaces) do
+      if i.interface == "wan" then
+        local dev = pick(i.l3_device) or pick(i.device)
+        return { device = dev, up = (i.up == true) and dev ~= nil }
+      end
+    end
+  end
+  return { device = nil, up = false }
+end
+
+function M.get_speedtest_interfaces(args)
+  return { cellular = resolve_iface("cellular"), wired = resolve_iface("wired") }
+end
+
+local function read_json_file(path, default)
+  local f = io.open(path, "r")
+  if not f then return default end
+  local raw = f:read("*a")
+  f:close()
+  local ok, obj = pcall(cjson.decode, raw)   -- cjson.decode can't yield; pcall is safe here
+  if not ok or type(obj) ~= "table" then return default end
+  return obj
+end
+
+local function write_json_file(path, obj)
+  local dir = path:match("(.*/)")
+  if dir then os.execute("mkdir -p " .. dir .. " 2>/dev/null") end
+  local f = io.open(path, "w")
+  if not f then return false end
+  f:write(cjson.encode(obj))
+  f:close()
+  return true
+end
+
+function M.run_speedtest(args)
+  local iface = (args and args.iface) or "cellular"
+  if iface ~= "cellular" and iface ~= "wired" then
+    return { error = "iface must be 'cellular' or 'wired'" }
+  end
+  local info = resolve_iface(iface)
+  if not info.up or not info.device then
+    return { error = "iface_down", iface = iface }
+  end
+
+  local st = read_json_file(SPEEDTEST_STATUS, nil)
+  if st and st.running then return { running = true } end
+
+  os.execute("mkdir -p /etc/mudimodem /tmp/mudimodem 2>/dev/null")
+  write_json_file(SPEEDTEST_STATUS, { running = true, phase = "starting", iface = iface })
+  local quoted_bin = "'" .. SPEEDTEST_BIN:gsub("'", "'\\''") .. "'"
+  os.execute("python3 " .. quoted_bin .. " --trigger manual --iface " .. iface .. " >/dev/null 2>&1 &")
+  return { started = true }
+end
+
+function M.get_speedtest_status(args)
+  return read_json_file(SPEEDTEST_STATUS, { running = false })
+end
+
+function M.get_speedtest_history(args)
+  local since = args and tonumber(args.since) or nil
+  local iface = args and args.iface or nil
+  local limit = args and tonumber(args.limit) or nil
+  local out = {}
+  local fh = io.open(SPEEDTEST_HIST, "r")
+  if fh then
+    for line in fh:lines() do
+      if #line > 1 then
+        local ok, obj = pcall(cjson.decode, line)
+        if ok and type(obj) == "table" and obj.t then
+          if (not since or obj.t > since) and (not iface or obj.iface == iface) then
+            out[#out + 1] = obj
+          end
+        end
+      end
+    end
+    fh:close()
+  end
+  if limit and #out > limit then
+    local trimmed = {}
+    for i = #out - limit + 1, #out do trimmed[#trimmed + 1] = out[i] end
+    out = trimmed
+  end
+  return { results = arr(out) }
+end
+
+function M.clear_speedtest_history(args)
+  os.execute("mkdir -p /etc/mudimodem 2>/dev/null")
+  local f = io.open(SPEEDTEST_HIST, "w")
+  if f then f:close() end
+  return { ok = true }
+end
+
+function M.get_speedtest_schedule(args)
+  return read_json_file(SPEEDTEST_SCHEDULE, { enabled = false, interval_seconds = 21600, last_run = 0 })
+end
+
+function M.set_speedtest_schedule(args)
+  local enabled = (args and args.enabled) and true or false
+  local interval = tonumber(args and args.interval_seconds)
+  if not interval or not SCHEDULE_SECONDS[interval] then
+    return { error = "interval_seconds must be one of 1800/3600/7200/21600/43200/86400" }
+  end
+  local cur = M.get_speedtest_schedule({})
+  os.execute("mkdir -p /etc/mudimodem 2>/dev/null")
+  local f = io.open(SPEEDTEST_SCHEDULE, "w")
+  if not f then return { error = "cannot write schedule config" } end
+  f:write(cjson.encode({ enabled = enabled, interval_seconds = interval, last_run = cur.last_run or 0 }))
+  f:close()
+  return { ok = true, enabled = enabled, interval_seconds = interval }
+end
+
 return M

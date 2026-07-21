@@ -206,4 +206,55 @@ else
   echo "9b. SKIPPED — set MM_PW=<admin-password> to run the /rpc round-trip"
 fi
 
+echo "10. Speedtest: files present, menu valid, chunk evals"
+ssh -o BatchMode=yes "root@$HOST" 'test -s /www/views/gl-sdk4-ui-mudimodem-speedtest.common.js.gz' \
+  || fail "speedtest chunk .gz missing"
+ssh -o BatchMode=yes "root@$HOST" 'test -s /usr/share/oui/menu.d/mudimodem-speedtest.json' \
+  || fail "speedtest menu json missing"
+ssh -o BatchMode=yes "root@$HOST" \
+  'lua -e "local c=require(\"cjson\"); local f=io.open(\"/usr/share/oui/menu.d/mudimodem-speedtest.json\"); c.decode(f:read(\"*a\"))"' \
+  || fail "speedtest menu json does not parse (would break ui.get_menu_list for EVERY page)"
+ssh -o BatchMode=yes "root@$HOST" 'test -x /usr/lib/mudimodem/mudimodem-speedtest.py' \
+  || fail "speedtest runner script missing or not executable"
+
+STBODY=$(ssh -o BatchMode=yes "root@$HOST" \
+  'curl -sk -H "Accept-Encoding: gzip" "https://127.0.0.1/views/gl-sdk4-ui-mudimodem-speedtest.common.js?_t=1" | gzip -dc')
+printf '%s' "$STBODY" | node -e '
+  let s=""; process.stdin.on("data",d=>s+=d).on("end",()=>{
+    const module={exports:{}}; const c=eval(s);
+    if(!c||c.name!=="mudimodem-speedtest"){console.error("FAIL: speedtest chunk eval");process.exit(1);}
+    if(typeof c.render!=="function"||c.template!==undefined){console.error("FAIL: not render-only");process.exit(1);}
+    if(!/"run_speedtest"/.test(s)){console.error("FAIL: does not call run_speedtest");process.exit(1);}
+    console.log("   speedtest chunk eval OK ->", c.name);
+  })' || fail "speedtest chunk eval failed"
+
+echo "10a. Speedtest backend round trip (on-device)"
+ssh -o BatchMode=yes "root@$HOST" 'cat > /tmp/mm-st.test.lua' < test/backend-speedtest.test.lua
+ssh -o BatchMode=yes "root@$HOST" 'MUDIMODEM_SPEEDTEST_HIST=/tmp/mmst-hist.jsonl MUDIMODEM_ST_SCHEDULE=/tmp/mmst-sched.json lua /tmp/mm-st.test.lua; rc=$?; rm -f /tmp/mm-st.test.lua /tmp/mmst-hist.jsonl /tmp/mmst-sched.json; exit $rc' \
+  || fail "speedtest backend test failed on-device"
+
+echo "10b. Speedtest scheduler service present (off by default)"
+ssh -o BatchMode=yes "root@$HOST" 'test -x /usr/sbin/mudimodem-speedtestd' \
+  || fail "speedtestd not installed (run ./tools/deploy.sh)"
+ssh -o BatchMode=yes "root@$HOST" 'pgrep -f mudimodem-speedtestd >/dev/null' \
+  || fail "speedtestd process not running (/etc/init.d/mudimodem-speedtestd start)"
+
+echo "10c. LIVE: one real speed test end-to-end over Cellular"
+ssh -o BatchMode=yes "root@$HOST" 'rm -f /tmp/mudimodem/speedtest-status.json'
+RESULT=$(ssh -o BatchMode=yes "root@$HOST" '
+  rm -f /tmp/mmv-speedtests.jsonl
+  python3 /usr/lib/mudimodem/mudimodem-speedtest.py --trigger manual --iface cellular --hist /tmp/mmv-speedtests.jsonl
+  rc=$?
+  if [ $rc -eq 0 ] && [ -s /tmp/mmv-speedtests.jsonl ]; then
+    lua -e "local c=require(\"cjson\");local f=io.open(\"/tmp/mmv-speedtests.jsonl\");local d=c.decode(f:read(\"*l\"));assert(d.down_mbps and d.down_mbps>0,\"down_mbps\");assert(d.up_mbps and d.up_mbps>0,\"up_mbps\");assert(d.latency_ms,\"latency_ms\");assert(d.carrier,\"carrier\")" \
+      && rc=0 || rc=1
+  else
+    rc=1
+  fi
+  [ $rc -eq 0 ] && cat /tmp/mmv-speedtests.jsonl
+  rm -f /tmp/mmv-speedtests.jsonl
+  exit $rc
+') || fail "live speed test failed (produced no result, timed out, or result missing down_mbps/up_mbps/latency_ms/carrier)"
+echo "   live result: $RESULT"
+
 echo "ALL CHECKS PASSED"
