@@ -1999,7 +1999,7 @@ module.exports = {
     // "tracking" is an in-page tab like the rest — the strip + tab bar stay put;
     // its graph chunk is lazy-loaded into the panel on first open.
     var TABS = [["tracking", "Tracking"], ["sim", "SIM"], ["lock", "Cell lock"],
-      ["bands", "Bands"], ["at", "AT console"], ["config", "Config"], ["speedtest", "Speedtest"]];
+      ["bands", "Bands"], ["at", "AT console"], ["speedtest", "Speedtest"], ["config", "Config"]];
     var tabs = h("div", { staticClass: "mm-tabs" }, TABS.map(function (t) {
       return h("button", {
         key: t[0], staticClass: "mm-tab" + (self.tab === t[0] ? " on" : ""),
