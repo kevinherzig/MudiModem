@@ -205,15 +205,20 @@ ssh -o BatchMode=yes "root@$HOST" 'pgrep -f mudimodem-speedtestd >/dev/null' \
 
 echo "10c. LIVE: one real speed test end-to-end over Cellular"
 ssh -o BatchMode=yes "root@$HOST" 'rm -f /tmp/mudimodem/speedtest-status.json'
-ssh -o BatchMode=yes "root@$HOST" \
-  'python3 /usr/lib/mudimodem/mudimodem-speedtest.py --trigger manual --iface cellular --hist /tmp/mmv-speedtests.jsonl'
-ssh -o BatchMode=yes "root@$HOST" 'test -s /tmp/mmv-speedtests.jsonl' \
-  || fail "live speed test produced no result"
-ssh -o BatchMode=yes "root@$HOST" \
-  'lua -e "local c=require(\"cjson\");local f=io.open(\"/tmp/mmv-speedtests.jsonl\");local d=c.decode(f:read(\"*l\"));assert(d.down_mbps and d.down_mbps>0,\"down_mbps\");assert(d.up_mbps and d.up_mbps>0,\"up_mbps\");assert(d.latency_ms,\"latency_ms\");assert(d.carrier,\"carrier\")"' \
-  || fail "live speed test result missing expected fields (down_mbps/up_mbps/latency_ms/carrier)"
-RESULT=$(ssh -o BatchMode=yes "root@$HOST" 'cat /tmp/mmv-speedtests.jsonl')
+RESULT=$(ssh -o BatchMode=yes "root@$HOST" '
+  rm -f /tmp/mmv-speedtests.jsonl
+  python3 /usr/lib/mudimodem/mudimodem-speedtest.py --trigger manual --iface cellular --hist /tmp/mmv-speedtests.jsonl
+  rc=$?
+  if [ $rc -eq 0 ] && [ -s /tmp/mmv-speedtests.jsonl ]; then
+    lua -e "local c=require(\"cjson\");local f=io.open(\"/tmp/mmv-speedtests.jsonl\");local d=c.decode(f:read(\"*l\"));assert(d.down_mbps and d.down_mbps>0,\"down_mbps\");assert(d.up_mbps and d.up_mbps>0,\"up_mbps\");assert(d.latency_ms,\"latency_ms\");assert(d.carrier,\"carrier\")" \
+      && rc=0 || rc=1
+  else
+    rc=1
+  fi
+  [ $rc -eq 0 ] && cat /tmp/mmv-speedtests.jsonl
+  rm -f /tmp/mmv-speedtests.jsonl
+  exit $rc
+') || fail "live speed test failed (produced no result, timed out, or result missing down_mbps/up_mbps/latency_ms/carrier)"
 echo "   live result: $RESULT"
-ssh -o BatchMode=yes "root@$HOST" 'rm -f /tmp/mmv-speedtests.jsonl'
 
 echo "ALL CHECKS PASSED"
