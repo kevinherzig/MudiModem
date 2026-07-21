@@ -32,6 +32,7 @@ module.exports = (function () {
         runIface: "cellular",
         filterIface: "cellular",
         status: { running: false },
+        lastResult: null,
         statusPoll: null,
         schedule: null, scheduleErr: "", scheduleSaving: false,
         cursor: null, pinned: null, width: 900
@@ -102,7 +103,10 @@ module.exports = (function () {
           .then(function (r) {
             self.status = r || { running: false };
             if (self.status.running && startPollIfRunning) self.startPoll();
-            if (!self.status.running && self.statusPoll) self.stopPollAndRefresh();
+            if (!self.status.running && self.statusPoll) {
+              if (self.status.phase === "done" && self.status.result) self.lastResult = self.status.result;
+              self.stopPollAndRefresh();
+            }
           })
           .catch(function () { /* transient -- next poll tick tries again */ });
       },

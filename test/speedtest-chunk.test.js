@@ -116,6 +116,42 @@ test('fetchStatus(): a finished test stops polling and refreshes history', async
   } finally { unstubRpc(); }
 });
 
+test('fetchStatus(): captures the finished result into lastResult', async () => {
+  const result = { t: 5000, iface: 'cellular', down_mbps: 42, up_mbps: 9, latency_ms: 55, jitter_ms: 3 };
+  const calls = stubRpc([{ running: false, phase: 'done', result: result }, { results: [] }]);
+  try {
+    const vm = makeVm(loadChunk());
+    vm.statusPoll = setInterval(() => {}, 100000);
+    vm.fetchStatus(false);
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    assert.deepStrictEqual(vm.lastResult, result);
+  } finally { unstubRpc(); }
+});
+
+test('fetchStatus(): a stale "done" status already on disk at mount does not populate lastResult', async () => {
+  const calls = stubRpc([{ running: false, phase: 'done', result: { t: 1, iface: 'cellular', down_mbps: 1 } }]);
+  try {
+    const vm = makeVm(loadChunk());
+    vm.fetchStatus(true);   // mount-time call; statusPoll is null, nothing was being watched
+    await Promise.resolve(); await Promise.resolve();
+    assert.strictEqual(vm.lastResult, null);
+  } finally { unstubRpc(); calls; }
+});
+
+test('runTest(): a new run does not clear the previous lastResult until it completes', () => {
+  const vm = makeVm(loadChunk());
+  vm.lastResult = { t: 1, iface: 'cellular', down_mbps: 10 };
+  const calls = stubRpc([{ started: true }]);
+  try {
+    vm.runIface = 'cellular';
+    vm.runTest();
+    assert.deepStrictEqual(vm.lastResult, { t: 1, iface: 'cellular', down_mbps: 10 }, 'old result stays until replaced');
+  } finally {
+    if (vm.statusPoll) clearInterval(vm.statusPoll);
+    unstubRpc(); calls;
+  }
+});
+
 test('setSchedule(): posts enabled+interval, then re-fetches', async () => {
   const calls = stubRpc([{ ok: true }, { enabled: true, interval_seconds: 3600, last_run: 0 }]);
   try {
