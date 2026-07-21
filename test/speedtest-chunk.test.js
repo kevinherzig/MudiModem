@@ -156,6 +156,14 @@ test('interface dropdown marks a down interface as not connected', () => {
   assert.match(txt, /Wired WAN \(not connected\)/);
 });
 
+test('ifacesErr renders as a visible error instead of failing silently', () => {
+  const c = loadChunk();
+  const vm = makeVm(c);
+  vm.ifacesErr = 'timeout';
+  const txt = textOf(c.render.call(vm, h));
+  assert.match(txt, /Couldn't check interfaces: timeout/);
+});
+
 const RESULTS = [
   { t: 1000, iface: 'cellular', down_mbps: 40, up_mbps: 10, latency_ms: 60, jitter_ms: 5,
     carrier: 'T-Mobile', slot: 1, band: 71, mode: 'NR5G-SA FDD', cell_id: 'ABC', rsrp: -98, sinr: 8, rsrq: -11 },

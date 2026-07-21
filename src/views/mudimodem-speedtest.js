@@ -171,7 +171,9 @@ module.exports = (function () {
         }, this.status.running ? (PHASE_TEXT[this.status.phase] || "Testing…") : "Run speed test");
         var err = (!this.status.running && this.status.phase === "error")
           ? h("span", { staticClass: "mms-err" }, this.status.message) : null;
-        return h("div", { staticClass: "mms-controls" }, [ifaceSel, runBtn, err].filter(Boolean));
+        var ifaceErr = this.ifacesErr
+          ? h("span", { staticClass: "mms-err" }, "Couldn't check interfaces: " + this.ifacesErr) : null;
+        return h("div", { staticClass: "mms-controls" }, [ifaceSel, runBtn, err, ifaceErr].filter(Boolean));
       },
       renderSchedule: function (h) {
         var self = this;

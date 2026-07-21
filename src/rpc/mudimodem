@@ -819,6 +819,16 @@ local function read_json_file(path, default)
   return obj
 end
 
+local function write_json_file(path, obj)
+  local dir = path:match("(.*/)")
+  if dir then os.execute("mkdir -p " .. dir .. " 2>/dev/null") end
+  local f = io.open(path, "w")
+  if not f then return false end
+  f:write(cjson.encode(obj))
+  f:close()
+  return true
+end
+
 function M.run_speedtest(args)
   local iface = (args and args.iface) or "cellular"
   if iface ~= "cellular" and iface ~= "wired" then
@@ -833,6 +843,7 @@ function M.run_speedtest(args)
   if st and st.running then return { running = true } end
 
   os.execute("mkdir -p /etc/mudimodem /tmp/mudimodem 2>/dev/null")
+  write_json_file(SPEEDTEST_STATUS, { running = true, phase = "starting", iface = iface })
   local quoted_bin = "'" .. SPEEDTEST_BIN:gsub("'", "'\\''") .. "'"
   os.execute("python3 " .. quoted_bin .. " --trigger manual --iface " .. iface .. " >/dev/null 2>&1 &")
   return { started = true }

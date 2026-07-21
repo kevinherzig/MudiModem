@@ -22,6 +22,7 @@ import time
 WAKE_INTERVAL = float(os.environ.get("MUDIMODEM_SPEEDTESTD_WAKE", "60"))
 SCHEDULE_PATH = os.environ.get("MUDIMODEM_ST_SCHEDULE", "/etc/mudimodem/speedtest-schedule.json")
 SPEEDTEST_BIN = os.environ.get("MUDIMODEM_SPEEDTEST_BIN", "/usr/lib/mudimodem/mudimodem-speedtest.py")
+PYTHON3 = os.environ.get("MUDIMODEM_PYTHON3", "/usr/bin/python3")
 
 DEFAULT_SCHEDULE = {"enabled": False, "interval_seconds": 6 * 3600, "last_run": 0}
 
@@ -69,6 +70,22 @@ def now_ms():
     return int(time.time() * 1000)
 
 
+def attempt_run(python3, bin_path, timeout):
+    """Run one scheduled speed test attempt and ALWAYS record it as attempted
+    (via write_last_run), whether it succeeds, times out, or errors -- a timed
+    -out/hung run must not make the daemon immediately retry on its very next
+    60s wake, which could loop a stuck run forever and burn cellular data.
+    Catches only subprocess.run's own failure locally; anything else (e.g. a
+    broken SCHEDULE_PATH) is left to the caller's own safety net."""
+    try:
+        subprocess.run([python3, bin_path, "--trigger", "schedule", "--iface", "cellular"],
+                        timeout=timeout)
+    except subprocess.TimeoutExpired:
+        sys.stderr.write("speedtestd: run timed out\n")
+        sys.stderr.flush()
+    write_last_run(SCHEDULE_PATH, now_ms())
+
+
 def main():
     state = {"go": True}
 
@@ -81,9 +98,7 @@ def main():
         try:
             cfg = read_schedule(SCHEDULE_PATH)
             if is_due(cfg, now_ms()):
-                subprocess.run(["python3", SPEEDTEST_BIN, "--trigger", "schedule", "--iface", "cellular"],
-                                timeout=120)
-                write_last_run(SCHEDULE_PATH, now_ms())
+                attempt_run(PYTHON3, SPEEDTEST_BIN, 120)
         except Exception as e:                        # never die out of the loop
             sys.stderr.write("speedtestd: %s\n" % e)
             sys.stderr.flush()

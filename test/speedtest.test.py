@@ -37,6 +37,16 @@ class Mbps(unittest.TestCase):
         self.assertIsNone(st.mbps(None))
 
 
+class ParseArgs(unittest.TestCase):
+    def test_trailing_trigger_flag_raises_systemexit_not_indexerror(self):
+        with self.assertRaises(SystemExit):
+            st.parse_args(["--trigger"])
+
+    def test_trailing_iface_flag_raises_systemexit_not_indexerror(self):
+        with self.assertRaises(SystemExit):
+            st.parse_args(["--iface"])
+
+
 class ResolveIfaceFromDump(unittest.TestCase):
     # Real captured shapes (box, 2026-07-20) -- the cellular device index has
     # been observed to change (rmnet_data0 <-> rmnet_data1) after a modem
@@ -212,6 +222,31 @@ class IsDue(unittest.TestCase):
 
     def test_zero_interval_never_due(self):
         self.assertFalse(std.is_due({"enabled": True, "interval_seconds": 0, "last_run": 0}, 10 ** 9))
+
+
+class AttemptRun(unittest.TestCase):
+    def test_write_last_run_happens_even_when_subprocess_times_out(self):
+        """A hung/timed-out scheduled run must still be recorded as attempted --
+        otherwise the daemon would retry it on its very next 60s wake, looping
+        a stuck run forever and burning cellular data."""
+        calls = []
+
+        def fake_run(*a, **kw):
+            raise std.subprocess.TimeoutExpired(cmd="x", timeout=120)
+
+        def fake_write_last_run(path, now):
+            calls.append((path, now))
+
+        orig_run, orig_write = std.subprocess.run, std.write_last_run
+        std.subprocess.run = fake_run
+        std.write_last_run = fake_write_last_run
+        try:
+            std.attempt_run("python3", "/fake/bin.py", 120)
+        finally:
+            std.subprocess.run = orig_run
+            std.write_last_run = orig_write
+
+        self.assertEqual(len(calls), 1, "write_last_run must be called even after a timeout")
 
 
 class ReadSchedule(unittest.TestCase):

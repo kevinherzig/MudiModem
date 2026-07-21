@@ -216,6 +216,13 @@ def append_result(path, result):
     trim_history(path)
 
 
+def _next(argv, i, flag):
+    """argv[i+1], or a clean SystemExit instead of an IndexError if it's missing."""
+    if i + 1 >= len(argv):
+        raise SystemExit("missing value for %s" % flag)
+    return argv[i + 1]
+
+
 def parse_args(argv):
     """Manual argv parsing (matches mudimodem-at.py's style -- no argparse
     elsewhere in this codebase). --device is a debug/testing override that
@@ -231,27 +238,27 @@ def parse_args(argv):
     while i < len(argv):
         a = argv[i]
         if a == "--trigger":
-            i += 1; cfg["trigger"] = argv[i]
+            cfg["trigger"] = _next(argv, i, a); i += 1
         elif a == "--iface":
-            i += 1; cfg["iface"] = argv[i]
+            cfg["iface"] = _next(argv, i, a); i += 1
         elif a == "--device":
-            i += 1; cfg["device"] = argv[i]
+            cfg["device"] = _next(argv, i, a); i += 1
         elif a == "--timeout":
-            i += 1; cfg["timeout"] = float(argv[i])
+            cfg["timeout"] = float(_next(argv, i, a)); i += 1
         elif a == "--down-url":
-            i += 1; cfg["down_url"] = argv[i]
+            cfg["down_url"] = _next(argv, i, a); i += 1
         elif a == "--up-url":
-            i += 1; cfg["up_url"] = argv[i]
+            cfg["up_url"] = _next(argv, i, a); i += 1
         elif a == "--down-bytes":
-            i += 1; cfg["down_bytes"] = int(argv[i])
+            cfg["down_bytes"] = int(_next(argv, i, a)); i += 1
         elif a == "--up-bytes":
-            i += 1; cfg["up_bytes"] = int(argv[i])
+            cfg["up_bytes"] = int(_next(argv, i, a)); i += 1
         elif a == "--hist":
-            i += 1; cfg["hist"] = argv[i]
+            cfg["hist"] = _next(argv, i, a); i += 1
         elif a == "--status":
-            i += 1; cfg["status"] = argv[i]
+            cfg["status"] = _next(argv, i, a); i += 1
         elif a == "--lock":
-            i += 1; cfg["lock"] = argv[i]
+            cfg["lock"] = _next(argv, i, a); i += 1
         else:
             raise SystemExit("unknown arg: %s" % a)
         i += 1

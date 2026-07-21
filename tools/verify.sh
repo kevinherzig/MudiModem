@@ -194,7 +194,7 @@ printf '%s' "$STBODY" | node -e '
 
 echo "10a. Speedtest backend round trip (on-device)"
 ssh -o BatchMode=yes "root@$HOST" 'cat > /tmp/mm-st.test.lua' < test/backend-speedtest.test.lua
-ssh -o BatchMode=yes "root@$HOST" 'MUDIMODEM_SPEEDTEST_HIST=/tmp/mmst-hist.jsonl MUDIMODEM_ST_SCHEDULE=/tmp/mmst-sched.json lua /tmp/mm-st.test.lua; rc=$?; rm -f /tmp/mm-st.test.lua; exit $rc' \
+ssh -o BatchMode=yes "root@$HOST" 'MUDIMODEM_SPEEDTEST_HIST=/tmp/mmst-hist.jsonl MUDIMODEM_ST_SCHEDULE=/tmp/mmst-sched.json lua /tmp/mm-st.test.lua; rc=$?; rm -f /tmp/mm-st.test.lua /tmp/mmst-hist.jsonl /tmp/mmst-sched.json; exit $rc' \
   || fail "speedtest backend test failed on-device"
 
 echo "10b. Speedtest scheduler service present (off by default)"
