@@ -721,6 +721,30 @@ test('AT console is an in-page tab: lazy-loads its own chunk', () => {
   assert.ok(node, 'renders the loaded console component as a child vnode');
 });
 
+test('Speedtest is an in-page tab: lazy-loads its own chunk, embedded like Tracking', () => {
+  const src = fs.readFileSync(SRC, 'utf8');
+  assert.match(src, /gl-sdk4-ui-mudimodem-speedtest\.common\.js/, 'lazy-loads the speedtest chunk');
+  const c = loadChunk();
+  const vm = makeVm(c, LIVE);
+  vm.tab = 'speedtest';
+  const txt = textOf(c.render.call(vm, h));
+  assert.match(txt, /Loading the speed test/, 'loading state before the chunk arrives');
+  const fake = { name: 'mudimodem-speedtest', render() {} };
+  vm.speedtestComp = fake;
+  const node = walk(c.render.call(vm, h)).find((n) => n.tag === fake);
+  assert.ok(node, 'renders the loaded speedtest component as a child vnode');
+  assert.strictEqual(node.data.props.embedded, true, 'passes embedded:true');
+});
+
+test('Speedtest tab appears in the tab bar', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, LIVE);
+  const on = walk(c.render.call(vm, h))
+    .filter((n) => n.data.staticClass && /\bmm-tab\b/.test(n.data.staticClass))
+    .map(textOf);
+  assert.ok(on.includes('Speedtest'), 'Speedtest tab rendered alongside the others');
+});
+
 // ---------------------------------------------------------------------------
 // Phase 4 — SIM / APN tab
 // ---------------------------------------------------------------------------
