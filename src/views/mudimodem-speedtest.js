@@ -23,6 +23,20 @@ module.exports = (function () {
     for (var i = 0; i < IFACES.length; i++) if (IFACES[i][0] === id) return IFACES[i][1];
     return id;
   }
+  // Shared label+value rows for a result record `r` -- used by both the
+  // graph's hover tooltip and the latest-result panel, so the field list and
+  // formatting (units, band prefix, — for null) live in exactly one place.
+  function resultDetailRows(r) {
+    return [
+      ["Latency", r.latency_ms == null ? "—" : r.latency_ms + " ms (±" + (r.jitter_ms == null ? "—" : r.jitter_ms) + ")"],
+      ["Carrier", (r.carrier || "—") + " · SIM " + (r.slot == null ? "—" : r.slot)],
+      ["Band", r.band == null ? "—" : (r.mode && /NR5G/.test(r.mode) ? "n" : "B") + r.band],
+      ["Cell", r.cell_id == null ? "—" : r.cell_id],
+      ["RSRP", r.rsrp == null ? "—" : r.rsrp + " dBm"],
+      ["SINR", r.sinr == null ? "—" : r.sinr + " dB"],
+      ["RSRQ", r.rsrq == null ? "—" : r.rsrq + " dB"]
+    ];
+  }
 
   var component = {
     name: "mudimodem-speedtest",
@@ -218,15 +232,7 @@ module.exports = (function () {
             h("span", { staticClass: "u" }, "ms latency")
           ])
         ]);
-        var rows = [
-          ["Latency", r.latency_ms == null ? "—" : r.latency_ms + " ms (±" + (r.jitter_ms == null ? "—" : r.jitter_ms) + ")"],
-          ["Carrier", (r.carrier || "—") + " · SIM " + (r.slot == null ? "—" : r.slot)],
-          ["Band", r.band == null ? "—" : (r.mode && /NR5G/.test(r.mode) ? "n" : "B") + r.band],
-          ["Cell", r.cell_id == null ? "—" : r.cell_id],
-          ["RSRP", r.rsrp == null ? "—" : r.rsrp + " dBm"],
-          ["SINR", r.sinr == null ? "—" : r.sinr + " dB"],
-          ["RSRQ", r.rsrq == null ? "—" : r.rsrq + " dB"]
-        ];
+        var rows = resultDetailRows(r);
         return h("div", { staticClass: "mms-card" }, [
           h("div", { staticClass: "mms-latest-head" }, [
             h("span", { staticClass: "mms-title" }, "Latest result"),
@@ -347,15 +353,8 @@ module.exports = (function () {
           var r = results[this.cursor];
           var rows = [
             ["Down", r.down_mbps == null ? "—" : r.down_mbps + " Mbps"],
-            ["Up", r.up_mbps == null ? "—" : r.up_mbps + " Mbps"],
-            ["Latency", r.latency_ms == null ? "—" : r.latency_ms + " ms (±" + (r.jitter_ms == null ? "—" : r.jitter_ms) + ")"],
-            ["Carrier", (r.carrier || "—") + " · SIM " + (r.slot == null ? "—" : r.slot)],
-            ["Band", r.band == null ? "—" : (r.mode && /NR5G/.test(r.mode) ? "n" : "B") + r.band],
-            ["Cell", r.cell_id == null ? "—" : r.cell_id],
-            ["RSRP", r.rsrp == null ? "—" : r.rsrp + " dBm"],
-            ["SINR", r.sinr == null ? "—" : r.sinr + " dB"],
-            ["RSRQ", r.rsrq == null ? "—" : r.rsrq + " dB"]
-          ];
+            ["Up", r.up_mbps == null ? "—" : r.up_mbps + " Mbps"]
+          ].concat(resultDetailRows(r));
           tip = h("div", { staticClass: "mms-tip" }, [
             h("div", { staticClass: "t" }, this.clock(r.t) + (this.pinned != null ? " · pinned" : ""))
           ].concat(rows.map(function (row) {
