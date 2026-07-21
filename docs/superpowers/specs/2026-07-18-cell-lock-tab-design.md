@@ -49,6 +49,13 @@ supervised live-fire test, §5). `QSCAN` is absent from the 5-series manual too.
 - **Current cell** — serving cell from `global_sockets` (PCI, ARFCN, band chip, cell ID,
   RSRP/RSRQ/SINR in GL's quality ramp) + lock state. Primary button **Lock to this cell** — the
   main use case and the safest possible target. When locked: mint "Locked" badge + **Unlock**.
+  The Unlock button carries a **☑ Restore AUTO network mode** checkbox, **checked by default** —
+  a 5G/LTE lock silently forces `mode_pref` NR-only and unlocking alone does *not* undo it
+  (verified on-box 2026-07-19: cleared lock, `mode_pref` stayed `NR5G` across a reboot until set
+  back to `AUTO` explicitly). Checked ⇒ unlock also writes `mode_pref,AUTO`; unchecked ⇒ leave the
+  mode as-is (for a user who deliberately wants to stay NR-only). Not the same as the watchdog's
+  restore-*previous*-mode path — that reverts an unconfirmed change; this is the deliberate-unlock
+  default and it targets AUTO, not whatever the mode happened to be before the lock.
   Disabled (with reason shown) while any pending change exists or an operator lock is set.
 - **Nearby cells** — empty state says the truth: *"5G SA exposes no neighbour list; scanning takes
   the modem offline for up to ~10 minutes."* **Scan for cells** → confirm dialog → GL scan →
@@ -67,6 +74,7 @@ supervised live-fire test, §5). `QSCAN` is absent from the 5-series manual too.
 | `get_lock {}` | `AT+QNWLOCK="common/4g"/"common/5g"/"save_ctrl"` (explicit active sub_id, never 0) **+** glc `modem.get_cell_tower` → returns modem truth, GL store, and an `agree` flag |
 | `scan_cells {}` | glc `modem.scan_cell_tower {bus:"cpu", slot:<active>}`, long timeout; returns GL's towers list verbatim |
 | `set_cell_lock {rat, pci, freq, scs?, band?}` | validate ints → refuse if operator lock or pending exists → snapshot previous lock + `mode_pref` + `nr5g_disable_mode` to `pending.json` → arm watchdog → glc `modem.set_cell_tower {…, lock:true}` |
+| `clear_lock {rat?, restore_auto=true}` | deliberate unlock of a committed lock: glc `modem.set_cell_tower {lock:false}` + raw AT `"common/X",0` + `save_ctrl,0,0`; **if `restore_auto` (default): `AT+QNWPREFCFG="mode_pref",AUTO`** (else leave mode untouched). Backs the Current-cell **Unlock** button + its checkbox |
 | `confirm {}` (existing) | clears pending — GL store and modem already agree |
 | `revert_now {}` (existing) | for a cell pending: glc `set_cell_tower {lock:false}` + restore mode prefs + clear pending |
 

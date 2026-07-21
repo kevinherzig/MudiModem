@@ -206,7 +206,30 @@ else
   echo "9b. SKIPPED — set MM_PW=<admin-password> to run the /rpc round-trip"
 fi
 
-echo "10. Speedtest: files present, menu valid, chunk evals"
+# 10. Phase 5: Config tab / version check / self-update.
+echo "10. Phase 5: version check + self-update"
+ssh -o BatchMode=yes "root@$HOST" 'test -s /etc/mudimodem/version.json' \
+  || fail "version.json not installed (run ./tools/deploy.sh)"
+ssh -o BatchMode=yes "root@$HOST" 'test -x /usr/sbin/mudimodem-selfupdate' \
+  || fail "self-update script not installed"
+ssh -o BatchMode=yes "root@$HOST" 'grep -q "function M.app_version" /usr/lib/oui-httpd/rpc/mudimodem && grep -q "function M.device_info" /usr/lib/oui-httpd/rpc/mudimodem && grep -q "function M.self_update" /usr/lib/oui-httpd/rpc/mudimodem && grep -q "function M.update_status" /usr/lib/oui-httpd/rpc/mudimodem' \
+  || fail "backend missing app_version/device_info/self_update/update_status"
+
+echo "10a. app_version isolation test (offline, fake curl)"
+ssh -o BatchMode=yes "root@$HOST" 'cat > /tmp/mm-ver.test.lua' < test/backend-version.test.lua
+ssh -o BatchMode=yes "root@$HOST" 'MM_TMP=/tmp/mm-ver-test MUDIMODEM_VERSION_FILE=/tmp/mm-ver-test/local.json MUDIMODEM_CURL=/tmp/mm-ver-test/curl.sh lua /tmp/mm-ver.test.lua; rc=$?; rm -rf /tmp/mm-ver.test.lua /tmp/mm-ver-test; exit $rc' \
+  || fail "app_version isolation test failed"
+
+echo "10b. self-update script isolation test (no real install)"
+ssh -o BatchMode=yes "root@$HOST" 'cat > /tmp/mm-su.test.sh' < test/selfupdate.test.sh
+ssh -o BatchMode=yes "root@$HOST" 'sh /tmp/mm-su.test.sh /usr/sbin/mudimodem-selfupdate; rc=$?; rm -f /tmp/mm-su.test.sh; exit $rc' \
+  || fail "self-update isolation test failed"
+
+echo "10c. app_version live shape (direct dofile call, real network)"
+ssh -o BatchMode=yes "root@$HOST" 'lua -e '\''package.loaded["oui.ubus"]={call=function()end}; local M=dofile("/usr/lib/oui-httpd/rpc/mudimodem"); local r=M.app_version({}); assert(type(r)=="table" and r.installed~=nil, "app_version shape"); print("app_version live shape OK: installed="..tostring(r.installed).." checked="..tostring(r.checked))'\''' \
+  || fail "app_version live shape check failed"
+
+echo "11. Speedtest: files present, menu valid, chunk evals"
 ssh -o BatchMode=yes "root@$HOST" 'test -s /www/views/gl-sdk4-ui-mudimodem-speedtest.common.js.gz' \
   || fail "speedtest chunk .gz missing"
 ssh -o BatchMode=yes "root@$HOST" 'test -s /usr/share/oui/menu.d/mudimodem-speedtest.json' \
@@ -228,18 +251,18 @@ printf '%s' "$STBODY" | node -e '
     console.log("   speedtest chunk eval OK ->", c.name);
   })' || fail "speedtest chunk eval failed"
 
-echo "10a. Speedtest backend round trip (on-device)"
+echo "11a. Speedtest backend round trip (on-device)"
 ssh -o BatchMode=yes "root@$HOST" 'cat > /tmp/mm-st.test.lua' < test/backend-speedtest.test.lua
 ssh -o BatchMode=yes "root@$HOST" 'MUDIMODEM_SPEEDTEST_HIST=/tmp/mmst-hist.jsonl MUDIMODEM_ST_SCHEDULE=/tmp/mmst-sched.json lua /tmp/mm-st.test.lua; rc=$?; rm -f /tmp/mm-st.test.lua /tmp/mmst-hist.jsonl /tmp/mmst-sched.json; exit $rc' \
   || fail "speedtest backend test failed on-device"
 
-echo "10b. Speedtest scheduler service present (off by default)"
+echo "11b. Speedtest scheduler service present (off by default)"
 ssh -o BatchMode=yes "root@$HOST" 'test -x /usr/sbin/mudimodem-speedtestd' \
   || fail "speedtestd not installed (run ./tools/deploy.sh)"
 ssh -o BatchMode=yes "root@$HOST" 'pgrep -f mudimodem-speedtestd >/dev/null' \
   || fail "speedtestd process not running (/etc/init.d/mudimodem-speedtestd start)"
 
-echo "10c. LIVE: one real speed test end-to-end over Cellular"
+echo "11c. LIVE: one real speed test end-to-end over Cellular"
 ssh -o BatchMode=yes "root@$HOST" 'rm -f /tmp/mudimodem/speedtest-status.json'
 RESULT=$(ssh -o BatchMode=yes "root@$HOST" '
   rm -f /tmp/mmv-speedtests.jsonl

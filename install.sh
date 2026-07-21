@@ -39,6 +39,7 @@ gz_install src/views/mudimodem-console.js  /www/views/gl-sdk4-ui-mudimodem-conso
 gz_install src/at-library.snapshot.json    /www/mudimodem/at-library.json.gz
 cp_install src/menu/mudimodem.json          /usr/share/oui/menu.d/mudimodem.json          0644
 cp_install src/menu/mudimodem-tracking.json /usr/share/oui/menu.d/mudimodem-tracking.json 0644
+cp_install version.json                     /etc/mudimodem/version.json                   0644
 
 echo "installing AT channel + library tool:"
 cp_install tools/mudimodem-at.py /usr/lib/mudimodem/mudimodem-at.py 0644
@@ -48,6 +49,7 @@ echo "installing watchdog + validator + backend:"
 # Watchdog + validator BEFORE the backend: set_bands needs the watchdog present,
 # and the validator must exist before nginx reloads the plugin (§8).
 cp_install src/sbin/mudimodem-revert  /usr/sbin/mudimodem-revert            0755
+cp_install src/sbin/mudimodem-selfupdate /usr/sbin/mudimodem-selfupdate     0755
 cp_install src/validator/mudimodem.lua /usr/share/gl-validator.d/mudimodem.lua 0644
 cp_install src/rpc/mudimodem          /usr/lib/oui-httpd/rpc/mudimodem       0644
 # RESTART not reload: nginx caches the plugin per worker; reload leaves stale
@@ -75,10 +77,12 @@ for p in \
   /usr/lib/mudimodem/mudimodem-at.py \
   /usr/lib/mudimodem/mudimodem-lib \
   /usr/sbin/mudimodem-revert \
+  /usr/sbin/mudimodem-selfupdate \
   /usr/share/gl-validator.d/mudimodem.lua \
   /usr/lib/oui-httpd/rpc/mudimodem \
   /usr/sbin/mudimodem-collectd \
   /etc/init.d/mudimodem-collectd \
+  /etc/mudimodem/version.json \
 ; do grep -qxF "$p" "$f" || echo "$p" >> "$f"; done
 echo "  done"
 

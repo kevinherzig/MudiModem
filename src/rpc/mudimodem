@@ -1000,4 +1000,90 @@ function M.set_speedtest_schedule(args)
   return { ok = true, enabled = enabled, interval_seconds = interval }
 end
 
+-- ======================= Phase 5: MudiModem version check ====================
+-- app_version reads the installed version from a local file and the latest from
+-- version.json on GitHub main. No ubus here (a plain file read + a curl
+-- subprocess), so pcall(cjson.decode, ...) is safe (§8: pcall is only unsafe
+-- around a ubus cosocket call). The URL is a fixed constant — no RPC arg reaches
+-- the shell. Fail-silent: any network/parse failure sets error + checked=false.
+local VERSION_FILE = os.getenv("MUDIMODEM_VERSION_FILE") or "/etc/mudimodem/version.json"
+local VERSION_URL  = os.getenv("MUDIMODEM_VERSION_URL")
+  or "https://raw.githubusercontent.com/kevinherzig/MudiModem/main/version.json"
+local CURL         = os.getenv("MUDIMODEM_CURL") or "curl"
+
+local function read_version_file()
+  local f = io.open(VERSION_FILE, "r")
+  if not f then return "unknown" end
+  local s = f:read("*a") or ""
+  f:close()
+  local ok, obj = pcall(cjson.decode, s)   -- cjson.decode can't yield; pcall safe (§8)
+  if ok and type(obj) == "table" and obj.version then return tostring(obj.version) end
+  return "unknown"
+end
+
+function M.app_version(args)
+  local out = { installed = read_version_file(), latest = nil,
+                update_available = false, checked = false }
+  -- Fixed URL, shell-escaped defensively even though it never contains user input.
+  local q = "'" .. VERSION_URL:gsub("'", "'\\''") .. "'"
+  local f = io.popen(CURL .. " -fsS --max-time 8 " .. q .. " 2>/dev/null")
+  if not f then out.error = "curl spawn failed"; return out end
+  local body = f:read("*a") or ""
+  f:close()
+  local ok, obj = pcall(cjson.decode, body)
+  if not ok or type(obj) ~= "table" or not obj.version then
+    out.error = "remote version.json unreachable or malformed"
+    return out
+  end
+  out.latest = tostring(obj.version)
+  out.checked = true
+  out.update_available = (out.latest ~= out.installed)
+  return out
+end
+
+-- device_info: model + CPU for the Config tab. The browser-facing `system` rpc
+-- object has no `board` method, so we read it server-side via ubus (through
+-- ucall — never pcall, per §8).
+function M.device_info(args)
+  local r = ucall("system", "board", {})
+  if type(r) ~= "table" then return { model = "", cpu = "" } end
+  return { model = r.model or "", cpu = r.system or "" }
+end
+
+-- self_update launches the detached self-update script and returns at once
+-- (install.sh restarts nginx; running it in-handler would drop this connection).
+-- update_status polls the lockdir + result file the script writes. No ubus here,
+-- so no cosocket concern. The script path is a fixed constant.
+local SELFUPDATE_BIN = os.getenv("MUDIMODEM_SELFUPDATE_BIN") or "/usr/sbin/mudimodem-selfupdate"
+local UPDATE_LOCK    = os.getenv("MUDIMODEM_UPDATE_LOCK")   or "/etc/mudimodem/update.lock.d"
+local UPDATE_RESULT  = os.getenv("MUDIMODEM_UPDATE_RESULT") or "/etc/mudimodem/update-result.json"
+
+function M.self_update(args)
+  os.execute("mkdir -p /etc/mudimodem 2>/dev/null")
+  -- Fresh run: clear any stale result so update_status reflects THIS attempt.
+  os.remove(UPDATE_RESULT)
+  os.execute(SELFUPDATE_BIN .. " >/dev/null 2>&1 &")
+  return { ok = true, started = true }
+end
+
+function M.update_status(args)
+  -- lockdir present => an update is running.
+  local lock = io.open(UPDATE_LOCK .. "/.", "r")
+  local in_progress = false
+  if lock then lock:close(); in_progress = true
+  else
+    -- io.open on a directory path is unreliable; probe with a shell test instead.
+    in_progress = (os.execute("[ -d '" .. UPDATE_LOCK .. "' ]") == 0
+                or os.execute("[ -d '" .. UPDATE_LOCK .. "' ]") == true)
+  end
+  local result = nil
+  local f = io.open(UPDATE_RESULT, "r")
+  if f then
+    local s = f:read("*a") or ""; f:close()
+    local ok, obj = pcall(cjson.decode, s)
+    if ok and type(obj) == "table" then result = obj end
+  end
+  return { in_progress = in_progress, result = result }
+end
+
 return M

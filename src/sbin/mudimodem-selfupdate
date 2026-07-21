@@ -1,0 +1,42 @@
+#!/bin/sh
+# /usr/sbin/mudimodem-selfupdate — detached MudiModem self-update.
+#
+# Runs the idempotent, model-guarded install.sh from GitHub main. Launched
+# DETACHED by the mudimodem.self_update RPC method: install.sh ends with an
+# nginx restart, which would kill the /rpc connection if run in-handler.
+#
+# An atomic lockdir (mkdir is atomic) guards against double-click / concurrency.
+# The result is written to a state file the mudimodem.update_status method polls.
+# The install URL is a FIXED constant — no RPC argument reaches this shell.
+set -u
+
+LOCK="${MUDIMODEM_UPDATE_LOCK:-/etc/mudimodem/update.lock.d}"
+RESULT="${MUDIMODEM_UPDATE_RESULT:-/etc/mudimodem/update-result.json}"
+LOG="${MUDIMODEM_UPDATE_LOG:-/var/log/mudimodem-update.log}"
+CMD="${MUDIMODEM_UPDATE_CMD:-curl -fsSL https://raw.githubusercontent.com/kevinherzig/MudiModem/main/install.sh | sh}"
+
+STALE_MIN="${MUDIMODEM_LOCK_STALE_MIN:-10}"
+# A prior run killed by SIGKILL/OOM/power-loss can't fire its EXIT trap, leaving
+# the lockdir behind forever. Reap a lockdir older than STALE_MIN minutes so the
+# feature self-heals instead of wedging (recovery would otherwise need ssh).
+if [ -d "$LOCK" ] && [ -n "$(find "$LOCK" -maxdepth 0 -type d -mmin "+$STALE_MIN" 2>/dev/null)" ]; then
+  rmdir "$LOCK" 2>/dev/null || true
+fi
+
+# Atomic lock: if the dir already exists another update is in flight — no-op.
+if ! mkdir "$LOCK" 2>/dev/null; then
+  exit 0
+fi
+# Always release the lock, however we exit.
+trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
+
+: > "$LOG"
+if sh -c "$CMD" >> "$LOG" 2>&1; then
+  printf '{"ok":true,"finished_at":"%s"}\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$RESULT"
+else
+  rc=$?
+  # Escape the log tail for JSON: drop double-quotes and backslashes, collapse newlines.
+  tail=$(tail -n 3 "$LOG" 2>/dev/null | tr '\n' ' ' | tr -d '"\\')
+  printf '{"ok":false,"finished_at":"%s","error":"install failed (rc=%s): %s"}\n' \
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$rc" "$tail" > "$RESULT"
+fi

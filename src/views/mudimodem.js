@@ -86,6 +86,17 @@ module.exports = {
       failoverErr: "",
       failoverApplying: false,
       failoverConfirm: false,            // failover Apply would switch slots — confirm first
+      // ---- Config tab (Phase 5) ----
+      deviceInfo: null,       // { model, cpu } — fetched once via system.board
+      appVer: null,           // app_version result { installed, latest, update_available, checked, error? }
+      updateConfirm: false,   // "Update now" armed, awaiting a second click
+      updateConfirmTimer: null,
+      updating: false,        // self_update in flight / polling
+      updateMsg: "",          // final status line after an update attempt
+      updatePollTimer: null,
+      pollStopped: false,     // set true on teardown; makes an in-flight poll continuation a no-op
+      pollAttempts: 0,        // bounds the poll loop — give up after POLL_MAX
+      POLL_MAX: 40,           // ~2 minutes at the 3s poll interval
       // Approximate downlink centre freq (MHz) per band, for spectrum ordering
       // and labels. Source: 3GPP TS 38.101-1 (NR) / 36.101 (LTE), rounded to the
       // marketing figure. Labels only — the modem is never sent a frequency.
@@ -260,6 +271,10 @@ module.exports = {
       if (t === "lock" && !this.lockData && !this.lockLoading) this.fetchLock();
       if (t === "at" && !this.consoleComp && !this.consoleLoading) this.loadConsole();
       if (t === "sim") this.loadSimTab();
+      if (t === "config") {
+        if (!this.deviceInfo) this.fetchDeviceInfo();   // retries on every open until it succeeds
+        this.checkAppVersion();   // re-check every open, per spec
+      }
     },
     // A slot switch is done when GL's selected slot lands on the target.
     activeSlot(v) {
@@ -277,7 +292,12 @@ module.exports = {
     // data whatever tab we land on (the tab watcher only fires on a change).
     if (!this.bands && !this.bandsLoading) this.fetchBands();
   },
-  beforeDestroy() { this.clearCountdown(); this.clearSwitchState(); },
+  beforeDestroy() {
+    this.clearCountdown(); this.clearSwitchState();
+    if (this.updateConfirmTimer) clearTimeout(this.updateConfirmTimer);
+    if (this.updatePollTimer) clearTimeout(this.updatePollTimer);
+    this.pollStopped = true;
+  },
 
   methods: {
     qFromLevel(lvl) {
@@ -618,6 +638,135 @@ module.exports = {
         .catch(function (e) {
           self.failoverErr = (e && (e.type || e.message)) || "request failed";
         });
+    },
+    // ---- Config tab (Phase 5) ----
+    modemName() {
+      return (this.modem && this.modem.name) || "";   // this.modem already exists (computed)
+    },
+    fetchDeviceInfo() {
+      var self = this;
+      if (typeof window === "undefined" || !window.$rpcRequest) return Promise.resolve();
+      return window.$rpcRequest("call", ["sid", "mudimodem", "device_info", {}], { timeout: 8000 })
+        .then(function (r) {
+          self.deviceInfo = { model: (r && r.model) || "", cpu: (r && r.cpu) || "" };
+        })
+        .catch(function () { /* fail-silent: next tab-open retries via the !deviceInfo watcher */ });
+    },
+    checkAppVersion() {
+      var self = this;
+      if (typeof window === "undefined" || !window.$rpcRequest) return Promise.resolve();
+      return window.$rpcRequest("call", ["sid", "mudimodem", "app_version", {}], { timeout: 12000 })
+        .then(function (r) { self.appVer = r || null; })
+        .catch(function () { /* fail-silent: keep whatever we had, show installed only */ });
+    },
+    armUpdate() {
+      var self = this;
+      if (this.updateConfirm) return;         // already armed
+      this.updateConfirm = true;
+      if (this.updateConfirmTimer) clearTimeout(this.updateConfirmTimer);
+      this.updateConfirmTimer = setTimeout(function () { self.updateConfirm = false; }, 5000);
+    },
+    confirmUpdate() {
+      var self = this;
+      this.updateConfirm = false;
+      if (this.updateConfirmTimer) { clearTimeout(this.updateConfirmTimer); this.updateConfirmTimer = null; }
+      if (this.updating || typeof window === "undefined" || !window.$rpcRequest) return Promise.resolve();
+      this.updating = true; this.updateMsg = "Updating…";
+      this.pollStopped = false; this.pollAttempts = 0;   // fresh run — a prior update may have stopped/capped it
+      return window.$rpcRequest("call", ["sid", "mudimodem", "self_update", {}], { timeout: 12000 })
+        .then(function () { self.pollUpdate(); })
+        .catch(function (e) {
+          self.updating = false;
+          self.updateMsg = "Couldn't start update: " + ((e && (e.message || e.type)) || "error");
+        });
+    },
+    // Polls update_status every 3s until a terminal result, a give-up cap
+    // (POLL_MAX attempts), or the component tears down. `pollStopped` is the
+    // teardown guard: `updatePollTimer` only ever holds the id of the NEXT
+    // scheduled timer, so once a timer fires and its RPC is in flight, a plain
+    // clearTimeout in beforeDestroy can no longer cancel anything — the async
+    // continuation below is what must notice and stop rescheduling.
+    pollUpdate() {
+      var self = this;
+      if (this.updatePollTimer) clearTimeout(this.updatePollTimer);
+      this.updatePollTimer = setTimeout(function () {
+        if (self.pollStopped) return;   // torn down while this timer was pending
+        self.pollAttempts++;
+        window.$rpcRequest("call", ["sid", "mudimodem", "update_status", {}], { timeout: 8000 })
+          .then(function (s) {
+            if (self.pollStopped) return;   // torn down while the request was in flight
+            if (s && s.result) {
+              self.updating = false;
+              if (s.result.ok) {
+                var v = (self.appVer && self.appVer.latest) || "";
+                self.updateMsg = "Updated" + (v ? " to v" + v : "") + " — reload the page to load the new version.";
+              } else {
+                self.updateMsg = "Update failed: " + (s.result.error || "unknown") +
+                  " — see /var/log/mudimodem-update.log";
+              }
+            } else if (self.pollAttempts >= self.POLL_MAX) {
+              self.updating = false;
+              self.updateMsg = "Update is taking longer than expected — check /var/log/mudimodem-update.log, then reload the page.";
+            } else {
+              self.pollUpdate();   // still running (or nginx mid-restart) — keep polling
+            }
+          })
+          .catch(function () {
+            if (self.pollStopped) return;   // torn down while the request was in flight
+            if (self.pollAttempts >= self.POLL_MAX) {
+              self.updating = false;
+              self.updateMsg = "Update is taking longer than expected — check /var/log/mudimodem-update.log, then reload the page.";
+            } else {
+              self.pollUpdate();   // nginx restart drops a request; retry
+            }
+          });
+      }, 3000);
+    },
+    renderConfig(h) {
+      var self = this;
+      var row = function (label, value) {
+        return h("div", { staticClass: "mm-kv" }, [
+          h("span", { staticClass: "mm-k" }, label),
+          h("span", { staticClass: "mm-v" }, value || "—")
+        ]);
+      };
+
+      // --- Device card ---
+      var di = this.deviceInfo || {};
+      var device = h("div", { staticClass: "mm-card" }, [
+        h("div", { staticClass: "mm-card-h" }, "Device"),
+        row("Model", di.model),
+        row("CPU", di.cpu),
+        row("Modem", this.modemName())
+      ]);
+
+      // --- MudiModem / version card ---
+      var av = this.appVer || {};
+      var installed = av.installed || "unknown";
+      var verNodes = [h("span", {}, "MudiModem "
+        + (installed === "unknown" ? "(version unknown)" : "v" + installed))];
+      if (av.checked && av.update_available && av.latest) {
+        verNodes.push(h("span", { staticClass: "mm-upd" }, [
+          " (v" + av.latest + " available — ",
+          this.updateConfirm
+            ? h("a", { staticClass: "mm-link mm-warn", attrs: { href: "#" },
+                on: { click: function (e) { if (e.preventDefault) e.preventDefault(); self.confirmUpdate(); } } },
+                "click to confirm — briefly restarts the admin panel")
+            : h("a", { staticClass: "mm-link", attrs: { href: "#" },
+                on: { click: function (e) { if (e.preventDefault) e.preventDefault(); self.armUpdate(); } } },
+                "Update now"),
+          ")"
+        ]));
+      }
+      var verLine = h("div", { staticClass: "mm-kv" }, verNodes);
+
+      var cardKids = [h("div", { staticClass: "mm-card-h" }, "MudiModem"), verLine];
+      if (this.updateMsg) {
+        cardKids.push(h("div", { staticClass: "mm-note" }, this.updateMsg));
+      }
+      var app = h("div", { staticClass: "mm-card" }, cardKids);
+
+      return h("div", {}, [device, app]);
     },
     askSwitch(slot) { this.switchConfirm = slot; this.switchErr = ""; },
     clearSwitchState() {
@@ -1275,7 +1424,17 @@ module.exports = {
         '.mm-scan-row{display:flex;gap:10px;align-items:center;padding:7px 4px;border-bottom:1px solid var(--divider);font-size:12px}' +
         '.mm-scan-row>span{min-width:0}.mm-scan-row>span:nth-child(2){flex:1}' +
         '.mm-scan-badge{flex:none;font-size:10px;padding:1px 6px;border:1px solid var(--border);border-radius:3px;color:var(--text-badge)}' +
-        '@media(max-width:640px){.mm-strip{flex-direction:column}.mm-read{border-left:0;border-top:1px solid var(--divider);text-align:left;align-items:flex-start}.mm-facts{justify-content:flex-start}.mm-revert-row{flex-direction:column;align-items:flex-start}}';
+        '@media(max-width:640px){.mm-strip{flex-direction:column}.mm-read{border-left:0;border-top:1px solid var(--divider);text-align:left;align-items:flex-start}.mm-facts{justify-content:flex-start}.mm-revert-row{flex-direction:column;align-items:flex-start}}' +
+        // Config tab
+        '.mm-card+.mm-card{margin-top:11px}' +
+        '.mm-card-h{font-size:13px;font-weight:600;color:var(--text-title);margin-bottom:6px}' +
+        '.mm-kv{display:flex;gap:12px;padding:4px 0;font-size:14px}' +
+        '.mm-k{color:var(--text-hint);min-width:64px}' +
+        '.mm-v{color:var(--text)}' +
+        '.mm-link{color:var(--primary);cursor:pointer;text-decoration:underline}' +
+        '.mm-warn{color:var(--warning)}' +
+        '.mm-upd{color:var(--text-hint)}' +
+        '.mm-note{margin-top:8px;color:var(--text-hint);font-size:13px}';
       var el = document.createElement("style");
       el.id = this.styleId; el.textContent = css;
       document.head.appendChild(el);
@@ -1840,7 +1999,7 @@ module.exports = {
     // "tracking" is an in-page tab like the rest — the strip + tab bar stay put;
     // its graph chunk is lazy-loaded into the panel on first open.
     var TABS = [["tracking", "Tracking"], ["sim", "SIM"], ["lock", "Cell lock"],
-      ["bands", "Bands"], ["at", "AT console"], ["speedtest", "Speedtest"]];
+      ["bands", "Bands"], ["at", "AT console"], ["config", "Config"], ["speedtest", "Speedtest"]];
     var tabs = h("div", { staticClass: "mm-tabs" }, TABS.map(function (t) {
       return h("button", {
         key: t[0], staticClass: "mm-tab" + (self.tab === t[0] ? " on" : ""),
@@ -1878,6 +2037,8 @@ module.exports = {
       }
     } else if (this.tab === "sim") {
       panel = this.renderSim(h);
+    } else if (this.tab === "config") {
+      panel = this.renderConfig(h);
     } else if (this.tab === "speedtest") {
       if (this.speedtestComp) {
         panel = h(this.speedtestComp, { props: { embedded: true } });

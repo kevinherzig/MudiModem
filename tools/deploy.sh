@@ -60,12 +60,26 @@ if [ -f src/sbin/mudimodem-speedtestd ]; then
   echo "speedtest scheduler deployed + service (re)started (off by default)"
 fi
 
+# Phase 5: installed-version marker, read by mudimodem.app_version.
+ssh -o BatchMode=yes "root@$HOST" 'mkdir -p /etc/mudimodem && cat > /etc/mudimodem/version.json' \
+  < version.json
+echo "version.json deployed (/etc/mudimodem/version.json)"
+
 # Confirm-or-revert watchdog + panic restore (§5). Inert until invoked; install
 # it BEFORE the backend so set_bands can always find it.
 if [ -f src/sbin/mudimodem-revert ]; then
   ssh -o BatchMode=yes "root@$HOST" 'cat > /usr/sbin/mudimodem-revert && chmod 0755 /usr/sbin/mudimodem-revert && mkdir -p /etc/mudimodem' \
     < src/sbin/mudimodem-revert
   echo "watchdog installed (/usr/sbin/mudimodem-revert)"
+fi
+
+# Self-update script (Task 3). Detached, lockdir-guarded; install.sh restarts
+# nginx at the end, so mudimodem.self_update launches this rather than running
+# install.sh in-handler (which would drop the /rpc connection).
+if [ -f src/sbin/mudimodem-selfupdate ]; then
+  ssh -o BatchMode=yes "root@$HOST" 'cat > /usr/sbin/mudimodem-selfupdate && chmod 0755 /usr/sbin/mudimodem-selfupdate' \
+    < src/sbin/mudimodem-selfupdate
+  echo "self-update script installed (/usr/sbin/mudimodem-selfupdate)"
 fi
 
 # Arg validator for the mudimodem object. ⚠️ REQUIRED for the AT console: without
@@ -112,6 +126,7 @@ ssh -o BatchMode=yes "root@$HOST" 'f=/etc/sysupgrade.conf; touch "$f"; for p in 
   /usr/share/oui/menu.d/mudimodem-tracking.json \
   /usr/lib/oui-httpd/rpc/mudimodem \
   /usr/sbin/mudimodem-revert \
+  /usr/sbin/mudimodem-selfupdate \
   /usr/sbin/mudimodem-collectd \
   /etc/init.d/mudimodem-collectd \
   /www/views/gl-sdk4-ui-mudimodem-console.common.js.gz \
@@ -124,6 +139,7 @@ ssh -o BatchMode=yes "root@$HOST" 'f=/etc/sysupgrade.conf; touch "$f"; for p in 
   /usr/lib/mudimodem/mudimodem-speedtest.py \
   /usr/sbin/mudimodem-speedtestd \
   /etc/init.d/mudimodem-speedtestd \
+  /etc/mudimodem/version.json \
   ; do \
   grep -qxF "$p" "$f" || echo "$p" >> "$f" ; done'
 echo "sysupgrade.conf registered"
