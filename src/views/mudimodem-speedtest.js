@@ -191,12 +191,129 @@ module.exports = (function () {
         }, INTERVALS.map(function (iv) { return h("option", { attrs: { value: iv[0] }, key: iv[0] }, "Every " + iv[1]); }));
         return h("div", { staticClass: "mms-sched" }, [toggle, sel]);
       },
-      renderHistoryList: function (h) {
+      renderGraph: function (h) {
+        var self = this, results = this.filtered;
         if (this.resultsLoading) return h("div", { staticClass: "mms-empty" }, "Loading history…");
         if (this.resultsErr) return h("div", { staticClass: "mms-empty" }, "Couldn't load history: " + this.resultsErr);
-        if (!this.filtered.length) return h("div", { staticClass: "mms-empty" },
+        if (!results.length) return h("div", { staticClass: "mms-empty" },
           "No results yet for this interface. Run a speed test above.");
-        return null;   // Task 6 replaces this with the graph once results exist.
+
+        var W = this.width, PADL = 34, PADR = 12, PLOT_H = 160, LAT_H = 40, GAP = 14;
+        var plotTop = 10, plotBot = plotTop + PLOT_H;
+        var latTop = plotBot + GAP, latBot = latTop + LAT_H;
+        var t0 = results[0].t, t1 = results[results.length - 1].t;
+        var span = Math.max(1, t1 - t0);
+        var xOf = function (t) { return PADL + (t - t0) / span * (W - PADL - PADR); };
+
+        var maxMbps = 1;
+        results.forEach(function (r) {
+          if (r.down_mbps > maxMbps) maxMbps = r.down_mbps;
+          if (r.up_mbps > maxMbps) maxMbps = r.up_mbps;
+        });
+        var yMax = maxMbps * 1.15;
+        var yOf = function (v) { return plotBot - (Math.max(0, v || 0) / yMax) * PLOT_H; };
+        var maxLatency = 1;
+        results.forEach(function (r) { if (r.latency_ms > maxLatency) maxLatency = r.latency_ms; });
+        var latYOf = function (v) { return latBot - (Math.max(0, v || 0) / (maxLatency * 1.15)) * LAT_H; };
+
+        var kids = [];
+        kids.push(h("rect", { attrs: { x: PADL, y: 0, width: 10, height: 3, fill: "var(--primary)" } }));
+        kids.push(h("text", { attrs: { x: PADL + 14, y: 6, "font-size": 9.5, fill: "var(--text-badge)" } }, "Download"));
+        kids.push(h("rect", { attrs: { x: PADL + 78, y: 0, width: 10, height: 3, fill: "var(--success)" } }));
+        kids.push(h("text", { attrs: { x: PADL + 92, y: 6, "font-size": 9.5, fill: "var(--text-badge)" } }, "Upload"));
+
+        [plotTop, plotBot].forEach(function (yy) {
+          kids.push(h("line", { attrs: { x1: PADL, x2: W - PADR, y1: yy, y2: yy,
+            stroke: "var(--divider)", "stroke-width": 1 } }));
+        });
+
+        function linePath(key, color) {
+          var d = "", pen = false;
+          results.forEach(function (r) {
+            var v = r[key];
+            if (v == null) { pen = false; return; }
+            d += (pen ? "L" : "M") + xOf(r.t).toFixed(1) + " " + yOf(v).toFixed(1) + " ";
+            pen = true;
+          });
+          return d ? h("path", { attrs: { fill: "none", stroke: color, "stroke-width": 1.75, d: d.trim() } }) : null;
+        }
+        var downLine = linePath("down_mbps", "var(--primary)");
+        var upLine = linePath("up_mbps", "var(--success)");
+        if (downLine) kids.push(downLine);
+        if (upLine) kids.push(upLine);
+        results.forEach(function (r) {
+          kids.push(h("circle", { attrs: { cx: xOf(r.t).toFixed(1), cy: yOf(r.down_mbps).toFixed(1), r: 2.5, fill: "var(--primary)" } }));
+          kids.push(h("circle", { attrs: { cx: xOf(r.t).toFixed(1), cy: yOf(r.up_mbps).toFixed(1), r: 2.5, fill: "var(--success)" } }));
+        });
+
+        kids.push(h("text", { attrs: { x: 4, y: latTop + LAT_H / 2 + 3, "font-size": 9, fill: "var(--text-badge)" } }, "MS"));
+        kids.push(h("line", { attrs: { x1: PADL, x2: W - PADR, y1: latBot, y2: latBot,
+          stroke: "var(--divider)", "stroke-width": 1 } }));
+        var latD = "", penL = false;
+        results.forEach(function (r) {
+          if (r.latency_ms == null) { penL = false; return; }
+          latD += (penL ? "L" : "M") + xOf(r.t).toFixed(1) + " " + latYOf(r.latency_ms).toFixed(1) + " ";
+          penL = true;
+        });
+        if (latD) kids.push(h("path", { attrs: { fill: "none", stroke: "var(--warning)", "stroke-width": 1.5, d: latD.trim() } }));
+
+        if (this.cursor != null && results[this.cursor]) {
+          var cx = xOf(results[this.cursor].t);
+          kids.push(h("line", { attrs: { x1: cx.toFixed(1), x2: cx.toFixed(1), y1: plotTop, y2: latBot,
+            stroke: this.pinned != null ? "var(--primary)" : "var(--text-weak)", "stroke-width": 1 } }));
+        }
+
+        var svg = h("svg", { ref: "svg", attrs: { viewBox: "0 0 " + W + " " + (latBot + 4),
+          width: W, height: latBot + 4, preserveAspectRatio: "none" } }, kids);
+
+        var nearestIdx = function (evX) {
+          var best = 0, bestD = Infinity;
+          results.forEach(function (r, i) {
+            var d = Math.abs(xOf(r.t) - evX);
+            if (d < bestD) { bestD = d; best = i; }
+          });
+          return best;
+        };
+        var onMove = function (e) {
+          if (self.pinned != null) return;
+          var el = self.$refs && self.$refs.graph;
+          if (!el || !el.getBoundingClientRect) { self.cursor = results.length - 1; return; }
+          var rect = el.getBoundingClientRect();
+          if (!rect.width) { self.cursor = results.length - 1; return; }
+          var ux = ((e.clientX || 0) - rect.left) * self.width / rect.width;
+          self.cursor = nearestIdx(ux);
+        };
+        var onLeave = function () { if (self.pinned == null) self.cursor = null; };
+        var onClick = function (e) {
+          if (self.pinned != null) { self.pinned = null; return; }
+          onMove(e);
+          if (self.cursor == null) self.cursor = results.length - 1;
+          self.pinned = self.cursor;
+        };
+
+        var tip = null;
+        if (this.cursor != null && results[this.cursor]) {
+          var r = results[this.cursor];
+          var rows = [
+            ["Down", r.down_mbps == null ? "—" : r.down_mbps + " Mbps"],
+            ["Up", r.up_mbps == null ? "—" : r.up_mbps + " Mbps"],
+            ["Latency", r.latency_ms == null ? "—" : r.latency_ms + " ms (±" + (r.jitter_ms == null ? "—" : r.jitter_ms) + ")"],
+            ["Carrier", (r.carrier || "—") + " · SIM " + (r.slot == null ? "—" : r.slot)],
+            ["Band", r.band == null ? "—" : (r.mode && /NR5G/.test(r.mode) ? "n" : "B") + r.band],
+            ["Cell", r.cell_id == null ? "—" : r.cell_id],
+            ["RSRP", r.rsrp == null ? "—" : r.rsrp + " dBm"],
+            ["SINR", r.sinr == null ? "—" : r.sinr + " dB"],
+            ["RSRQ", r.rsrq == null ? "—" : r.rsrq + " dB"]
+          ];
+          tip = h("div", { staticClass: "mms-tip" }, [
+            h("div", { staticClass: "t" }, this.clock(r.t) + (this.pinned != null ? " · pinned" : ""))
+          ].concat(rows.map(function (row) {
+            return h("div", { staticClass: "mms-tip-row" }, [h("span", row[0]), h("b", row[1])]);
+          })));
+        }
+
+        return h("div", { ref: "graph", staticClass: "mms-graph",
+          on: { mousemove: onMove, mouseleave: onLeave, click: onClick } }, [svg, tip]);
       },
       injectStyle: function () {
         if (typeof document === "undefined" || document.getElementById(this.styleId)) return;
@@ -213,7 +330,12 @@ module.exports = (function () {
           '.mms-err{color:var(--error);font-size:12px}' +
           '.mms-sched{display:flex;align-items:center;gap:10px;margin-top:10px;font-size:12px}' +
           '.mms-sched-toggle{display:flex;align-items:center;gap:6px;cursor:pointer}' +
-          '.mms-empty{padding:24px 0;text-align:center;color:var(--text-hint);font-size:12.5px}';
+          '.mms-empty{padding:24px 0;text-align:center;color:var(--text-hint);font-size:12.5px}' +
+          '.mms-graph{position:relative;cursor:crosshair}.mms-graph svg{display:block;width:100%}' +
+          '.mms-tip{position:absolute;top:8px;left:8px;pointer-events:none;z-index:5;background:var(--background-card);border:1px solid var(--border);border-radius:4px;box-shadow:0 2px 8px rgba(0,0,0,.12);padding:8px 10px;min-width:170px}' +
+          '.mms-tip .t{font-size:10.5px;color:var(--text-badge);margin-bottom:5px}' +
+          '.mms-tip-row{display:flex;justify-content:space-between;gap:14px;font-size:11.5px;padding:1px 0}' +
+          '.mms-tip-row b{font-weight:600;color:var(--text-title)}';
         var el = document.createElement("style");
         el.id = this.styleId; el.textContent = css;
         document.head.appendChild(el);
@@ -236,7 +358,7 @@ module.exports = (function () {
               h("span", "History"), ifaceFilterSel,
               h("button", { staticClass: "mms-btn", on: { click: function () { self.clearHistory(); } } }, "Clear history")
             ]),
-            this.renderHistoryList(h)
+            this.renderGraph(h)
           ])
         ]);
       }

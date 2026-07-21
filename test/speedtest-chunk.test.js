@@ -156,6 +156,70 @@ test('interface dropdown marks a down interface as not connected', () => {
   assert.match(txt, /Wired WAN \(not connected\)/);
 });
 
+const RESULTS = [
+  { t: 1000, iface: 'cellular', down_mbps: 40, up_mbps: 10, latency_ms: 60, jitter_ms: 5,
+    carrier: 'T-Mobile', slot: 1, band: 71, mode: 'NR5G-SA FDD', cell_id: 'ABC', rsrp: -98, sinr: 8, rsrq: -11 },
+  { t: 2000, iface: 'cellular', down_mbps: 55, up_mbps: 12, latency_ms: 58, jitter_ms: 4,
+    carrier: 'T-Mobile', slot: 1, band: 71, mode: 'NR5G-SA FDD', cell_id: 'ABC', rsrp: -95, sinr: 9, rsrq: -10 },
+  { t: 3000, iface: 'wired', down_mbps: 500, up_mbps: 100, latency_ms: 8, jitter_ms: 1 }
+];
+
+test('renderGraph: draws a line for cellular results only when filtered', () => {
+  const c = loadChunk();
+  const vm = makeVm(c);
+  vm.results = RESULTS;
+  vm.filterIface = 'cellular';
+  vm.resultsLoading = false;
+  const svg = walk(c.render.call(vm, h)).find((n) => n.tag === 'svg');
+  assert.ok(svg, 'graph renders an svg once results exist');
+  const paths = walk(svg).filter((n) => n.tag === 'path');
+  assert.ok(paths.length >= 2, 'at least a download and upload line');
+});
+
+test('renderGraph: hovering picks the nearest result and shows a full snapshot popover', () => {
+  const c = loadChunk();
+  const vm = makeVm(c);
+  vm.results = RESULTS;
+  vm.filterIface = 'cellular';
+  vm.resultsLoading = false;
+  vm.width = 400;
+  vm.cursor = 1;   // simulate onMove having picked index 1
+  const txt = textOf(c.render.call(vm, h));
+  assert.match(txt, /55 Mbps/);
+  assert.match(txt, /12 Mbps/);
+  assert.match(txt, /58 ms/);
+  assert.match(txt, /T-Mobile/);
+  assert.match(txt, /n71/);
+  assert.match(txt, /-95 dBm/);
+});
+
+test('renderGraph: clicking pins the cursor; clicking again unpins', () => {
+  const c = loadChunk();
+  const vm = makeVm(c);
+  vm.results = RESULTS;
+  vm.filterIface = 'cellular';
+  vm.resultsLoading = false;
+  vm.width = 400;
+  const graphDiv = walk(c.render.call(vm, h)).find((n) => n.data.staticClass === 'mms-graph');
+  assert.ok(graphDiv.data.on && graphDiv.data.on.click, 'graph wires a click handler');
+  graphDiv.data.on.click({ clientX: 0, currentTarget: null });
+  assert.notStrictEqual(vm.pinned, null, 'click pins a cursor position');
+  const pinnedAt = vm.pinned;
+  graphDiv.data.on.click({ clientX: 0, currentTarget: null });
+  assert.strictEqual(vm.pinned, null, 'second click unpins');
+  pinnedAt;
+});
+
+test('renderGraph: empty-for-this-interface state is honest, no crash', () => {
+  const c = loadChunk();
+  const vm = makeVm(c);
+  vm.results = [RESULTS[2]];        // only a wired result
+  vm.filterIface = 'cellular';
+  vm.resultsLoading = false;
+  const txt = textOf(c.render.call(vm, h));
+  assert.match(txt, /No results yet for this interface/);
+});
+
 test('the chunk never issues raw AT and never calls tracking/console RPC objects', () => {
   const src = fs.readFileSync(SRC, 'utf8');
   assert.doesNotMatch(src, /get_result_AT|modem\.CPU\.AT|at_console/);
