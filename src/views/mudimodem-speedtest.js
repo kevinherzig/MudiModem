@@ -21,7 +21,7 @@ module.exports = (function () {
     latency: "Testing latency…" };
   function ifaceLabel(id) {
     for (var i = 0; i < IFACES.length; i++) if (IFACES[i][0] === id) return IFACES[i][1];
-    return id;
+    return "—";
   }
   // Shared label+value rows for a result record `r` -- used by both the
   // graph's hover tooltip and the latest-result panel, so the field list and
@@ -220,11 +220,11 @@ module.exports = (function () {
         var r = this.lastResult;
         var big = h("div", { staticClass: "mms-latest-big" }, [
           h("div", { staticClass: "mms-latest-metric" }, [
-            h("span", { staticClass: "v" }, r.down_mbps == null ? "—" : String(r.down_mbps)),
+            h("span", { staticClass: "v", style: { color: "var(--primary)" } }, r.down_mbps == null ? "—" : String(r.down_mbps)),
             h("span", { staticClass: "u" }, "Mbps down")
           ]),
           h("div", { staticClass: "mms-latest-metric" }, [
-            h("span", { staticClass: "v" }, r.up_mbps == null ? "—" : String(r.up_mbps)),
+            h("span", { staticClass: "v", style: { color: "var(--success)" } }, r.up_mbps == null ? "—" : String(r.up_mbps)),
             h("span", { staticClass: "u" }, "Mbps up")
           ]),
           h("div", { staticClass: "mms-latest-metric" }, [
@@ -239,7 +239,7 @@ module.exports = (function () {
             h("span", { staticClass: "mms-latest-when" }, ifaceLabel(r.iface) + " · " + this.clock(r.t))
           ]),
           big,
-          h("div", { staticClass: "mms-latest-rows" }, rows.map(function (row) {
+          h("div", {}, rows.map(function (row) {
             return h("div", { staticClass: "mms-tip-row" }, [h("span", row[0]), h("b", row[1])]);
           }))
         ]);

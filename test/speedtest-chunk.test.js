@@ -138,7 +138,7 @@ test('fetchStatus(): a stale "done" status already on disk at mount does not pop
   } finally { unstubRpc(); calls; }
 });
 
-test('runTest(): a new run does not clear the previous lastResult until it completes', () => {
+test('runTest(): a new run does not clear the previous lastResult until it completes', async () => {
   const vm = makeVm(loadChunk());
   vm.lastResult = { t: 1, iface: 'cellular', down_mbps: 10 };
   const calls = stubRpc([{ started: true }]);
@@ -146,6 +146,7 @@ test('runTest(): a new run does not clear the previous lastResult until it compl
     vm.runIface = 'cellular';
     vm.runTest();
     assert.deepStrictEqual(vm.lastResult, { t: 1, iface: 'cellular', down_mbps: 10 }, 'old result stays until replaced');
+    await Promise.resolve(); await Promise.resolve();
   } finally {
     if (vm.statusPoll) clearInterval(vm.statusPoll);
     unstubRpc(); calls;
@@ -233,6 +234,28 @@ test('renderLatestResult: null fields render as an honest em-dash placeholder', 
   const txt = textOf(c.render.call(vm, h));
   assert.match(txt, /Wired WAN/);
   assert.match(txt, /—/, 'missing carrier/band/cell/rsrp/sinr/rsrq render as em dash');
+});
+
+test('renderLatestResult: Down headline uses --primary, Up headline uses --success', () => {
+  const c = loadChunk();
+  const vm = makeVm(c);
+  vm.resultsLoading = false;
+  vm.lastResult = { t: 2000, iface: 'cellular', down_mbps: 55, up_mbps: 12, latency_ms: 58, jitter_ms: 4 };
+  const nodes = walk(c.render.call(vm, h)).filter((n) => n.data && n.data.staticClass === 'v');
+  assert.strictEqual(nodes.length, 3, 'down, up, and latency headline spans');
+  assert.strictEqual(nodes[0].data.style && nodes[0].data.style.color, 'var(--primary)', 'down uses --primary');
+  assert.strictEqual(nodes[1].data.style && nodes[1].data.style.color, 'var(--success)', 'up uses --success');
+  assert.ok(!nodes[2].data.style || nodes[2].data.style.color !== 'var(--primary)',
+    'latency stays neutral, not colored like a direction');
+});
+
+test('ifaceLabel: an unmatched/missing iface never renders the literal string "undefined"', () => {
+  const c = loadChunk();
+  const vm = makeVm(c);
+  vm.resultsLoading = false;
+  vm.lastResult = { t: 1000, down_mbps: 10, up_mbps: 2, latency_ms: 20, jitter_ms: 1 }; // no iface
+  const txt = textOf(c.render.call(vm, h));
+  assert.doesNotMatch(txt, /undefined/);
 });
 
 test('renderLatestResult: card sits between the controls card and the History card', () => {
