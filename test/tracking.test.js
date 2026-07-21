@@ -93,6 +93,16 @@ test('empty (loaded, no samples) explains the collector', () => {
   assert.match(textOf(c.render.call(vm, h)), /collector runs on the router/);
 });
 
+test('default range is the 15 m view (state + active segment)', () => {
+  const c = loadChunk();
+  const vm = makeVm(c);
+  assert.strictEqual(vm.winW, 15, 'data() default winW is 15');
+  const on = walk(c.render.call(makeVm(c, { samples: seedSamples(), events: [] }), h))
+    .filter((n) => n.tag === 'button' && n.data.staticClass === 'on');
+  assert.strictEqual(on.length, 1, 'exactly one active range segment');
+  assert.strictEqual(textOf(on[0]), '15 m', 'the 15 m segment is the active one');
+});
+
 test('renders one overlaid plot (RSRP/SINR/RSRQ) + three buses + a derived handover tick', () => {
   const c = loadChunk();
   const vm = makeVm(c, { samples: seedSamples(), events: [], winW: 60 });

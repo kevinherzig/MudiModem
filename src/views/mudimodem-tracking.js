@@ -50,7 +50,7 @@ module.exports = (function () {
     props: { embedded: { type: Boolean, default: false } },
 
     data: function () {
-      return { winW: 60, pinnedM: null, tick: 0, live: true, width: 900,
+      return { winW: 15, pinnedM: null, tick: 0, live: true, width: 900,
         styleId: "mmt-css", cursor: null, poll: null,
         samples: [], events: [], lastT: 0, serverNow: 0, serverNowAt: 0,
         loading: true, err: "", fetching: false,
