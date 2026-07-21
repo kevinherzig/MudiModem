@@ -242,8 +242,12 @@ module.exports = (function () {
         if (downLine) kids.push(downLine);
         if (upLine) kids.push(upLine);
         results.forEach(function (r) {
-          kids.push(h("circle", { attrs: { cx: xOf(r.t).toFixed(1), cy: yOf(r.down_mbps).toFixed(1), r: 2.5, fill: "var(--primary)" } }));
-          kids.push(h("circle", { attrs: { cx: xOf(r.t).toFixed(1), cy: yOf(r.up_mbps).toFixed(1), r: 2.5, fill: "var(--success)" } }));
+          if (r.down_mbps != null) {
+            kids.push(h("circle", { attrs: { cx: xOf(r.t).toFixed(1), cy: yOf(r.down_mbps).toFixed(1), r: 2.5, fill: "var(--primary)" } }));
+          }
+          if (r.up_mbps != null) {
+            kids.push(h("circle", { attrs: { cx: xOf(r.t).toFixed(1), cy: yOf(r.up_mbps).toFixed(1), r: 2.5, fill: "var(--success)" } }));
+          }
         });
 
         kids.push(h("text", { attrs: { x: 4, y: latTop + LAT_H / 2 + 3, "font-size": 9, fill: "var(--text-badge)" } }, "MS"));

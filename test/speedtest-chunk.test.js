@@ -220,6 +220,28 @@ test('renderGraph: empty-for-this-interface state is honest, no crash', () => {
   assert.match(txt, /No results yet for this interface/);
 });
 
+test('renderGraph: skips circles when down_mbps or up_mbps is null (honest gaps)', () => {
+  const c = loadChunk();
+  const vm = makeVm(c);
+  // Create results where index 1 has down_mbps: null (simulating a partial result).
+  // We should get 2*(results.length) circles total if all were present, but only 2*3-1=5 because one is missing.
+  vm.results = [
+    { t: 1000, iface: 'cellular', down_mbps: 40, up_mbps: 10, latency_ms: 60 },
+    { t: 2000, iface: 'cellular', down_mbps: null, up_mbps: 12, latency_ms: 58 },  // down is null
+    { t: 3000, iface: 'cellular', down_mbps: 55, up_mbps: null, latency_ms: 62 }   // up is null
+  ];
+  vm.filterIface = 'cellular';
+  vm.resultsLoading = false;
+  const svg = walk(c.render.call(vm, h)).find((n) => n.tag === 'svg');
+  const circles = walk(svg).filter((n) => n.tag === 'circle');
+  // With 3 results, we'd have 6 circles if all were present.
+  // Result 1: down_mbps null -> skip down circle, keep up -> 1 circle
+  // Result 2: up_mbps null -> keep down, skip up -> 1 circle
+  // Result 3: both present -> 2 circles
+  // Total: 4 circles (not 6)
+  assert.strictEqual(circles.length, 4, 'must skip circles for null values; found ' + circles.length);
+});
+
 test('the chunk never issues raw AT and never calls tracking/console RPC objects', () => {
   const src = fs.readFileSync(SRC, 'utf8');
   assert.doesNotMatch(src, /get_result_AT|modem\.CPU\.AT|at_console/);
