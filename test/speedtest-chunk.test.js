@@ -1,0 +1,158 @@
+const assert = require('node:assert');
+const fs = require('node:fs');
+const path = require('node:path');
+const test = require('node:test');
+
+const SRC = path.join(__dirname, '..', 'src', 'views', 'mudimodem-speedtest.js');
+
+function loadChunk() {
+  const module = { exports: {} };
+  const source = fs.readFileSync(SRC, 'utf8');
+  return eval(source);
+}
+
+function h(tag, data, children) {
+  if (Array.isArray(data) || typeof data === 'string') { children = data; data = {}; }
+  return { tag, data: data || {}, children };
+}
+function textOf(node) {
+  if (node == null) return '';
+  if (typeof node === 'string') return node;
+  if (Array.isArray(node)) return node.map(textOf).join('');
+  return textOf(node.children);
+}
+function walk(node, out) {
+  out = out || [];
+  if (node == null || typeof node === 'string') return out;
+  if (Array.isArray(node)) { node.forEach((n) => walk(n, out)); return out; }
+  out.push(node);
+  walk(node.children, out);
+  return out;
+}
+function makeVm(component) {
+  const vm = Object.assign({}, component.data());
+  for (const [k, fn] of Object.entries(component.methods || {})) vm[k] = fn.bind(vm);
+  for (const [k, fn] of Object.entries(component.computed || {})) {
+    Object.defineProperty(vm, k, { get: fn.bind(vm), configurable: true });
+  }
+  return vm;
+}
+function stubRpc(replies) {
+  const calls = [];
+  global.window = {
+    $rpcRequest(method, params, opts) {
+      calls.push({ method, params, opts });
+      const r = replies.shift();
+      return (r instanceof Error) ? Promise.reject(r) : Promise.resolve(r);
+    }
+  };
+  return calls;
+}
+function unstubRpc() { delete global.window; }
+
+test('chunk evals to a render-only component named mudimodem-speedtest', () => {
+  const c = loadChunk();
+  assert.strictEqual(c.name, 'mudimodem-speedtest');
+  assert.strictEqual(c.template, undefined, 'template: is forbidden');
+  assert.strictEqual(typeof c.render, 'function');
+});
+
+test('renders an honest empty state before data arrives', () => {
+  const c = loadChunk();
+  const vm = makeVm(c);
+  vm.resultsLoading = true;
+  const txt = textOf(c.render.call(vm, h));
+  assert.match(txt, /Run speed test/);
+  assert.match(txt, /Loading history/);
+});
+
+test('runTest(): calls run_speedtest with the picked interface, sets running state', async () => {
+  const calls = stubRpc([{ started: true }]);
+  try {
+    const vm = makeVm(loadChunk());
+    vm.runIface = 'wired';
+    vm.runTest();
+    assert.strictEqual(vm.status.running, true, 'optimistic running state set immediately');
+    await Promise.resolve(); await Promise.resolve();
+    assert.deepStrictEqual(calls[0].params, ['sid', 'mudimodem', 'run_speedtest', { iface: 'wired' }]);
+  } finally { unstubRpc(); }
+});
+
+test('runTest(): iface_down surfaces as a friendly error, not a crash', async () => {
+  const calls = stubRpc([{ error: 'iface_down', iface: 'wired' }]);
+  try {
+    const vm = makeVm(loadChunk());
+    vm.runIface = 'wired';
+    vm.runTest();
+    await Promise.resolve(); await Promise.resolve();
+    assert.strictEqual(vm.status.running, false);
+    assert.match(vm.status.message, /Wired WAN is not connected/);
+  } finally { unstubRpc(); calls; }
+});
+
+test('runTest(): no-ops while a test is already running', () => {
+  const vm = makeVm(loadChunk());
+  vm.status = { running: true, phase: 'download' };
+  const calls = stubRpc([]);
+  try {
+    vm.runTest();
+    assert.strictEqual(calls.length, 0, 'must not start a second test');
+  } finally { unstubRpc(); }
+});
+
+test('fetchStatus(): a finished test stops polling and refreshes history', async () => {
+  const calls = stubRpc([{ running: false, phase: 'done' }, { results: [{ t: 1, down_mbps: 1 }] }]);
+  try {
+    const vm = makeVm(loadChunk());
+    vm.statusPoll = setInterval(() => {}, 100000);
+    vm.fetchStatus(false);
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    assert.strictEqual(vm.statusPoll, null, 'poll cleared once the test is done');
+    assert.strictEqual(calls[1].params[2], 'get_speedtest_history', 'history refetched after completion');
+  } finally { unstubRpc(); }
+});
+
+test('setSchedule(): posts enabled+interval, then re-fetches', async () => {
+  const calls = stubRpc([{ ok: true }, { enabled: true, interval_seconds: 3600, last_run: 0 }]);
+  try {
+    const vm = makeVm(loadChunk());
+    vm.setSchedule(true, 3600);
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    assert.deepStrictEqual(calls[0].params, ['sid', 'mudimodem', 'set_speedtest_schedule',
+      { enabled: true, interval_seconds: 3600 }]);
+    assert.strictEqual(calls[1].params[2], 'get_speedtest_schedule');
+  } finally { unstubRpc(); }
+});
+
+test('clearHistory(): empties the local results list', async () => {
+  const calls = stubRpc([{ ok: true }]);
+  try {
+    const vm = makeVm(loadChunk());
+    vm.results = [{ t: 1 }];
+    vm.clearHistory();
+    await Promise.resolve(); await Promise.resolve();
+    assert.deepStrictEqual(vm.results, []);
+    assert.strictEqual(calls[0].params[2], 'clear_speedtest_history');
+  } finally { unstubRpc(); }
+});
+
+test('filtered: only shows results matching filterIface', () => {
+  const vm = makeVm(loadChunk());
+  vm.results = [{ t: 1, iface: 'cellular' }, { t: 2, iface: 'wired' }];
+  vm.filterIface = 'cellular';
+  assert.strictEqual(vm.filtered.length, 1);
+  assert.strictEqual(vm.filtered[0].t, 1);
+});
+
+test('interface dropdown marks a down interface as not connected', () => {
+  const c = loadChunk();
+  const vm = makeVm(c);
+  vm.ifaces = { cellular: { device: 'rmnet_data0', up: true }, wired: { device: null, up: false } };
+  const txt = textOf(c.render.call(vm, h));
+  assert.match(txt, /Wired WAN \(not connected\)/);
+});
+
+test('the chunk never issues raw AT and never calls tracking/console RPC objects', () => {
+  const src = fs.readFileSync(SRC, 'utf8');
+  assert.doesNotMatch(src, /get_result_AT|modem\.CPU\.AT|at_console/);
+});
