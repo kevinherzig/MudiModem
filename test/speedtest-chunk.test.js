@@ -68,14 +68,18 @@ test('renders an honest empty state before data arrives', () => {
 
 test('runTest(): calls run_speedtest with the picked interface, sets running state', async () => {
   const calls = stubRpc([{ started: true }]);
+  let vm;
   try {
-    const vm = makeVm(loadChunk());
+    vm = makeVm(loadChunk());
     vm.runIface = 'wired';
     vm.runTest();
     assert.strictEqual(vm.status.running, true, 'optimistic running state set immediately');
     await Promise.resolve(); await Promise.resolve();
     assert.deepStrictEqual(calls[0].params, ['sid', 'mudimodem', 'run_speedtest', { iface: 'wired' }]);
-  } finally { unstubRpc(); }
+  } finally {
+    if (vm && vm.statusPoll) clearInterval(vm.statusPoll);
+    unstubRpc();
+  }
 });
 
 test('runTest(): iface_down surfaces as a friendly error, not a crash', async () => {
