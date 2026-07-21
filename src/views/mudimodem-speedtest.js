@@ -19,6 +19,10 @@ module.exports = (function () {
     [21600, "6 hours"], [43200, "12 hours"], [86400, "24 hours"]];
   var PHASE_TEXT = { download: "Testing download…", upload: "Testing upload…",
     latency: "Testing latency…" };
+  function ifaceLabel(id) {
+    for (var i = 0; i < IFACES.length; i++) if (IFACES[i][0] === id) return IFACES[i][1];
+    return id;
+  }
 
   var component = {
     name: "mudimodem-speedtest",
@@ -197,6 +201,43 @@ module.exports = (function () {
         }, INTERVALS.map(function (iv) { return h("option", { attrs: { value: iv[0] }, key: iv[0] }, "Every " + iv[1]); }));
         return h("div", { staticClass: "mms-sched" }, [toggle, sel]);
       },
+      renderLatestResult: function (h) {
+        if (!this.lastResult) return null;
+        var r = this.lastResult;
+        var big = h("div", { staticClass: "mms-latest-big" }, [
+          h("div", { staticClass: "mms-latest-metric" }, [
+            h("span", { staticClass: "v" }, r.down_mbps == null ? "—" : String(r.down_mbps)),
+            h("span", { staticClass: "u" }, "Mbps down")
+          ]),
+          h("div", { staticClass: "mms-latest-metric" }, [
+            h("span", { staticClass: "v" }, r.up_mbps == null ? "—" : String(r.up_mbps)),
+            h("span", { staticClass: "u" }, "Mbps up")
+          ]),
+          h("div", { staticClass: "mms-latest-metric" }, [
+            h("span", { staticClass: "v" }, r.latency_ms == null ? "—" : String(r.latency_ms)),
+            h("span", { staticClass: "u" }, "ms latency")
+          ])
+        ]);
+        var rows = [
+          ["Latency", r.latency_ms == null ? "—" : r.latency_ms + " ms (±" + (r.jitter_ms == null ? "—" : r.jitter_ms) + ")"],
+          ["Carrier", (r.carrier || "—") + " · SIM " + (r.slot == null ? "—" : r.slot)],
+          ["Band", r.band == null ? "—" : (r.mode && /NR5G/.test(r.mode) ? "n" : "B") + r.band],
+          ["Cell", r.cell_id == null ? "—" : r.cell_id],
+          ["RSRP", r.rsrp == null ? "—" : r.rsrp + " dBm"],
+          ["SINR", r.sinr == null ? "—" : r.sinr + " dB"],
+          ["RSRQ", r.rsrq == null ? "—" : r.rsrq + " dB"]
+        ];
+        return h("div", { staticClass: "mms-card" }, [
+          h("div", { staticClass: "mms-latest-head" }, [
+            h("span", { staticClass: "mms-title" }, "Latest result"),
+            h("span", { staticClass: "mms-latest-when" }, ifaceLabel(r.iface) + " · " + this.clock(r.t))
+          ]),
+          big,
+          h("div", { staticClass: "mms-latest-rows" }, rows.map(function (row) {
+            return h("div", { staticClass: "mms-tip-row" }, [h("span", row[0]), h("b", row[1])]);
+          }))
+        ]);
+      },
       renderGraph: function (h) {
         var self = this, results = this.filtered;
         if (this.resultsLoading) return h("div", { staticClass: "mms-empty" }, "Loading history…");
@@ -345,7 +386,13 @@ module.exports = (function () {
           '.mms-tip{position:absolute;top:8px;left:8px;pointer-events:none;z-index:5;background:var(--background-card);border:1px solid var(--border);border-radius:4px;box-shadow:0 2px 8px rgba(0,0,0,.12);padding:8px 10px;min-width:170px}' +
           '.mms-tip .t{font-size:10.5px;color:var(--text-badge);margin-bottom:5px}' +
           '.mms-tip-row{display:flex;justify-content:space-between;gap:14px;font-size:11.5px;padding:1px 0}' +
-          '.mms-tip-row b{font-weight:600;color:var(--text-title)}';
+          '.mms-tip-row b{font-weight:600;color:var(--text-title)}' +
+          '.mms-latest-head{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:10px}' +
+          '.mms-latest-when{font-size:11px;color:var(--text-badge)}' +
+          '.mms-latest-big{display:flex;gap:22px;margin-bottom:10px;flex-wrap:wrap}' +
+          '.mms-latest-metric{display:flex;flex-direction:column}' +
+          '.mms-latest-metric .v{font-size:22px;font-weight:700;color:var(--text-title);line-height:1.15}' +
+          '.mms-latest-metric .u{font-size:10.5px;color:var(--text-badge)}';
         var el = document.createElement("style");
         el.id = this.styleId; el.textContent = css;
         document.head.appendChild(el);
@@ -363,6 +410,7 @@ module.exports = (function () {
         }, IFACES.map(function (i) { return h("option", { attrs: { value: i[0] }, key: i[0] }, i[1]); }));
         return h("div", { staticClass: "mms" }, [
           h("div", { staticClass: "mms-card" }, [head, this.renderControls(h), this.renderSchedule(h)]),
+          this.renderLatestResult(h),
           h("div", { staticClass: "mms-card" }, [
             h("div", { staticClass: "mms-controls" }, [
               h("span", "History"), ifaceFilterSel,

@@ -200,6 +200,54 @@ test('ifacesErr renders as a visible error instead of failing silently', () => {
   assert.match(txt, /Couldn't check interfaces: timeout/);
 });
 
+test('renderLatestResult: absent until a result exists', () => {
+  const c = loadChunk();
+  const vm = makeVm(c);
+  vm.resultsLoading = false;
+  const txt = textOf(c.render.call(vm, h));
+  assert.doesNotMatch(txt, /Latest result/);
+});
+
+test('renderLatestResult: shows headline numbers + detail rows for the just-finished test', () => {
+  const c = loadChunk();
+  const vm = makeVm(c);
+  vm.resultsLoading = false;
+  vm.lastResult = { t: 2000, iface: 'cellular', down_mbps: 55, up_mbps: 12, latency_ms: 58, jitter_ms: 4,
+    carrier: 'T-Mobile', slot: 1, band: 71, mode: 'NR5G-SA FDD', cell_id: 'ABC', rsrp: -95, sinr: 9, rsrq: -10 };
+  const txt = textOf(c.render.call(vm, h));
+  assert.match(txt, /Latest result/);
+  assert.match(txt, /Cellular/);
+  assert.match(txt, /55/);
+  assert.match(txt, /12/);
+  assert.match(txt, /58/);
+  assert.match(txt, /T-Mobile/);
+  assert.match(txt, /n71/);
+  assert.match(txt, /-95 dBm/);
+});
+
+test('renderLatestResult: null fields render as an honest em-dash placeholder', () => {
+  const c = loadChunk();
+  const vm = makeVm(c);
+  vm.resultsLoading = false;
+  vm.lastResult = { t: 1000, iface: 'wired', down_mbps: 500, up_mbps: 100, latency_ms: 8, jitter_ms: 1 };
+  const txt = textOf(c.render.call(vm, h));
+  assert.match(txt, /Wired WAN/);
+  assert.match(txt, /—/, 'missing carrier/band/cell/rsrp/sinr/rsrq render as em dash');
+});
+
+test('renderLatestResult: card sits between the controls card and the History card', () => {
+  const c = loadChunk();
+  const vm = makeVm(c);
+  vm.resultsLoading = false;
+  vm.lastResult = { t: 1000, iface: 'cellular', down_mbps: 10, up_mbps: 2, latency_ms: 20, jitter_ms: 1 };
+  const txt = textOf(c.render.call(vm, h));
+  const speedtestIdx = txt.indexOf('Speedtest');
+  const latestIdx = txt.indexOf('Latest result');
+  const historyIdx = txt.indexOf('History');
+  assert.ok(speedtestIdx >= 0 && latestIdx > speedtestIdx, 'Latest result comes after the page header');
+  assert.ok(historyIdx > latestIdx, 'History still comes after Latest result');
+});
+
 const RESULTS = [
   { t: 1000, iface: 'cellular', down_mbps: 40, up_mbps: 10, latency_ms: 60, jitter_ms: 5,
     carrier: 'T-Mobile', slot: 1, band: 71, mode: 'NR5G-SA FDD', cell_id: 'ABC', rsrp: -98, sinr: 8, rsrq: -11 },
