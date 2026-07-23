@@ -636,6 +636,9 @@ MudiModem/
   `gl_modem` SIGSTOPped during the send (paired CONT + startup recovery; verify.sh 8e asserts no
   stopped daemon survives). Gate: set/nv library entries need the banner checkbox; free-typed always
   sends. Spec: `docs/superpowers/specs/2026-07-18-at-console-library-design.md`.
+- ✅ **Battery charge limit (2026-07-22)** — Config tab toggle + GUI % target; ships
+  glbattlimit + config-aware hotplug/init; default disabled. Spec:
+  docs/superpowers/specs/2026-07-22-battery-charge-limit-design.md
 - 🔭 Later: `install.sh`/`uninstall.sh` (device-guarded + idempotent, mirroring MudiUI's); register
   the watchdog `boot-check` in a boot hook; `/etc/sysupgrade.conf`; ipk.
 
