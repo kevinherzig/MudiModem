@@ -27,7 +27,8 @@ local ALLOWED = { get_bands = true, set_bands = true, confirm = true, revert_now
                   get_speedtest_interfaces = true, run_speedtest = true, get_speedtest_status = true,
                   get_speedtest_history = true, clear_speedtest_history = true,
                   get_speedtest_schedule = true, set_speedtest_schedule = true,
-                  app_version = true, device_info = true, self_update = true, update_status = true }
+                  app_version = true, device_info = true, self_update = true, update_status = true,
+                  get_battlimit = true, set_battlimit = true }
 for k, v in pairs(M) do
   if type(v) == "function" then
     assert(ALLOWED[k], "unexpected RPC method exposed: " .. k)

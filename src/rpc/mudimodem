@@ -1086,4 +1086,165 @@ function M.update_status(args)
   return { in_progress = in_progress, result = result }
 end
 
+-- ---- Battery charge limit (Config tab) ------------------------------------
+-- Policy file + glbattlimit CLI. No ubus. Spec:
+-- docs/superpowers/specs/2026-07-22-battery-charge-limit-design.md
+-- Env (MUDIMODEM_BATTLIMIT_FILE / MUDIMODEM_BATTLIMIT_BIN) re-read each call
+-- so isolation tests can override after dofile.
+
+local function battlimit_file()
+  return os.getenv("MUDIMODEM_BATTLIMIT_FILE") or "/etc/mudimodem/battlimit.json"
+end
+local function battlimit_bin()
+  return os.getenv("MUDIMODEM_BATTLIMIT_BIN") or "/usr/bin/glbattlimit"
+end
+
+local function batt_defaults()
+  return { enabled = false, limit_gui = 80 }
+end
+
+local function read_batt_policy()
+  local p = batt_defaults()
+  local f = io.open(battlimit_file(), "r")
+  if not f then return p end
+  local body = f:read("*a") or ""; f:close()
+  local ok, obj = pcall(cjson.decode, body)
+  if not ok or type(obj) ~= "table" then return p end
+  if type(obj.enabled) == "boolean" then p.enabled = obj.enabled end
+  local g = tonumber(obj.limit_gui)
+  if g and g == math.floor(g) and g >= 20 and g <= 100 then p.limit_gui = g end
+  return p
+end
+
+local function write_batt_policy(enabled, limit_gui)
+  os.execute("mkdir -p /etc/mudimodem 2>/dev/null")
+  local path = battlimit_file()
+  local tmp = path .. ".tmp." .. tostring(os.time())
+  local f, err = io.open(tmp, "w")
+  if not f then return false, err or "open failed" end
+  -- cjson encodes booleans correctly; keep pretty-min for ash sed extract.
+  f:write(string.format('{"enabled":%s,"limit_gui":%d}\n',
+    enabled and "true" or "false", limit_gui))
+  f:close()
+  local ok = os.rename(tmp, path)
+  if not ok then os.remove(tmp); return false, "rename failed" end
+  return true
+end
+
+local function run_glbattlimit(args)
+  -- args is a shell-safe string already built from validated integers / fixed words
+  local bin = battlimit_bin()
+  local f = io.popen(bin .. " " .. args .. " 2>/dev/null")
+  if not f then return nil end
+  local out = f:read("*a") or ""
+  f:close()
+  return out
+end
+
+local function bin_available()
+  local bin = battlimit_bin()
+  -- executable check (Lua 5.1 returns int exit status; 5.2+ returns true/nil)
+  return (os.execute("[ -x '" .. bin:gsub("'", "'\\''") .. "' ]") == 0)
+      or (os.execute("[ -x '" .. bin:gsub("'", "'\\''") .. "' ]") == true)
+end
+
+-- Parse `glbattlimit status` human text. Tolerant of small format drift.
+local function parse_status(text)
+  local s = {
+    active = false, active_gauge = nil,
+    capacity_gauge = nil, capacity_gui = nil,
+    charger_online = false,
+  }
+  if not text or text == "" then return s end
+  if text:find("Limit%s*:%s*active", 1) then
+    s.active = true
+    local ag = text:match("active %((%d+)%s*%%%s*gauge")
+    if ag then s.active_gauge = tonumber(ag) end
+  end
+  local cg, cgui = text:match("Capacity%s*:%s*(%d+)%s*%%%s*gauge%s*/%s*~(%d+)%s*%%%s*GUI")
+  if cg then s.capacity_gauge = tonumber(cg) end
+  if cgui then s.capacity_gui = tonumber(cgui) end
+  local on = text:match("Charger%s*:%s*online=(%d)")
+  if on == "1" then s.charger_online = true end
+  return s
+end
+
+-- GUI→gauge using the same integer formula as the tool (gui2gauge).
+local function gui_to_gauge(gui)
+  local GUI_M, GUI_B = 13867, 189300
+  return math.floor((gui * 10000 + GUI_B + GUI_M / 2) / GUI_M)
+end
+
+local function snapshot_battlimit()
+  local pol = read_batt_policy()
+  local out = {
+    enabled = pol.enabled,
+    limit_gui = pol.limit_gui,
+    limit_gauge = gui_to_gauge(pol.limit_gui),
+    active = false,
+    active_gauge = nil,
+    capacity_gauge = nil,
+    capacity_gui = nil,
+    charger_online = false,
+    available = false,
+    error = nil,
+  }
+  if not bin_available() then
+    out.error = "glbattlimit not installed"
+    return out
+  end
+  out.available = true
+  local text = run_glbattlimit("status")
+  if not text or text == "" or text:find("ERROR:", 1, true) then
+    out.available = false
+    out.error = "glbattlimit status failed"
+    return out
+  end
+  local st = parse_status(text)
+  out.active = st.active
+  out.active_gauge = st.active_gauge
+  out.capacity_gauge = st.capacity_gauge
+  out.capacity_gui = st.capacity_gui
+  out.charger_online = st.charger_online
+  return out
+end
+
+function M.get_battlimit(args)
+  return snapshot_battlimit()
+end
+
+function M.set_battlimit(args)
+  args = args or {}
+  local enabled = args.enabled
+  local limit_gui = tonumber(args.limit_gui)
+  if type(enabled) ~= "boolean"
+     or not limit_gui or limit_gui ~= math.floor(limit_gui)
+     or limit_gui < 20 or limit_gui > 100 then
+    local out = snapshot_battlimit()
+    out.error = "invalid params"
+    return out
+  end
+  local ok, err = write_batt_policy(enabled, limit_gui)
+  if not ok then
+    local out = snapshot_battlimit()
+    out.error = err or "write failed"
+    return out
+  end
+  if not bin_available() then
+    local out = snapshot_battlimit()
+    out.error = "glbattlimit not installed"
+    return out
+  end
+  if not enabled then
+    run_glbattlimit("off")
+  else
+    -- Only apply when charger is online; status tells us.
+    local st = parse_status(run_glbattlimit("status") or "")
+    if st.charger_online then
+      run_glbattlimit("on " .. tostring(limit_gui) .. " gui")
+    end
+  end
+  return snapshot_battlimit()
+end
+
 return M
