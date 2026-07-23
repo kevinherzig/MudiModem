@@ -1,0 +1,189 @@
+#!/bin/sh
+#
+# glbattlimit - charge limit for GL.iNet Mudi 7 (GL-E5800)
+#
+#   glbattlimit on [PERCENT]   enable limit (default 80)
+#   glbattlimit off            disable limit, normal charging
+#   glbattlimit status         show current state
+#
+# The watcher terminates itself when the charger is unplugged and restores
+# the factory state, so the next plug-in charges normally again.
+#
+# How it works (verified on firmware 4.8.5):
+#   1. SGM41600 switched-capacitor charger (2:1) -> charge_en = 0
+#      quec_battery then re-enables the SGM41542S buck charger.
+#   2. SGM41542S buck -> vreg set below the current cell voltage
+#      so the buck does not charge either. Result: 0 mA charge current.
+#
+# Both writes are restrictive only (vreg << bat_ovp_uv = 4.4 V).
+# Overcharging is impossible; on any failure the device just charges normally.
+#
+# https://github.com/ChiliApple/mudi7-battery-limit
+#
+
+BAT=/sys/class/power_supply/cw221X-bat
+CHG=/sys/class/power_supply/charger
+PUMP=/sys/class/power_supply/sgm41600-standalone/device/sgm41600
+BUCK=/sys/class/power_supply/charger/device/sgm41542s
+
+VREG_NORMAL=4400000       # factory constant-voltage target (uV)
+VREG_FLOOR=3900000        # lowest value used for gating (uV)
+VREG_MARGIN=150           # mV below current terminal voltage
+DEF_LIMIT=80
+POLL=15
+PIDF=/tmp/glbattlimit.pid
+LIMF=/tmp/glbattlimit.limit
+
+# --- gauge <-> GUI conversion (PROVISIONAL) -------------------------------
+# The GL.iNet GUI/touchscreen does not show the fuel gauge value. Measured
+# pairs fit a straight line very closely (4 points, max deviation 0.5 pt):
+#
+#   GUI = 1.3867 * gauge - 18.93
+#
+# Extrapolated, GUI 100 % is gauge ~86 and GUI 0 % is gauge ~14, i.e. the GUI
+# stretches the usable window onto 0-100 - consistent with the `v42_cap`
+# symbol in quec_battery (capacity referenced to a 4.2 V full charge on a
+# 4.4 V cell). Only validated between gauge 62 and 78; treat values outside
+# that band as estimates. Scaled integer math, no floating point in ash.
+GUI_M=13867          # slope  * 10000
+GUI_B=189300         # offset * 10000 (subtracted)
+
+# Rounded, not truncated: ash does integer division, so half the divisor is
+# added before dividing. Truncating here cost about one point per conversion
+# and two on a round trip.
+gauge2gui() { g=$(( ($1 * GUI_M - GUI_B + 5000) / 10000 ))
+              [ "$g" -lt 0 ] && g=0; [ "$g" -gt 100 ] && g=100; echo "$g"; }
+gui2gauge() { echo $(( ($1 * 10000 + GUI_B + GUI_M / 2) / GUI_M )); }
+
+log() { logger -t glbattlimit "$*"; }
+
+need() {
+    for f in "$BAT/capacity" "$BAT/voltage_now" "$BAT/current_now" \
+             "$CHG/online" "$PUMP/charge_en" "$BUCK/vreg"; do
+        if [ ! -e "$f" ]; then
+            echo "ERROR: $f missing - wrong model or firmware."
+            exit 1
+        fi
+    done
+}
+
+cap()     { cat "$BAT/capacity"; }
+vnow_mv() { echo $(( $(cat "$BAT/voltage_now") / 1000 )); }
+online()  { cat "$CHG/online"; }
+
+gate_on() {
+    t=$(( $(vnow_mv) - VREG_MARGIN ))
+    t=$(( t * 1000 ))
+    [ "$t" -lt "$VREG_FLOOR" ] && t=$VREG_FLOOR
+    echo 0 > "$PUMP/charge_en" 2>/dev/null
+    echo "$t" > "$BUCK/vreg" 2>/dev/null
+}
+
+# Only restore vreg. Do NOT write charge_en=2 ourselves: the SGM41600 is a
+# slave charger and switching it back is the host's job. The buck resumes
+# charging immediately; the pump returns on the next plug event.
+gate_off() { echo "$VREG_NORMAL" > "$BUCK/vreg" 2>/dev/null; }
+
+stop_watcher() {
+    [ -f "$PIDF" ] || return 0
+    p=$(cat "$PIDF" 2>/dev/null)
+    [ -n "$p" ] && kill "$p" 2>/dev/null
+    sleep 1
+    rm -f "$PIDF" "$LIMF"
+}
+
+watch_loop() {
+    echo $$ > "$PIDF"
+    lim=$(cat "$LIMF" 2>/dev/null)
+    [ -z "$lim" ] && lim=$DEF_LIMIT
+    trap 'gate_off; rm -f "$PIDF" "$LIMF"; log "stopped, limit released"; exit 0' INT TERM
+    log "active, limit ${lim}%"
+    while :; do
+        if [ "$(online)" != "1" ]; then
+            gate_off
+            rm -f "$PIDF" "$LIMF"
+            log "unplugged - factory state restored"
+            exit 0
+        fi
+        if [ "$(cap)" -ge "$lim" ]; then gate_on; else gate_off; fi
+        sleep "$POLL"
+    done
+}
+
+case "$1" in
+  on)
+    need
+    l="$2"
+    [ -z "$l" ] && l=$DEF_LIMIT
+    case "$l" in
+        ''|*[!0-9]*) echo "Invalid value: $l"; exit 1 ;;
+    esac
+    if [ "$3" = "gui" ]; then
+        if [ "$l" -lt 20 ] || [ "$l" -gt 100 ]; then
+            echo "GUI value must be between 20 and 100."
+            exit 1
+        fi
+        g=$(gui2gauge "$l")
+        echo "GUI ${l} % -> gauge ${g} % (estimate, see README)"
+        l=$g
+    fi
+    if [ "$l" -lt 50 ] || [ "$l" -gt 100 ]; then
+        echo "Limit must be between 50 and 100 (gauge scale)."
+        exit 1
+    fi
+    stop_watcher
+    if [ "$(online)" != "1" ]; then
+        echo "No charger connected - nothing to do."
+        exit 1
+    fi
+    echo "$l" > "$LIMF"
+    nohup "$0" _watch >/dev/null 2>&1 &
+    sleep 2
+    echo "Charge limit active: $l % gauge / ~$(gauge2gui $l) % GUI"
+    echo "Currently: $(cap) % gauge / ~$(gauge2gui $(cap)) % GUI"
+    echo "Released automatically when the charger is unplugged."
+    ;;
+
+  off)
+    need
+    stop_watcher
+    gate_off
+    echo "Charge limit off - normal charging."
+    echo "Full charge current returns after the next unplug/plug cycle."
+    ;;
+
+  status)
+    need
+    p=$(cat "$PIDF" 2>/dev/null)
+    if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+        lm=$(cat $LIMF 2>/dev/null)
+        echo "Limit     : active ($lm % gauge / ~$(gauge2gui $lm) % GUI, PID $p)"
+    else
+        echo "Limit     : off"
+    fi
+    echo "Capacity  : $(cap) % gauge / ~$(gauge2gui $(cap)) % GUI (estimated)"
+    echo "Voltage   : $(vnow_mv) mV"
+    echo "Current   : $(cat $BAT/current_now) mA  (+charging -discharging 0=blocked)"
+    echo "Charger   : online=$(online)"
+    echo "Pump      : charge_en=$(cat $PUMP/charge_en)  (0=off 1=bypass 2=2:1)"
+    echo "Buck vreg : $(cat $BUCK/vreg) uV  (factory $VREG_NORMAL)"
+    ;;
+
+  _watch)
+    watch_loop
+    ;;
+
+  *)
+    echo "glbattlimit - charge limit for GL.iNet Mudi 7 (GL-E5800)"
+    echo ""
+    echo "  glbattlimit on [PERCENT]       enable limit, gauge scale (default $DEF_LIMIT)"
+    echo "  glbattlimit on [PERCENT] gui   enable limit, GUI scale (converted)"
+    echo "  glbattlimit off                disable limit"
+    echo "  glbattlimit status             show state"
+    echo ""
+    echo "  Gauge and GUI use different scales - see status output."
+    exit 1
+    ;;
+esac
+
+exit 0
