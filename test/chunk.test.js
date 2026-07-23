@@ -1684,9 +1684,49 @@ test('config tab battery: null battLimit shows Loading', () => {
   const vm = makeVm(c, LIVE);
   vm.tab = 'config';
   vm.battLimit = null;
+  vm.battLimitErr = '';
   const txt = textOf(vm.renderConfig(h));
   assert.match(txt, /Battery charge limit/, 'card still present');
   assert.match(txt, /Loading/, 'loading placeholder');
+});
+
+test('config tab battery: get_battlimit failure shows error not eternal Loading', async () => {
+  const calls = stubRpc([
+    { model: 'GL.iNet GL-E5800', cpu: 'ARMv8' },
+    { installed: '1.0.0', latest: null, update_available: false, checked: false },
+    Object.assign(new Error('rpc down'), { type: 'timeout' })  // get_battlimit rejects
+  ]);
+  try {
+    const c = loadChunk();
+    const vm = makeVm(c, LIVE);
+    c.watch.tab.call(vm, 'config');
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    assert.equal(vm.battLimit, null, 'battLimit stays null on rejection');
+    assert.ok(vm.battLimitErr, 'battLimitErr set from rejection');
+    const txt = textOf(vm.renderConfig(h));
+    assert.match(txt, /Battery charge limit/, 'card still present');
+    assert.match(txt, /timeout|rpc down|request failed/, 'error text surfaced');
+    assert.doesNotMatch(txt, /Loading/, 'not stuck on Loading alone');
+    const blCalls = calls.filter((x) => x.params[2] === 'get_battlimit');
+    assert.equal(blCalls.length, 1, 'get_battlimit attempted once');
+  } finally { unstubRpc(); }
+});
+
+test('applyBattLimit: incomplete error response keeps prior battLimit snapshot', async () => {
+  const prior = Object.assign({}, BL_OFF);
+  const calls = stubRpc([{ error: 'tool failed' }]);  // no available / limit_gui
+  try {
+    const c = loadChunk();
+    const vm = makeVm(c, LIVE);
+    vm.battLimit = prior;
+    vm.battLimitDraft = 80;
+    await vm.applyBattLimit({ enabled: true });
+    assert.equal(calls.length, 1, 'set_battlimit called');
+    assert.equal(vm.battLimit, prior, 'snapshot not overwritten by incomplete response');
+    assert.equal(vm.battLimit.enabled, false, 'prior enabled preserved');
+    assert.match(vm.battLimitErr, /tool failed/, 'error from response shown');
+    assert.equal(vm.battLimitBusy, false);
+  } finally { unstubRpc(); }
 });
 
 test('config tab: opening config fetches get_battlimit', async () => {
