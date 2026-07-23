@@ -280,4 +280,41 @@ RESULT=$(ssh -o BatchMode=yes "root@$HOST" '
 ') || fail "live speed test failed (produced no result, timed out, or result missing down_mbps/up_mbps/latency_ms/carrier)"
 echo "   live result: $RESULT"
 
+# 12. Battery charge limit stack + isolation tests.
+if [ -f src/sbin/glbattlimit ]; then
+  echo "12. battery charge limit"
+  ssh -o BatchMode=yes "root@$HOST" 'test -x /usr/bin/glbattlimit' \
+    || fail "glbattlimit missing"
+  ssh -o BatchMode=yes "root@$HOST" 'test -x /etc/hotplug.d/i2c/20-glbattlimit' \
+    || fail "hotplug glbattlimit missing"
+  ssh -o BatchMode=yes "root@$HOST" 'test -x /etc/init.d/glbattlimit' \
+    || fail "init glbattlimit missing"
+  ssh -o BatchMode=yes "root@$HOST" 'test -f /etc/mudimodem/battlimit.json' \
+    || fail "battlimit.json missing"
+  ssh -o BatchMode=yes "root@$HOST" 'grep -q "function M.get_battlimit" /usr/lib/oui-httpd/rpc/mudimodem && grep -q "function M.set_battlimit" /usr/lib/oui-httpd/rpc/mudimodem' \
+    || fail "backend missing get_battlimit/set_battlimit"
+  # Live status (read-only; does not change charge path).
+  ssh -o BatchMode=yes "root@$HOST" '/usr/bin/glbattlimit status >/dev/null' \
+    || fail "glbattlimit status failed"
+
+  echo "12a. get/set_battlimit isolation test (stub bin + temp config)"
+  ssh -o BatchMode=yes "root@$HOST" 'cat > /tmp/mm-batt.test.lua' < test/backend-battlimit.test.lua
+  ssh -o BatchMode=yes "root@$HOST" 'MM_TMP=/tmp/mm-batt-test MUDIMODEM_BATTLIMIT_FILE=/tmp/mm-batt-test/battlimit.json MUDIMODEM_BATTLIMIT_BIN=/tmp/mm-batt-test/glbattlimit MM_PLUGIN=/usr/lib/oui-httpd/rpc/mudimodem lua /tmp/mm-batt.test.lua; rc=$?; rm -rf /tmp/mm-batt.test.lua /tmp/mm-batt-test; exit $rc' \
+    || fail "backend-battlimit isolation test failed"
+
+  echo "12b. hotplug/init config isolation test (stub bin, no sysfs)"
+  # Push sources the hotplug test needs: scripts under /tmp so the on-device test
+  # can run without the full repo tree. Adapt ROOT by unpacking into a mini tree.
+  ssh -o BatchMode=yes "root@$HOST" 'mkdir -p /tmp/mm-batt-hp/src/hotplug /tmp/mm-batt-hp/src/etc/init.d /tmp/mm-batt-hp/test'
+  ssh -o BatchMode=yes "root@$HOST" 'cat > /tmp/mm-batt-hp/src/hotplug/20-glbattlimit' < src/hotplug/20-glbattlimit
+  ssh -o BatchMode=yes "root@$HOST" 'cat > /tmp/mm-batt-hp/src/etc/init.d/glbattlimit' < src/etc/init.d/glbattlimit
+  ssh -o BatchMode=yes "root@$HOST" 'cat > /tmp/mm-batt-hp/test/battlimit-hotplug.test.sh' < test/battlimit-hotplug.test.sh
+  ssh -o BatchMode=yes "root@$HOST" 'chmod +x /tmp/mm-batt-hp/test/battlimit-hotplug.test.sh /tmp/mm-batt-hp/src/hotplug/20-glbattlimit /tmp/mm-batt-hp/src/etc/init.d/glbattlimit; sh /tmp/mm-batt-hp/test/battlimit-hotplug.test.sh; rc=$?; rm -rf /tmp/mm-batt-hp; exit $rc' \
+    || fail "battlimit-hotplug isolation test failed"
+
+  # sysupgrade registration
+  ssh -o BatchMode=yes "root@$HOST" 'grep -qxF /usr/bin/glbattlimit /etc/sysupgrade.conf && grep -qxF /etc/mudimodem/battlimit.json /etc/sysupgrade.conf' \
+    || fail "battlimit paths not in sysupgrade.conf"
+fi
+
 echo "ALL CHECKS PASSED"

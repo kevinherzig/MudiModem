@@ -28,7 +28,20 @@ FILES="
 /usr/lib/oui-httpd/rpc/mudimodem
 /usr/sbin/mudimodem-collectd
 /etc/init.d/mudimodem-collectd
+/usr/bin/glbattlimit
+/etc/hotplug.d/i2c/20-glbattlimit
+/etc/init.d/glbattlimit
+/etc/mudimodem/battlimit.json
 "
+
+# Release charge limit before removing the binary (restores factory charge path).
+if [ -x /usr/bin/glbattlimit ]; then
+  /usr/bin/glbattlimit off 2>/dev/null || true
+  echo "charge limit released"
+fi
+if [ -x /etc/init.d/glbattlimit ]; then
+  /etc/init.d/glbattlimit disable 2>/dev/null || true
+fi
 
 # Stop + disable the collector service before removing its files.
 if [ -x /etc/init.d/mudimodem-collectd ]; then

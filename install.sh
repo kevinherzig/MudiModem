@@ -30,7 +30,8 @@ gz_install()  { grab "$1"; gzip -9 -c "$tmp" > "$2"; rm -f "$tmp"; echo "  $2"; 
 cp_install()  { grab "$1"; cat "$tmp" > "$2"; chmod "$3" "$2"; rm -f "$tmp"; echo "  $2"; } # $1 src, $2 target, $3 mode
 
 mkdir -p /www/views /www/mudimodem /usr/lib/mudimodem /usr/share/oui/menu.d \
-         /usr/share/gl-validator.d /usr/lib/oui-httpd/rpc /usr/sbin /etc/init.d /etc/mudimodem
+         /usr/share/gl-validator.d /usr/lib/oui-httpd/rpc /usr/sbin /usr/bin \
+         /etc/init.d /etc/mudimodem /etc/hotplug.d/i2c
 
 echo "installing view chunks + menu + library:"
 gz_install src/views/mudimodem.js          /www/views/gl-sdk4-ui-mudimodem.common.js.gz
@@ -64,6 +65,25 @@ cp_install src/etc/init.d/mudimodem-collectd  /etc/init.d/mudimodem-collectd  07
 /etc/init.d/mudimodem-collectd restart 2>/dev/null || true
 echo "  collector enabled + started"
 
+echo "installing battery charge limit:"
+# Off first if a previous install's watcher is active — replacing the binary
+# under a running watcher is racy.
+if [ -x /usr/bin/glbattlimit ]; then
+  /usr/bin/glbattlimit off 2>/dev/null || true
+fi
+cp_install src/sbin/glbattlimit           /usr/bin/glbattlimit                 0755
+cp_install src/hotplug/20-glbattlimit     /etc/hotplug.d/i2c/20-glbattlimit    0755
+cp_install src/etc/init.d/glbattlimit     /etc/init.d/glbattlimit              0755
+# Default policy only if absent — never clobber user settings on upgrade.
+if [ ! -f /etc/mudimodem/battlimit.json ]; then
+  echo '{"enabled":false,"limit_gui":80}' > /etc/mudimodem/battlimit.json
+  chmod 0644 /etc/mudimodem/battlimit.json
+  echo "  /etc/mudimodem/battlimit.json (default disabled)"
+fi
+/etc/init.d/glbattlimit enable 2>/dev/null || true
+# Do NOT start a limit on install (default disabled; start would no-op anyway).
+echo "  battery charge limit stack installed"
+
 # Survive a firmware upgrade (our files live outside /etc/config). Idempotent.
 echo "registering files in /etc/sysupgrade.conf:"
 f=/etc/sysupgrade.conf; touch "$f"
@@ -83,6 +103,10 @@ for p in \
   /usr/sbin/mudimodem-collectd \
   /etc/init.d/mudimodem-collectd \
   /etc/mudimodem/version.json \
+  /usr/bin/glbattlimit \
+  /etc/hotplug.d/i2c/20-glbattlimit \
+  /etc/init.d/glbattlimit \
+  /etc/mudimodem/battlimit.json \
 ; do grep -qxF "$p" "$f" || echo "$p" >> "$f"; done
 echo "  done"
 

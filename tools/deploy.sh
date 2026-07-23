@@ -117,6 +117,24 @@ if [ -f src/sbin/mudimodem-collectd ]; then
   echo "collector deployed + service (re)started"
 fi
 
+# Battery charge limit: glbattlimit + hotplug + init + default policy JSON.
+# Off first if a previous watcher is active — replacing the binary mid-run is racy.
+if [ -f src/sbin/glbattlimit ]; then
+  ssh -o BatchMode=yes "root@$HOST" '[ -x /usr/bin/glbattlimit ] && /usr/bin/glbattlimit off || true' 2>/dev/null || true
+  ssh -o BatchMode=yes "root@$HOST" 'cat > /usr/bin/glbattlimit && chmod 0755 /usr/bin/glbattlimit' \
+    < src/sbin/glbattlimit
+  ssh -o BatchMode=yes "root@$HOST" 'mkdir -p /etc/hotplug.d/i2c; cat > /etc/hotplug.d/i2c/20-glbattlimit && chmod 0755 /etc/hotplug.d/i2c/20-glbattlimit' \
+    < src/hotplug/20-glbattlimit
+  ssh -o BatchMode=yes "root@$HOST" 'cat > /etc/init.d/glbattlimit && chmod 0755 /etc/init.d/glbattlimit' \
+    < src/etc/init.d/glbattlimit
+  ssh -o BatchMode=yes "root@$HOST" '
+    mkdir -p /etc/mudimodem
+    [ -f /etc/mudimodem/battlimit.json ] || echo "{\"enabled\":false,\"limit_gui\":80}" > /etc/mudimodem/battlimit.json
+    /etc/init.d/glbattlimit enable 2>/dev/null || true
+  '
+  echo "battery charge limit stack deployed"
+fi
+
 # Preserve our files across a firmware upgrade (they live outside /etc/config).
 # Idempotent: only add lines not already present.
 ssh -o BatchMode=yes "root@$HOST" 'f=/etc/sysupgrade.conf; touch "$f"; for p in \
@@ -140,6 +158,10 @@ ssh -o BatchMode=yes "root@$HOST" 'f=/etc/sysupgrade.conf; touch "$f"; for p in 
   /usr/sbin/mudimodem-speedtestd \
   /etc/init.d/mudimodem-speedtestd \
   /etc/mudimodem/version.json \
+  /usr/bin/glbattlimit \
+  /etc/hotplug.d/i2c/20-glbattlimit \
+  /etc/init.d/glbattlimit \
+  /etc/mudimodem/battlimit.json \
   ; do \
   grep -qxF "$p" "$f" || echo "$p" >> "$f" ; done'
 echo "sysupgrade.conf registered"
