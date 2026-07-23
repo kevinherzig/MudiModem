@@ -1,0 +1,30 @@
+#!/bin/sh /etc/rc.common
+# Boot-time apply for MudiModem charge limit when already on charger power.
+# Same policy file as the hotplug path.
+
+START=99
+
+CFG="${MUDIMODEM_BATTLIMIT_FILE:-/etc/mudimodem/battlimit.json}"
+BIN="${MUDIMODEM_BATTLIMIT_BIN:-/usr/bin/glbattlimit}"
+
+start() {
+    if [ -n "${MUDIMODEM_BATTLIMIT_CHG_ONLINE+x}" ]; then
+        [ "$MUDIMODEM_BATTLIMIT_CHG_ONLINE" = "1" ] || return 0
+    else
+        [ "$(cat /sys/class/power_supply/charger/online 2>/dev/null)" = "1" ] || return 0
+    fi
+
+    enabled=false
+    limit_gui=80
+    if [ -f "$CFG" ]; then
+        e=$(sed -n 's/.*"enabled"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' "$CFG" | head -n1)
+        g=$(sed -n 's/.*"limit_gui"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$CFG" | head -n1)
+        [ -n "$e" ] && enabled=$e
+        [ -n "$g" ] && limit_gui=$g
+    fi
+    [ "$enabled" = "true" ] || return 0
+    case "$limit_gui" in ''|*[!0-9]*) return 0 ;; esac
+    [ "$limit_gui" -ge 20 ] && [ "$limit_gui" -le 100 ] || return 0
+    [ -x "$BIN" ] || return 0
+    "$BIN" on "$limit_gui" gui >/dev/null 2>&1
+}

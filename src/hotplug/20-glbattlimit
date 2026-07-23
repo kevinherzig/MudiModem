@@ -1,0 +1,47 @@
+#!/bin/sh
+# Re-apply MudiModem charge limit on charger-related i2c hotplug events.
+# Reads /etc/mudimodem/battlimit.json (GUI-scale target). No-op when disabled
+# or when a watcher is already running.
+# Spec: docs/superpowers/specs/2026-07-22-battery-charge-limit-design.md
+
+CFG="${MUDIMODEM_BATTLIMIT_FILE:-/etc/mudimodem/battlimit.json}"
+BIN="${MUDIMODEM_BATTLIMIT_BIN:-/usr/bin/glbattlimit}"
+PIDF=/tmp/glbattlimit.pid
+
+case "$DRIVER" in
+    cw221X|cw2217|aw35615|sgm41542*|qpnp*|pmic*) ;;
+    *) exit 0 ;;
+esac
+
+# Charger online? Env override for tests; else sysfs.
+if [ -n "${MUDIMODEM_BATTLIMIT_CHG_ONLINE+x}" ]; then
+    [ "$MUDIMODEM_BATTLIMIT_CHG_ONLINE" = "1" ] || exit 0
+else
+    [ "$(cat /sys/class/power_supply/charger/online 2>/dev/null)" = "1" ] || exit 0
+fi
+
+# Already watching?
+p=$(cat "$PIDF" 2>/dev/null)
+[ -n "$p" ] && kill -0 "$p" 2>/dev/null && exit 0
+
+# Defaults: disabled
+enabled=false
+limit_gui=80
+if [ -f "$CFG" ]; then
+    # Minimal extract for our fixed shape { "enabled": bool, "limit_gui": N }
+    e=$(sed -n 's/.*"enabled"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' "$CFG" | head -n1)
+    g=$(sed -n 's/.*"limit_gui"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$CFG" | head -n1)
+    [ -n "$e" ] && enabled=$e
+    [ -n "$g" ] && limit_gui=$g
+fi
+
+[ "$enabled" = "true" ] || exit 0
+
+# Sanity range (GUI 20–100); refuse garbage rather than call the tool wrong
+case "$limit_gui" in
+    ''|*[!0-9]*) exit 0 ;;
+esac
+[ "$limit_gui" -ge 20 ] && [ "$limit_gui" -le 100 ] || exit 0
+
+[ -x "$BIN" ] || exit 0
+"$BIN" on "$limit_gui" gui >/dev/null 2>&1
