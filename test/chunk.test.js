@@ -1572,11 +1572,31 @@ test('pollUpdate: gives up after POLL_MAX attempts with a clear message', async 
   } finally { unstubRpc(); }
 });
 
+// --- Config tab: Battery charge limit card ---
+
+const BL_OFF = {
+  enabled: false, limit_gui: 80, limit_gauge: 71,
+  active: false, active_gauge: null, capacity_gauge: 72, capacity_gui: 81,
+  charger_online: false, available: true, error: null
+};
+const BL_ARMED = {
+  enabled: true, limit_gui: 80, limit_gauge: 71,
+  active: false, active_gauge: null, capacity_gauge: 72, capacity_gui: 81,
+  charger_online: false, available: true, error: null
+};
+const BL_ACTIVE = {
+  enabled: true, limit_gui: 80, limit_gauge: 71,
+  active: true, active_gauge: 71, capacity_gauge: 68, capacity_gui: 77,
+  charger_online: true, available: true, error: null
+};
+
 test('config tab: device_info retries on a later tab open after a first failure', async () => {
   const c = loadChunk();
+  // Per open: device_info, app_version, get_battlimit (in that order).
   const calls = stubRpc([
-    new Error('boom'), {},                                                     // 1st open: fails
-    { model: 'GL.iNet GL-E5800', cpu: 'ARMv8 Processor rev 4' }, {}            // 2nd open: succeeds
+    new Error('boom'), {}, Object.assign({}, BL_OFF),                          // 1st open: device_info fails
+    { model: 'GL.iNet GL-E5800', cpu: 'ARMv8 Processor rev 4' }, {},            // 2nd open: succeeds
+    Object.assign({}, BL_OFF)
   ]);
   try {
     const vm = makeVm(c, LIVE);
@@ -1590,5 +1610,130 @@ test('config tab: device_info retries on a later tab open after a first failure'
 
     const deviceCalls = calls.filter((x) => x.params[2] === 'device_info');
     assert.equal(deviceCalls.length, 2, 'fetchDeviceInfo was called on both tab opens');
+  } finally { unstubRpc(); }
+});
+
+test('config tab shows battery card when battlimit loaded', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, LIVE);
+  vm.tab = 'config';
+  vm.deviceInfo = { model: 'GL.iNet GL-E5800', cpu: 'ARMv8' };
+  vm.appVer = { installed: '1.0.0', latest: null, update_available: false, checked: false };
+  vm.battLimit = Object.assign({}, BL_OFF);
+  vm.battLimitDraft = 80;
+  const txt = textOf(c.render.call(vm, h));
+  assert.match(txt, /Battery charge limit/, 'card title');
+  assert.match(txt, /Limit charging/, 'toggle label');
+  assert.match(txt, /80/, 'shows limit_gui');
+  assert.match(txt, /% GUI/, 'GUI scale label');
+  assert.match(txt, /71% gauge/, 'shows limit_gauge approx');
+});
+
+test('config tab battery status: Off when disabled', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, LIVE);
+  vm.tab = 'config';
+  vm.battLimit = Object.assign({}, BL_OFF);
+  vm.battLimitDraft = 80;
+  const txt = textOf(vm.renderConfig(h));
+  assert.match(txt, /Off ·/, 'Off status prefix');
+  assert.match(txt, /72% gauge/, 'capacity gauge');
+  assert.match(txt, /81% GUI/, 'capacity gui');
+  assert.match(txt, /Unplugged/, 'charger offline');
+});
+
+test('config tab battery status: Armed when enabled but not active', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, LIVE);
+  vm.tab = 'config';
+  vm.battLimit = Object.assign({}, BL_ARMED);
+  vm.battLimitDraft = 80;
+  const txt = textOf(vm.renderConfig(h));
+  assert.match(txt, /Armed · will apply when charger connects/, 'Armed status');
+  assert.doesNotMatch(txt, /Active ·/, 'not Active');
+});
+
+test('config tab battery status: Active when watcher running', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, LIVE);
+  vm.tab = 'config';
+  vm.battLimit = Object.assign({}, BL_ACTIVE);
+  vm.battLimitDraft = 80;
+  const txt = textOf(vm.renderConfig(h));
+  assert.match(txt, /Active ·/, 'Active status');
+  assert.match(txt, /71% gauge/, 'active_gauge in status');
+  assert.match(txt, /Plugged in/, 'charger online');
+});
+
+test('config tab battery: unavailable shows static note, no controls', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, LIVE);
+  vm.tab = 'config';
+  vm.battLimit = {
+    enabled: false, limit_gui: 80, limit_gauge: null,
+    active: false, available: false, error: 'glbattlimit not installed',
+    charger_online: false, capacity_gauge: null, capacity_gui: null
+  };
+  const txt = textOf(vm.renderConfig(h));
+  assert.match(txt, /not available/i, 'static unavailability note');
+  assert.doesNotMatch(txt, /Limit charging/, 'no interactive toggle');
+});
+
+test('config tab battery: null battLimit shows Loading', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, LIVE);
+  vm.tab = 'config';
+  vm.battLimit = null;
+  const txt = textOf(vm.renderConfig(h));
+  assert.match(txt, /Battery charge limit/, 'card still present');
+  assert.match(txt, /Loading/, 'loading placeholder');
+});
+
+test('config tab: opening config fetches get_battlimit', async () => {
+  const calls = stubRpc([
+    { model: 'GL.iNet GL-E5800', cpu: 'ARMv8' },   // device_info
+    { installed: '1.0.0', latest: null, update_available: false, checked: false }, // app_version
+    Object.assign({}, BL_OFF)                      // get_battlimit
+  ]);
+  try {
+    const c = loadChunk();
+    const vm = makeVm(c, LIVE);
+    c.watch.tab.call(vm, 'config');
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    const blCalls = calls.filter((x) => x.params[2] === 'get_battlimit');
+    assert.equal(blCalls.length, 1, 'get_battlimit called once on tab open');
+    assert.equal(blCalls[0].params[0], 'sid', 'literal sid placeholder');
+    assert.equal(blCalls[0].params[1], 'mudimodem');
+    assert.ok(vm.battLimit && vm.battLimit.limit_gui === 80, 'stores get_battlimit result');
+    assert.equal(vm.battLimitDraft, 80, 'seeds draft from limit_gui');
+  } finally { unstubRpc(); }
+});
+
+test('applyBattLimit: toggle enabled posts set_battlimit and refreshes state', async () => {
+  const calls = stubRpc([Object.assign({}, BL_ARMED)]);
+  try {
+    const c = loadChunk();
+    const vm = makeVm(c, LIVE);
+    vm.battLimit = Object.assign({}, BL_OFF);
+    vm.battLimitDraft = 80;
+    await vm.applyBattLimit({ enabled: true });
+    assert.equal(calls.length, 1, 'one set_battlimit call');
+    assert.equal(calls[0].params[2], 'set_battlimit');
+    assert.deepEqual(calls[0].params[3], { enabled: true, limit_gui: 80 });
+    assert.equal(vm.battLimit.enabled, true, 'state updated from response');
+    assert.equal(vm.battLimitBusy, false);
+  } finally { unstubRpc(); }
+});
+
+test('applyBattLimit: rejects limit_gui outside 20–100 without RPC', async () => {
+  const calls = stubRpc([]);
+  try {
+    const c = loadChunk();
+    const vm = makeVm(c, LIVE);
+    vm.battLimit = Object.assign({}, BL_OFF);
+    vm.battLimitDraft = 5;
+    vm.applyBattLimit({ limit_gui: 5 });
+    assert.equal(calls.length, 0, 'no RPC on invalid input');
+    assert.match(vm.battLimitErr, /20–100/, 'validation error message');
   } finally { unstubRpc(); }
 });

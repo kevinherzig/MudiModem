@@ -97,6 +97,11 @@ module.exports = {
       pollStopped: false,     // set true on teardown; makes an in-flight poll continuation a no-op
       pollAttempts: 0,        // bounds the poll loop — give up after POLL_MAX
       POLL_MAX: 40,           // ~2 minutes at the 3s poll interval
+      // Battery charge limit (get_battlimit / set_battlimit)
+      battLimit: null,        // full snapshot from get_battlimit
+      battLimitBusy: false,
+      battLimitErr: "",
+      battLimitDraft: 80,     // local number input while editing
       // Approximate downlink centre freq (MHz) per band, for spectrum ordering
       // and labels. Source: 3GPP TS 38.101-1 (NR) / 36.101 (LTE), rounded to the
       // marketing figure. Labels only — the modem is never sent a frequency.
@@ -274,6 +279,7 @@ module.exports = {
       if (t === "config") {
         if (!this.deviceInfo) this.fetchDeviceInfo();   // retries on every open until it succeeds
         this.checkAppVersion();   // re-check every open, per spec
+        this.fetchBattLimit();    // refresh charge-limit snapshot every open
       }
     },
     // A slot switch is done when GL's selected slot lands on the target.
@@ -659,6 +665,46 @@ module.exports = {
         .then(function (r) { self.appVer = r || null; })
         .catch(function () { /* fail-silent: keep whatever we had, show installed only */ });
     },
+    fetchBattLimit() {
+      var self = this;
+      if (typeof window === "undefined" || !window.$rpcRequest) return Promise.resolve();
+      return window.$rpcRequest("call", ["sid", "mudimodem", "get_battlimit", {}], { timeout: 8000 })
+        .then(function (r) {
+          self.battLimit = r || null;
+          if (r && typeof r.limit_gui === "number") self.battLimitDraft = r.limit_gui;
+          self.battLimitErr = (r && r.error) || "";
+        })
+        .catch(function (e) {
+          self.battLimitErr = (e && (e.message || e.type)) || "request failed";
+        });
+    },
+    applyBattLimit(patch) {
+      var self = this;
+      if (this.battLimitBusy || typeof window === "undefined" || !window.$rpcRequest) return;
+      var cur = this.battLimit || { enabled: false, limit_gui: 80 };
+      var enabled = (patch && typeof patch.enabled === "boolean") ? patch.enabled : !!cur.enabled;
+      var limit_gui = (patch && patch.limit_gui != null)
+        ? Number(patch.limit_gui)
+        : Number(this.battLimitDraft || cur.limit_gui);
+      if (!(limit_gui >= 20 && limit_gui <= 100)) {
+        this.battLimitErr = "Target must be 20–100 % GUI";
+        return;
+      }
+      this.battLimitBusy = true;
+      this.battLimitErr = "";
+      return window.$rpcRequest("call", ["sid", "mudimodem", "set_battlimit",
+        { enabled: enabled, limit_gui: limit_gui }], { timeout: 15000 })
+        .then(function (r) {
+          self.battLimitBusy = false;
+          self.battLimit = r || null;
+          if (r && typeof r.limit_gui === "number") self.battLimitDraft = r.limit_gui;
+          if (r && r.error) self.battLimitErr = r.error;
+        })
+        .catch(function (e) {
+          self.battLimitBusy = false;
+          self.battLimitErr = (e && (e.message || e.type)) || "request failed";
+        });
+    },
     armUpdate() {
       var self = this;
       if (this.updateConfirm) return;         // already armed
@@ -766,7 +812,73 @@ module.exports = {
       }
       var app = h("div", { staticClass: "mm-card" }, cardKids);
 
-      return h("div", {}, [device, app]);
+      // --- Battery charge limit card ---
+      var bl = this.battLimit;
+      var battKids = [h("div", { staticClass: "mm-card-h" }, "Battery charge limit")];
+      if (!bl) {
+        battKids.push(h("div", { staticClass: "mm-note" }, "Loading…"));
+      } else if (bl.available === false) {
+        battKids.push(h("div", { staticClass: "mm-note" },
+          "Charge limit not available on this device."));
+      } else {
+        battKids.push(h("div", { staticClass: "mm-kv" }, [
+          h("label", { staticClass: "mm-k" }, [
+            h("input", {
+              attrs: { type: "checkbox", disabled: !!self.battLimitBusy },
+              domProps: { checked: !!bl.enabled },
+              on: {
+                change: function (e) {
+                  self.applyBattLimit({ enabled: !!(e.target && e.target.checked) });
+                }
+              }
+            }),
+            " Limit charging"
+          ])
+        ]));
+        battKids.push(h("div", { staticClass: "mm-kv" }, [
+          h("span", { staticClass: "mm-k" }, "Target"),
+          h("span", { staticClass: "mm-v" }, [
+            h("input", {
+              attrs: {
+                type: "number", min: 20, max: 100, step: 1,
+                disabled: !bl.enabled || !!self.battLimitBusy
+              },
+              domProps: { value: self.battLimitDraft },
+              on: {
+                input: function (e) {
+                  self.battLimitDraft = Number(e.target && e.target.value);
+                },
+                change: function () { self.applyBattLimit({ limit_gui: self.battLimitDraft }); }
+              }
+            }),
+            " % GUI",
+            h("span", { staticClass: "mm-note" },
+              "  (≈ " + (bl.limit_gauge != null ? bl.limit_gauge : "—") + "% gauge)")
+          ])
+        ]));
+        var statusLine;
+        if (bl.active) {
+          statusLine = "Active · " + (bl.active_gauge != null ? bl.active_gauge + "% gauge" : "on")
+            + " · " + (bl.capacity_gauge != null ? bl.capacity_gauge + "% gauge" : "—")
+            + " / ~" + (bl.capacity_gui != null ? bl.capacity_gui + "% GUI" : "—");
+        } else if (bl.enabled) {
+          statusLine = "Armed · will apply when charger connects · "
+            + (bl.capacity_gauge != null ? bl.capacity_gauge + "% gauge" : "—")
+            + " / ~" + (bl.capacity_gui != null ? bl.capacity_gui + "% GUI" : "—");
+        } else {
+          statusLine = "Off · "
+            + (bl.capacity_gauge != null ? bl.capacity_gauge + "% gauge" : "—")
+            + " / ~" + (bl.capacity_gui != null ? bl.capacity_gui + "% GUI" : "—");
+        }
+        battKids.push(row("Status", statusLine));
+        battKids.push(row("Charger", bl.charger_online ? "Plugged in" : "Unplugged"));
+        if (this.battLimitErr) {
+          battKids.push(h("div", { staticClass: "mm-note" }, this.battLimitErr));
+        }
+      }
+      var batt = h("div", { staticClass: "mm-card" }, battKids);
+
+      return h("div", {}, [device, app, batt]);
     },
     askSwitch(slot) { this.switchConfirm = slot; this.switchErr = ""; },
     clearSwitchState() {
@@ -1332,17 +1444,17 @@ module.exports = {
       var css =
         '.mm{color:var(--text-regular);font-variant-numeric:tabular-nums}' +
         '.mm-strip{display:flex;align-items:stretch;background:var(--background-card);border-radius:4px;box-shadow:0 1px 5px rgba(0,0,0,.06);margin-bottom:11px;overflow:hidden}' +
-        '.mm-trace{flex:1;min-width:0;padding:9px 0 6px 13px}' +
+        '.mm-trace{flex:1;min-width:0;padding:9px 12px 6px 13px}' +
         '.mm-eyebrow{font-size:10px;letter-spacing:.05em;text-transform:uppercase;color:var(--text-badge)}' +
-        '.mm-plot{height:40px;margin-top:3px}.mm-plot svg{display:block;width:100%;height:100%;overflow:visible}' +
-        '.mm-axis{display:flex;justify-content:space-between;font-size:9.5px;color:var(--text-hint);margin-top:2px}' +
-        '.mm-read{flex:none;min-width:120px;padding:10px 14px 9px 15px;text-align:right;border-left:1px solid var(--divider);display:flex;flex-direction:column;justify-content:center}' +
+        '.mm-plot{height:26px;margin-top:5px}.mm-plot svg{display:block;width:100%;height:100%;overflow:visible}' +
+        '.mm-axis{display:flex;justify-content:flex-end;font-size:9.5px;color:var(--text-hint);margin-top:3px}' +
+        '.mm-read{flex:none;min-width:148px;padding:8px 14px 9px 15px;text-align:right;border-left:1px solid var(--divider);display:flex;flex-direction:column;justify-content:center}' +
         '.mm-rsrp{font-size:29px;font-weight:600;line-height:1;letter-spacing:-.025em}.mm-rsrp .u{font-size:11px;font-weight:500;color:var(--text-hint);margin-left:2px}' +
         '.mm-facts{display:flex;flex-wrap:wrap;gap:5px 13px;justify-content:flex-end;margin-top:7px}' +
         '.mm-facts .k{display:block;font-size:9px;letter-spacing:.04em;text-transform:uppercase;color:var(--text-badge)}.mm-facts b{font-size:12.5px;font-weight:600}' +
-        // Control-state badges on the trace header: mode lock + tower lock. Muted
-        // when idle (Auto / Unlocked), tinted when a restriction is in force.
-        '.mm-lockbadges{display:flex;gap:6px;align-items:center}' +
+        // Mode-lock + tower-lock badges sit top-left of the dBm readout (not the
+        // scroller). Muted when idle (Auto / Unlocked), tinted when restricted.
+        '.mm-lockbadges{display:flex;gap:6px;align-items:center;justify-content:flex-start;margin-bottom:8px}' +
         '.mm-lockbadge{background:var(--background-3,rgba(0,0,0,.04));border:1px solid transparent;border-radius:9px;padding:1px 8px;font:inherit;font-size:10px;font-weight:600;letter-spacing:.02em;color:var(--text-hint);cursor:pointer;white-space:nowrap}' +
         '.mm-lockbadge.mode{color:var(--warning);border-color:var(--warning-disabled,var(--warning));background:var(--warning-disabled,transparent)}' +
         '.mm-lockbadge.lock{color:var(--error);border-color:var(--error);background:transparent}' +
@@ -1945,12 +2057,11 @@ module.exports = {
     var stripKids;
     if (this.hasData) {
       var rsrpColor = this.qColor(this.rsrpQ);
+      var traceMeta = [c.mode, this.servingCarrier, this.activeSlot ? "SIM " + this.activeSlot : null]
+        .filter(function (v) { return v; }).join("  ");
       stripKids = [
         h("div", { staticClass: "mm-trace" }, [
-          h("div", { staticStyle: { display: "flex", justifyContent: "space-between", alignItems: "center" } }, [
-            h("span", { staticClass: "mm-eyebrow" }, "RSRP live"),
-            this.renderLockBadges(h)
-          ]),
+          h("div", { staticClass: "mm-eyebrow" }, traceMeta ? "RSRP live  ·  " + traceMeta : "RSRP live"),
           h("div", { staticClass: "mm-plot" }, [
             h("svg", { attrs: { viewBox: "0 0 320 40", preserveAspectRatio: "none" } }, [
               h("path", { attrs: {
@@ -1960,13 +2071,11 @@ module.exports = {
             ])
           ]),
           h("div", { staticClass: "mm-axis" }, [
-            h("span", "-120"),
-            h("span", (c.mode || "") + (this.servingCarrier ? "  " + this.servingCarrier : "") +
-              (this.activeSlot ? "  SIM " + this.activeSlot : "")),
-            h("span", "-80 dBm")
+            h("span", "scale -120 to -80 dBm")
           ])
         ]),
         h("div", { staticClass: "mm-read" }, [
+          this.renderLockBadges(h),
           h("div", { staticClass: "mm-rsrp", style: { color: rsrpColor } }, [
             String(c.rsrp), h("span", { staticClass: "u" }, "dBm")
           ]),
