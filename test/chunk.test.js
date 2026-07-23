@@ -1589,6 +1589,11 @@ const BL_ACTIVE = {
   active: true, active_gauge: 71, capacity_gauge: 68, capacity_gui: 77,
   charger_online: true, available: true, error: null
 };
+const BL_ENABLED_NOT_ACTIVE = {
+  enabled: true, limit_gui: 80, limit_gauge: 71,
+  active: false, active_gauge: null, capacity_gauge: 72, capacity_gui: 81,
+  charger_online: true, available: true, error: null
+};
 
 test('config tab: device_info retries on a later tab open after a first failure', async () => {
   const c = loadChunk();
@@ -1642,7 +1647,7 @@ test('config tab battery status: Off when disabled', () => {
   assert.match(txt, /Unplugged/, 'charger offline');
 });
 
-test('config tab battery status: Armed when enabled but not active', () => {
+test('config tab battery status: Armed when enabled and charger offline', () => {
   const c = loadChunk();
   const vm = makeVm(c, LIVE);
   vm.tab = 'config';
@@ -1651,6 +1656,20 @@ test('config tab battery status: Armed when enabled but not active', () => {
   const txt = textOf(vm.renderConfig(h));
   assert.match(txt, /Armed · will apply when charger connects/, 'Armed status');
   assert.doesNotMatch(txt, /Active ·/, 'not Active');
+  assert.doesNotMatch(txt, /Enabled · not active/, 'not the plugged-in stuck line');
+});
+
+test('config tab battery status: Enabled not active when plugged but watcher off', () => {
+  const c = loadChunk();
+  const vm = makeVm(c, LIVE);
+  vm.tab = 'config';
+  vm.battLimit = Object.assign({}, BL_ENABLED_NOT_ACTIVE);
+  vm.battLimitDraft = 80;
+  const txt = textOf(vm.renderConfig(h));
+  assert.match(txt, /Enabled · not active/, 'honest stuck/failed apply line');
+  assert.doesNotMatch(txt, /Armed ·/, 'not Armed while charger online');
+  assert.doesNotMatch(txt, /Active ·/, 'not Active');
+  assert.match(txt, /Plugged in/, 'charger online');
 });
 
 test('config tab battery status: Active when watcher running', () => {
@@ -1775,5 +1794,18 @@ test('applyBattLimit: rejects limit_gui outside 20–100 without RPC', async () 
     vm.applyBattLimit({ limit_gui: 5 });
     assert.equal(calls.length, 0, 'no RPC on invalid input');
     assert.match(vm.battLimitErr, /20–100/, 'validation error message');
+  } finally { unstubRpc(); }
+});
+
+test('applyBattLimit: rejects GUI that maps below gauge 50 without RPC', async () => {
+  const calls = stubRpc([]);
+  try {
+    const c = loadChunk();
+    const vm = makeVm(c, LIVE);
+    vm.battLimit = Object.assign({}, BL_OFF);
+    vm.battLimitDraft = 40;
+    vm.applyBattLimit({ limit_gui: 40 });
+    assert.equal(calls.length, 0, 'no RPC when gauge floor fails');
+    assert.match(vm.battLimitErr, /too low|50% gauge/i, 'gauge floor message');
   } finally { unstubRpc(); }
 });

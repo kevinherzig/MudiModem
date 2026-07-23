@@ -312,9 +312,15 @@ if [ -f src/sbin/glbattlimit ]; then
   ssh -o BatchMode=yes "root@$HOST" 'chmod +x /tmp/mm-batt-hp/test/battlimit-hotplug.test.sh /tmp/mm-batt-hp/src/hotplug/20-glbattlimit /tmp/mm-batt-hp/src/etc/init.d/glbattlimit; sh /tmp/mm-batt-hp/test/battlimit-hotplug.test.sh; rc=$?; rm -rf /tmp/mm-batt-hp; exit $rc' \
     || fail "battlimit-hotplug isolation test failed"
 
-  # sysupgrade registration
-  ssh -o BatchMode=yes "root@$HOST" 'grep -qxF /usr/bin/glbattlimit /etc/sysupgrade.conf && grep -qxF /etc/mudimodem/battlimit.json /etc/sysupgrade.conf' \
-    || fail "battlimit paths not in sysupgrade.conf"
+  # sysupgrade registration — all four battlimit paths
+  ssh -o BatchMode=yes "root@$HOST" 'for p in \
+      /usr/bin/glbattlimit \
+      /etc/hotplug.d/i2c/20-glbattlimit \
+      /etc/init.d/glbattlimit \
+      /etc/mudimodem/battlimit.json; do
+      grep -qxF "$p" /etc/sysupgrade.conf || { echo "missing: $p"; exit 1; }
+    done' \
+    || fail "battlimit paths not in sysupgrade.conf (need bin+hotplug+init+json)"
 fi
 
 echo "ALL CHECKS PASSED"

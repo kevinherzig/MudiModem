@@ -690,6 +690,13 @@ module.exports = {
         this.battLimitErr = "Target must be 20–100 % GUI";
         return;
       }
+      // Same gui2gauge floor as glbattlimit / backend (gauge must be ≥ 50).
+      var GUI_M = 13867, GUI_B = 189300;
+      var gauge = Math.floor((limit_gui * 10000 + GUI_B + GUI_M / 2) / GUI_M);
+      if (gauge < 50 || gauge > 100) {
+        this.battLimitErr = "limit too low (min ~50% gauge / use higher GUI %)";
+        return;
+      }
       this.battLimitBusy = true;
       this.battLimitErr = "";
       return window.$rpcRequest("call", ["sid", "mudimodem", "set_battlimit",
@@ -868,19 +875,18 @@ module.exports = {
               "  (≈ " + (bl.limit_gauge != null ? bl.limit_gauge : "—") + "% gauge)")
           ])
         ]));
+        var capBits = (bl.capacity_gauge != null ? bl.capacity_gauge + "% gauge" : "—")
+          + " / ~" + (bl.capacity_gui != null ? bl.capacity_gui + "% GUI" : "—");
         var statusLine;
         if (bl.active) {
           statusLine = "Active · " + (bl.active_gauge != null ? bl.active_gauge + "% gauge" : "on")
-            + " · " + (bl.capacity_gauge != null ? bl.capacity_gauge + "% gauge" : "—")
-            + " / ~" + (bl.capacity_gui != null ? bl.capacity_gui + "% GUI" : "—");
-        } else if (bl.enabled) {
-          statusLine = "Armed · will apply when charger connects · "
-            + (bl.capacity_gauge != null ? bl.capacity_gauge + "% gauge" : "—")
-            + " / ~" + (bl.capacity_gui != null ? bl.capacity_gui + "% GUI" : "—");
+            + " · " + capBits;
+        } else if (bl.enabled && !bl.charger_online) {
+          statusLine = "Armed · will apply when charger connects · " + capBits;
+        } else if (bl.enabled && bl.charger_online) {
+          statusLine = "Enabled · not active · " + capBits;
         } else {
-          statusLine = "Off · "
-            + (bl.capacity_gauge != null ? bl.capacity_gauge + "% gauge" : "—")
-            + " / ~" + (bl.capacity_gui != null ? bl.capacity_gui + "% GUI" : "—");
+          statusLine = "Off · " + capBits;
         }
         battKids.push(row("Status", statusLine));
         battKids.push(row("Charger", bl.charger_online ? "Plugged in" : "Unplugged"));

@@ -54,13 +54,25 @@ assert(a.capacity_gui == 81, "A capacity_gui: " .. tostring(a.capacity_gui))
 assert(a.charger_online == false, "A charger")
 assert(a.active == false, "A active")
 
--- Case B: set enable + 80 → writes file + calls on 80 gui when status says online
--- Re-stub status with online=1 for apply path. Easiest: rewrite BIN mid-test.
+-- Case B: set enable + 80 → writes file + calls on 80 gui when status says online.
+-- Stub models charger/watcher via flag files so off clears "active".
 writef(BIN, string.format([[#!/bin/sh
 echo "$*" >> "%s"
+if [ "$1" = "on" ]; then
+  touch "%s/force_online" "%s/force_active"
+  exit 0
+fi
+if [ "$1" = "off" ]; then
+  rm -f "%s/force_active"
+  exit 0
+fi
 if [ "$1" = "status" ]; then
   if [ -f "%s/force_online" ]; then
-    echo "Limit     : active (71 %% gauge / ~80 %% GUI, PID 9)"
+    if [ -f "%s/force_active" ]; then
+      echo "Limit     : active (71 %% gauge / ~80 %% GUI, PID 9)"
+    else
+      echo "Limit     : off"
+    fi
     echo "Capacity  : 70 %% gauge / ~78 %% GUI (estimated)"
     echo "Voltage   : 4100 mV"
     echo "Current   : 0 mA  (+charging -discharging 0=blocked)"
@@ -79,9 +91,10 @@ if [ "$1" = "status" ]; then
   exit 0
 fi
 exit 0
-]], LOG, TMP))
+]], LOG, TMP, TMP, TMP, TMP, TMP))
 os.execute("chmod +x " .. BIN)
-os.execute("touch " .. TMP .. "/force_online")
+os.execute("touch " .. TMP .. "/force_online")  -- charger plugged; not yet active
+os.execute("rm -f " .. TMP .. "/force_active")
 os.remove(LOG)
 
 local b = M.set_battlimit({ enabled = true, limit_gui = 80 })
@@ -108,14 +121,67 @@ assert(type(d.error) == "string", "D error")
 cf = assert(io.open(CFG, "r")); local after = cf:read("*a"); cf:close()
 assert(not after:find('"limit_gui"%s*:%s*5'), "D must not persist 5: " .. after)
 
+-- Case D2: GUI that maps below gauge 50 → reject before write
+cf = assert(io.open(CFG, "r")); before = cf:read("*a"); cf:close()
+local d2 = M.set_battlimit({ enabled = true, limit_gui = 40 })
+assert(type(d2.error) == "string" and d2.error:find("too low", 1, true),
+  "D2 error: " .. tostring(d2.error))
+cf = assert(io.open(CFG, "r")); after = cf:read("*a"); cf:close()
+assert(not after:find('"limit_gui"%s*:%s*40'), "D2 must not persist 40: " .. after)
+assert(after == before, "D2 policy unchanged")
+
 -- Case E: missing binary → available false
-local bad = TMP .. "/missing-bin"
 -- Point at non-executable path via env is process-level; for this case the
 -- plugin should treat non-executable BIN as unavailable. Temporarily rename.
 os.execute("mv " .. BIN .. " " .. BIN .. ".bak")
 local e = M.get_battlimit({})
 assert(e.available == false, "E available false")
 os.execute("mv " .. BIN .. ".bak " .. BIN)
+
+-- Case F: enable while unplugged → write policy, never call "on "
+os.execute("rm -f " .. TMP .. "/force_online")
+os.remove(LOG)
+local fcase = M.set_battlimit({ enabled = true, limit_gui = 80 })
+assert(fcase.enabled == true, "F enabled")
+assert(fcase.limit_gui == 80, "F limit_gui")
+assert(fcase.charger_online == false, "F charger offline")
+assert(fcase.active == false, "F not active")
+cf = assert(io.open(CFG, "r")); body = cf:read("*a"); cf:close()
+assert(body:find('"enabled"%s*:%s*true'), "F file enabled: " .. body)
+assert(body:find('"limit_gui"%s*:%s*80'), "F file limit: " .. body)
+lf = assert(io.open(LOG, "r")); calls = lf:read("*a"); lf:close()
+assert(not calls:find("on ", 1, true), "F must not call on: " .. calls)
+assert(calls:find("status", 1, true), "F still polls status: " .. calls)
+
+-- Case G: charger online but on does not activate → surface error
+writef(BIN, string.format([[#!/bin/sh
+echo "$*" >> "%s"
+if [ "$1" = "on" ]; then
+  echo "Limit must be between 50 and 100 (gauge scale)."
+  exit 1
+fi
+if [ "$1" = "status" ]; then
+  cat <<'ST'
+Limit     : off
+Capacity  : 70 %% gauge / ~78 %% GUI (estimated)
+Voltage   : 4100 mV
+Current   : 0 mA
+Charger   : online=1
+Pump      : charge_en=0
+Buck vreg : 4400000 uV  (factory 4400000)
+ST
+  exit 0
+fi
+exit 0
+]], LOG))
+os.execute("chmod +x " .. BIN)
+os.remove(LOG)
+local g = M.set_battlimit({ enabled = true, limit_gui = 80 })
+assert(g.enabled == true, "G policy enabled")
+assert(g.charger_online == true, "G charger online")
+assert(g.active == false, "G not active")
+assert(type(g.error) == "string" and g.error:find("could not activate", 1, true),
+  "G error: " .. tostring(g.error))
 
 os.execute("rm -rf " .. TMP)
 print("backend-battlimit OK")

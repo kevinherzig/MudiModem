@@ -1132,13 +1132,21 @@ local function write_batt_policy(enabled, limit_gui)
 end
 
 local function run_glbattlimit(args)
-  -- args is a shell-safe string already built from validated integers / fixed words
+  -- args is a shell-safe string already built from validated integers / fixed words.
+  -- Returns: output_text, success (exit 0).
   local bin = battlimit_bin()
   local f = io.popen(bin .. " " .. args .. " 2>/dev/null")
-  if not f then return nil end
+  if not f then return nil, false end
   local out = f:read("*a") or ""
-  f:close()
-  return out
+  -- Lua 5.1: close → true/nil; Lua 5.2+: true|"exit"|code or nil|"exit"|code
+  local c1, c2, c3 = f:close()
+  local success
+  if c3 ~= nil then
+    success = (c3 == 0)
+  else
+    success = (c1 == true) or (c1 == 0)
+  end
+  return out, success
 end
 
 local function bin_available()
@@ -1224,6 +1232,13 @@ function M.set_battlimit(args)
     out.error = "invalid params"
     return out
   end
+  -- glbattlimit enforces gauge 50–100 after gui2gauge; reject before write.
+  local gauge = gui_to_gauge(limit_gui)
+  if gauge < 50 or gauge > 100 then
+    local out = snapshot_battlimit()
+    out.error = "limit too low (min ~50% gauge / use higher GUI %)"
+    return out
+  end
   local ok, err = write_batt_policy(enabled, limit_gui)
   if not ok then
     local out = snapshot_battlimit()
@@ -1237,12 +1252,22 @@ function M.set_battlimit(args)
   end
   if not enabled then
     run_glbattlimit("off")
-  else
-    -- Only apply when charger is online; status tells us.
-    local st = parse_status(run_glbattlimit("status") or "")
-    if st.charger_online then
-      run_glbattlimit("on " .. tostring(limit_gui) .. " gui")
+    local out = snapshot_battlimit()
+    if out.active then
+      out.error = "could not deactivate limit"
     end
+    return out
+  end
+  -- Only apply live when charger is online; otherwise policy is armed for hotplug.
+  local st = parse_status((run_glbattlimit("status")))
+  if st.charger_online then
+    run_glbattlimit("on " .. tostring(limit_gui) .. " gui")
+    local out = snapshot_battlimit()
+    -- enabled + plugged but watcher not running → tool rejected or failed silently
+    if out.enabled and out.charger_online and not out.active then
+      out.error = "could not activate limit"
+    end
+    return out
   end
   return snapshot_battlimit()
 end
