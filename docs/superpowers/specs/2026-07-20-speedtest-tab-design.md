@@ -22,7 +22,7 @@ the moment of the test, so a dip in throughput can be correlated with what the r
 |---|---|
 | Trigger | Manual button, **plus** an optional background schedule (off by default) |
 | Test method | `curl` against Cloudflare's public speed-test endpoints (`speed.cloudflare.com/__down`, `/__up`) — no server to run/maintain, HTTPS, matches the project's stdlib+subprocess convention |
-| Data usage per test | Fixed modest size: ~20 MiB download, ~8 MiB upload |
+| Data usage per test | Fixed modest size: ~20 MiB download, ~2 MiB upload (revised down from ~8 MiB 2026-07-21 — see § below) |
 | Latency/jitter | `curl` connect+TTFB timing (5× tiny requests), not ICMP — carrier NAT sometimes throttles/blocks ICMP in ways that would misrepresent real latency |
 | Schedule interval | User-selectable: 30m / 1h / 2h / 6h / 12h / 24h; **off by default** |
 | Retention | Cap by count — last 500 results, trimmed the same way the RF-history collector trims |
@@ -74,8 +74,17 @@ never overlap.
 | Phase | Command shape | Fixed size |
 |---|---|---|
 | Download | `curl -w '%{json}' 'https://speed.cloudflare.com/__down?bytes=N' -o /dev/null` | ~20 MiB |
-| Upload | `curl -w '%{json}' --data-binary @tmpfile 'https://speed.cloudflare.com/__up'` | ~8 MiB |
+| Upload | `curl -w '%{json}' --data-binary @tmpfile 'https://speed.cloudflare.com/__up'` | ~2 MiB |
 | Latency/jitter | 5× `bytes=0` requests, timing connect+TTFB via curl's `-w`; report median and jitter (max−min) | negligible |
+
+⚠️ **Upload size revised 8 MiB → 2 MiB (2026-07-21).** Every phase shares one fixed curl `-m`
+timeout (20s default). Cellular uplinks run far slower than downlink — worse on TDD bands, which
+give uplink a minority of the frame — and an 8 MiB upload could exceed 20s on a real, working, just
+-slow connection: reproduced live at ~2.6 Mbps actual throughput (curl `exitcode 28`, timed out with
+6.2 of 8 MiB sent; the identical transfer succeeded in 33.8s once given a 40s ceiling). Rather than
+grow the timeout (which would make a *genuinely* dead link take much longer to report as failed),
+the upload was shrunk to fit the existing timeout with margin even on a slow-but-alive link —
+matching real-world down/up asymmetry rather than mirroring the download size.
 
 Steps:
 1. Write `{"phase": "download", "started": <ms>}` to the status file.

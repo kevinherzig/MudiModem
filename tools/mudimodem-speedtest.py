@@ -23,7 +23,12 @@ import time
 DOWN_URL = os.environ.get("MUDIMODEM_ST_DOWN_URL", "https://speed.cloudflare.com/__down")
 UP_URL = os.environ.get("MUDIMODEM_ST_UP_URL", "https://speed.cloudflare.com/__up")
 DOWN_BYTES = int(os.environ.get("MUDIMODEM_ST_DOWN_BYTES", 20 * 1024 * 1024))
-UP_BYTES = int(os.environ.get("MUDIMODEM_ST_UP_BYTES", 8 * 1024 * 1024))
+# Deliberately much smaller than DOWN_BYTES: cellular uplinks are asymmetric
+# (often 5-10x slower than downlink, worse on TDD bands), so an 8 MiB upload
+# could exceed the single fixed curl timeout below on a real, working, just-
+# slow connection -- observed live 2026-07-21 (curl exitcode 28 at 20s with
+# ~2.6 Mbps actual throughput; the same transfer completed fine at 40s).
+UP_BYTES = int(os.environ.get("MUDIMODEM_ST_UP_BYTES", 2 * 1024 * 1024))
 LATENCY_N = int(os.environ.get("MUDIMODEM_ST_LATENCY_N", 5))
 HIST_PATH = os.environ.get("MUDIMODEM_ST_HIST", "/etc/mudimodem/speedtests.jsonl")
 STATUS_PATH = os.environ.get("MUDIMODEM_ST_STATUS", "/tmp/mudimodem/speedtest-status.json")

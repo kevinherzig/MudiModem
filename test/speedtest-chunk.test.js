@@ -357,6 +357,28 @@ test('renderGraph: skips circles when down_mbps or up_mbps is null (honest gaps)
   assert.strictEqual(circles.length, 4, 'must skip circles for null values; found ' + circles.length);
 });
 
+test('renderGraph: x positions are evenly spaced by index, not proportional to elapsed time', () => {
+  const c = loadChunk();
+  const vm = makeVm(c);
+  // A burst of three tests seconds apart, then one nearly a day later -- a
+  // time-proportional axis would squash the first three into a sliver.
+  vm.results = [
+    { t: 1000, iface: 'cellular', down_mbps: 10, up_mbps: 2, latency_ms: 20 },
+    { t: 2000, iface: 'cellular', down_mbps: 20, up_mbps: 4, latency_ms: 22 },
+    { t: 3000, iface: 'cellular', down_mbps: 30, up_mbps: 6, latency_ms: 24 },
+    { t: 86403000, iface: 'cellular', down_mbps: 40, up_mbps: 8, latency_ms: 26 }
+  ];
+  vm.filterIface = 'cellular';
+  vm.resultsLoading = false;
+  vm.width = 400;
+  const svg = walk(c.render.call(vm, h)).find((n) => n.tag === 'svg');
+  const downCircles = walk(svg).filter((n) => n.tag === 'circle' && n.data.attrs.fill === 'var(--primary)');
+  assert.strictEqual(downCircles.length, 4);
+  const xs = downCircles.map((n) => Number(n.data.attrs.cx));
+  const gaps = xs.slice(1).map((x, i) => x - xs[i]);
+  gaps.forEach((g) => assert.ok(Math.abs(g - gaps[0]) < 0.01, 'gaps between consecutive points must be equal: ' + gaps));
+});
+
 test('the chunk never issues raw AT and never calls tracking/console RPC objects', () => {
   const src = fs.readFileSync(SRC, 'utf8');
   assert.doesNotMatch(src, /get_result_AT|modem\.CPU\.AT|at_console/);

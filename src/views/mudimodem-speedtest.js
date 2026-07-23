@@ -254,9 +254,8 @@ module.exports = (function () {
         var W = this.width, PADL = 34, PADR = 12, PLOT_H = 160, LAT_H = 40, GAP = 14;
         var plotTop = 10, plotBot = plotTop + PLOT_H;
         var latTop = plotBot + GAP, latBot = latTop + LAT_H;
-        var t0 = results[0].t, t1 = results[results.length - 1].t;
-        var span = Math.max(1, t1 - t0);
-        var xOf = function (t) { return PADL + (t - t0) / span * (W - PADL - PADR); };
+        var n = results.length;
+        var xOf = function (i) { return n <= 1 ? PADL : PADL + i / (n - 1) * (W - PADL - PADR); };
 
         var maxMbps = 1;
         results.forEach(function (r) {
@@ -282,10 +281,10 @@ module.exports = (function () {
 
         function linePath(key, color) {
           var d = "", pen = false;
-          results.forEach(function (r) {
+          results.forEach(function (r, i) {
             var v = r[key];
             if (v == null) { pen = false; return; }
-            d += (pen ? "L" : "M") + xOf(r.t).toFixed(1) + " " + yOf(v).toFixed(1) + " ";
+            d += (pen ? "L" : "M") + xOf(i).toFixed(1) + " " + yOf(v).toFixed(1) + " ";
             pen = true;
           });
           return d ? h("path", { attrs: { fill: "none", stroke: color, "stroke-width": 1.75, d: d.trim() } }) : null;
@@ -294,12 +293,12 @@ module.exports = (function () {
         var upLine = linePath("up_mbps", "var(--success)");
         if (downLine) kids.push(downLine);
         if (upLine) kids.push(upLine);
-        results.forEach(function (r) {
+        results.forEach(function (r, i) {
           if (r.down_mbps != null) {
-            kids.push(h("circle", { attrs: { cx: xOf(r.t).toFixed(1), cy: yOf(r.down_mbps).toFixed(1), r: 2.5, fill: "var(--primary)" } }));
+            kids.push(h("circle", { attrs: { cx: xOf(i).toFixed(1), cy: yOf(r.down_mbps).toFixed(1), r: 2.5, fill: "var(--primary)" } }));
           }
           if (r.up_mbps != null) {
-            kids.push(h("circle", { attrs: { cx: xOf(r.t).toFixed(1), cy: yOf(r.up_mbps).toFixed(1), r: 2.5, fill: "var(--success)" } }));
+            kids.push(h("circle", { attrs: { cx: xOf(i).toFixed(1), cy: yOf(r.up_mbps).toFixed(1), r: 2.5, fill: "var(--success)" } }));
           }
         });
 
@@ -307,15 +306,15 @@ module.exports = (function () {
         kids.push(h("line", { attrs: { x1: PADL, x2: W - PADR, y1: latBot, y2: latBot,
           stroke: "var(--divider)", "stroke-width": 1 } }));
         var latD = "", penL = false;
-        results.forEach(function (r) {
+        results.forEach(function (r, i) {
           if (r.latency_ms == null) { penL = false; return; }
-          latD += (penL ? "L" : "M") + xOf(r.t).toFixed(1) + " " + latYOf(r.latency_ms).toFixed(1) + " ";
+          latD += (penL ? "L" : "M") + xOf(i).toFixed(1) + " " + latYOf(r.latency_ms).toFixed(1) + " ";
           penL = true;
         });
         if (latD) kids.push(h("path", { attrs: { fill: "none", stroke: "var(--warning)", "stroke-width": 1.5, d: latD.trim() } }));
 
         if (this.cursor != null && results[this.cursor]) {
-          var cx = xOf(results[this.cursor].t);
+          var cx = xOf(this.cursor);
           kids.push(h("line", { attrs: { x1: cx.toFixed(1), x2: cx.toFixed(1), y1: plotTop, y2: latBot,
             stroke: this.pinned != null ? "var(--primary)" : "var(--text-weak)", "stroke-width": 1 } }));
         }
@@ -324,12 +323,9 @@ module.exports = (function () {
           width: W, height: latBot + 4, preserveAspectRatio: "none" } }, kids);
 
         var nearestIdx = function (evX) {
-          var best = 0, bestD = Infinity;
-          results.forEach(function (r, i) {
-            var d = Math.abs(xOf(r.t) - evX);
-            if (d < bestD) { bestD = d; best = i; }
-          });
-          return best;
+          if (n <= 1) return 0;
+          var idx = Math.round((evX - PADL) / (W - PADL - PADR) * (n - 1));
+          return Math.max(0, Math.min(n - 1, idx));
         };
         var onMove = function (e) {
           if (self.pinned != null) return;
