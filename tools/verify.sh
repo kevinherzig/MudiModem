@@ -421,6 +421,14 @@ if [ -f src/sbin/glbattlimit ]; then
   ssh -o BatchMode=yes "root@$HOST" 'chmod +x /tmp/mm-batt-hp/test/battlimit-hotplug.test.sh /tmp/mm-batt-hp/src/hotplug/20-glbattlimit /tmp/mm-batt-hp/src/etc/init.d/glbattlimit; sh /tmp/mm-batt-hp/test/battlimit-hotplug.test.sh; rc=$?; rm -rf /tmp/mm-batt-hp; exit $rc' \
     || fail "battlimit-hotplug isolation test failed"
 
+  echo "12c. glbattlimit concurrency test (fake sysfs; repeated on + hotplug)"
+  ssh -o BatchMode=yes "root@$HOST" 'mkdir -p /tmp/mm-batt-cc/src/sbin /tmp/mm-batt-cc/src/hotplug /tmp/mm-batt-cc/test'
+  ssh -o BatchMode=yes "root@$HOST" 'cat > /tmp/mm-batt-cc/src/sbin/glbattlimit' < src/sbin/glbattlimit
+  ssh -o BatchMode=yes "root@$HOST" 'cat > /tmp/mm-batt-cc/src/hotplug/20-glbattlimit' < src/hotplug/20-glbattlimit
+  ssh -o BatchMode=yes "root@$HOST" 'cat > /tmp/mm-batt-cc/test/glbattlimit-concurrency.test.sh' < test/glbattlimit-concurrency.test.sh
+  ssh -o BatchMode=yes "root@$HOST" 'chmod +x /tmp/mm-batt-cc/src/sbin/glbattlimit /tmp/mm-batt-cc/test/glbattlimit-concurrency.test.sh; sh /tmp/mm-batt-cc/test/glbattlimit-concurrency.test.sh; rc=$?; rm -rf /tmp/mm-batt-cc; exit $rc' \
+    || fail "glbattlimit concurrency test failed"
+
   # sysupgrade registration — all four battlimit paths
   ssh -o BatchMode=yes "root@$HOST" 'for p in \
       /usr/bin/glbattlimit \

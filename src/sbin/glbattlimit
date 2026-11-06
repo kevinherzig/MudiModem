@@ -33,6 +33,7 @@ DEF_LIMIT=80
 POLL=15
 PIDF=/tmp/glbattlimit.pid
 LIMF=/tmp/glbattlimit.limit
+LOCKD=/tmp/glbattlimit.lock
 
 # --- gauge <-> GUI conversion (PROVISIONAL) -------------------------------
 # The GL.iNet GUI/touchscreen does not show the fuel gauge value. Measured
@@ -84,11 +85,63 @@ gate_on() {
 # charging immediately; the pump returns on the next plug event.
 gate_off() { echo "$VREG_NORMAL" > "$BUCK/vreg" 2>/dev/null; }
 
+# Concurrency hardening contributed by @jayck88 (thanks!):
+# lock, robust watcher teardown, and owner-scoped state cleanup so a GUI and a
+# CLI invocation can no longer clobber each other's state.
+acquire_lock() {
+    n=0
+    while ! mkdir "$LOCKD" 2>/dev/null; do
+        owner=$(cat "$LOCKD/pid" 2>/dev/null)
+        if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+            rm -f "$LOCKD/pid"
+            rmdir "$LOCKD" 2>/dev/null || true
+            continue
+        fi
+        n=$((n + 1))
+        if [ -z "$owner" ] && [ "$n" -ge 2 ]; then
+            rmdir "$LOCKD" 2>/dev/null || true
+            continue
+        fi
+        [ "$n" -lt 10 ] || { echo "ERROR: another charge-limit operation is busy."; return 1; }
+        sleep 1
+    done
+    echo $$ > "$LOCKD/pid"
+    trap 'rm -f "$LOCKD/pid"; rmdir "$LOCKD" 2>/dev/null || true' 0
+}
+
+watcher_pids() {
+    for d in /proc/[0-9]*; do
+        [ -r "$d/cmdline" ] || continue
+        p=${d##*/}
+        [ "$p" = "$$" ] && continue
+        cmd=$(tr '\000' ' ' < "$d/cmdline" 2>/dev/null)
+        case "$cmd" in
+          *"$0 _watch "*) echo "$p" ;;
+        esac
+    done
+}
+
 stop_watcher() {
-    [ -f "$PIDF" ] || return 0
-    p=$(cat "$PIDF" 2>/dev/null)
-    [ -n "$p" ] && kill "$p" 2>/dev/null
-    sleep 1
+    pids=$(watcher_pids)
+    [ -z "$pids" ] || kill $pids 2>/dev/null || true
+    n=0
+    live=""
+    while [ "$n" -lt 2 ]; do
+        live=""
+        for p in $pids; do kill -0 "$p" 2>/dev/null && live="$live $p"; done
+        [ -z "$live" ] && break
+        sleep 1
+        n=$((n + 1))
+    done
+    # ash defers TERM traps while its 15-second sleep child is running. Do not
+    # let those old shells overlap a replacement watcher for the remainder of
+    # the sleep; the caller restores or reapplies the charge gate immediately.
+    [ -z "$live" ] || kill -KILL $live 2>/dev/null || true
+    rm -f "$PIDF" "$LIMF"
+}
+
+clear_own_state() {
+    [ "$(cat "$PIDF" 2>/dev/null)" = "$$" ] || return 0
     rm -f "$PIDF" "$LIMF"
 }
 
@@ -96,12 +149,12 @@ watch_loop() {
     echo $$ > "$PIDF"
     lim=$(cat "$LIMF" 2>/dev/null)
     [ -z "$lim" ] && lim=$DEF_LIMIT
-    trap 'gate_off; rm -f "$PIDF" "$LIMF"; log "stopped, limit released"; exit 0' INT TERM
+    trap 'gate_off; clear_own_state; log "stopped, limit released"; exit 0' INT TERM
     log "active, limit ${lim}%"
     while :; do
         if [ "$(online)" != "1" ]; then
             gate_off
-            rm -f "$PIDF" "$LIMF"
+            clear_own_state
             log "unplugged - factory state restored"
             exit 0
         fi
@@ -131,6 +184,7 @@ case "$1" in
         echo "Limit must be between 50 and 100 (gauge scale)."
         exit 1
     fi
+    acquire_lock
     stop_watcher
     if [ "$(online)" != "1" ]; then
         echo "No charger connected - nothing to do."
@@ -146,6 +200,7 @@ case "$1" in
 
   off)
     need
+    acquire_lock
     stop_watcher
     gate_off
     echo "Charge limit off - normal charging."
