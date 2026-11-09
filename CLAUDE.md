@@ -559,9 +559,14 @@ router and searchable. It's a differentiator no router UI has.
   4.8.5 → 4.10.0 FOTA every MudiModem file came back and `site-packages` held nothing but
   `README.txt`; both LCD services crash-looped on `ModuleNotFoundError` while `gl_screen` kept the
   panel. **The web admin was completely unaffected**, which is exactly what makes this look like an
-  LCD bug instead of an upgrade artefact — check `python3 -c "import numpy, evdev, PIL"` first.
-  Fix: **`/usr/sbin/mudimodem-lcddeps`** (§5) — the init scripts run `check` before opening a procd
-  instance and spawn `heal` if it fails, so a dep-less box **defers** instead of crash-looping.
+  LCD bug instead of an upgrade artefact — confirm the LCD imports, and do not trust python's exit
+  code. A zero-byte `/usr/bin/python3.11` is ENOEXEC; BusyBox ash re-executes it as an empty shell
+  script, so `python3 -c ...` exits 0 and prints nothing (GL-E5800 4.10.2, issue #6).
+  Fix: **`/usr/sbin/mudimodem-lcddeps`** (§5) — `check` requires the sentinel `LCDDEPS_OK` on stdout
+  after numpy, evdev and PIL import. The init scripts run `check` before opening a procd instance
+  and spawn `heal` if it fails, so a dep-less **or interpreter-dead** box **defers** instead of
+  crash-looping. A failed probe `--force-reinstall`s `python3-base`, `libpython3-3.11` and
+  `python3-light` with the LCD module packages, then re-verifies.
   ⇒ **Any new add-on dependency that is an opkg package needs the same treatment; listing it in
   `keep.d` is the wrong instinct** — 30 MB of numpy would land on `/dev/mmcblk0p66`, the partition
   that filled to 100% (a runaway `ipacm_log.txt`) and silently killed a firmware upgrade on
@@ -604,7 +609,7 @@ MudiModem/
 │   ├── verify.sh                ← on-device assertions (files, JSON parse, gzip_static, eval, backend, watchdog)
 │   └── mudimodem-at.py          ← our own AT channel on /dev/at_mdm0 (Python stdlib; Phase 3 console)
 ├── test/chunk.test.js           ← local Node test: evals the chunk exactly as the SPA does
-├── test/lcddeps.test.sh         ← stubbed opkg/python3: dep guard, ordering, force-reinstall, deferral
+├── test/lcddeps.test.sh         ← stubbed opkg/python3: sentinel, no-op interpreter, ordering, force-reinstall, deferral
 ├── test/battery-chunk.test.js       ← evals the battery chunk; lane domains, reduce, gaps
 ├── test/backend-battery-history.test.lua
 ├── test/test_collectd.py        ← collectd broadcast socket + latest.json test
@@ -854,6 +859,14 @@ MudiModem/
   `heal` (waits ≤10 min for the feed, installs, then starts the services) instead of crash-looping.
   Verified on the box by hiding `numpy` and restarting: **no procd instance, zero
   `ModuleNotFoundError`, one log line.** `heal` also **`--force-reinstall`s** when opkg's status DB
-  claims the packages are present but the modules still won't import. See §9 for why not `keep.d`.
+  claims the packages are present but the modules still won't import, and (1.8.2) that reinstall
+  includes `python3-base` / `libpython3-3.11` / `python3-light` when the interpreter never prints
+  the sentinel. See §9 for why not `keep.d`.
+- ✅ **Dead interpreter no longer passes `lcddeps check` (1.8.2, issue #6).** On 4.10.2 a zero-byte
+  `/usr/bin/python3.11` and a damaged stdlib made `python3 -c 'print(...)'` exit 0 with no output,
+  so the guard reported success and the panel stayed on `gl_screen`. `check` now requires stdout
+  `LCDDEPS_OK` after the LCD imports (and the stdlib those scripts import). `install`/`heal`
+  `--force-reinstall` the core Python packages and re-verify. Stubbed in `test/lcddeps.test.sh`
+  (also what `tools/verify.sh` §15 runs on device). Not yet confirmed on hardware.
 - 🧹 `tools/verify.sh` still only checks the menu JSON *parses*; it should also assert
   `get_menu_list` returns it at `level:1` (§8 has the stub).

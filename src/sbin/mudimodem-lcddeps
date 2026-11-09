@@ -14,6 +14,15 @@
 # panel. The web admin was entirely unaffected, which is what made it look like
 # an LCD bug rather than an upgrade artefact.
 #
+# A second failure mode showed up on 4.10.2 (issue #6): /usr/bin/python3.11 was
+# a zero-byte file and part of the stdlib was damaged. BusyBox ash treats an
+# ENOEXEC (an empty file is not an ELF) as "run it as a shell script". An empty
+# script exits 0 and prints nothing, so `python3 -c 'import numpy'` looked
+# successful and `check` let procd start the panel against a dead interpreter.
+# The LCD stayed on the stock GL screen. Exit status is not evidence that
+# Python ran. The probe below requires a sentinel on stdout, printed only after
+# the imports actually succeed.
+#
 # WHY opkg AND NOT keep.d
 # -----------------------
 # Listing site-packages in keep.d would add ~30 MB (numpy alone is 26 MB) to the
@@ -30,17 +39,26 @@
 # install path and the boot path.
 #
 # USAGE
-#   mudimodem-lcddeps check          # exit 0 if every module imports; silent. No network.
+#   mudimodem-lcddeps check          # exit 0 only if python prints SENTINEL
+#                                    # after the LCD imports. Silent. No network.
 #   mudimodem-lcddeps install        # install what is missing; do NOT touch services.
 #   mudimodem-lcddeps heal           # wait for network, install, then start the services.
 #
 # `heal` is what the init scripts spawn (detached) when `check` fails at boot.
+# A failed probe reinstalls the interpreter itself (python3-base, libpython3-*,
+# python3-light), not only the LCD module packages, then re-verifies.
 
 set -u
 
-# Modules the renderer and the button watcher import, and the opkg packages that
-# provide them. mudi.py needs numpy + PIL; mudi-watch.py needs evdev. We heal all
-# three together — a partial site-packages is not a state worth modelling.
+# Printed by the probe, and only then, when this interpreter executed the
+# program below and every import succeeded. Callers compare stdout to this
+# string. They must not treat the exit code as success.
+SENTINEL=LCDDEPS_OK
+
+# Modules the renderer and the button watcher import. mudi.py needs numpy +
+# PIL (Image, ImageDraw, ImageFont); mudi-watch.py needs evdev (InputDevice,
+# ecodes). The probe imports those names. We heal all three together — a
+# partial site-packages is not a state worth modelling.
 MODULES="numpy evdev PIL"
 
 # Mirrors what install.sh has always installed. Order matters: libtiff6 must land
@@ -56,74 +74,213 @@ MODULES="numpy evdev PIL"
 # imports and renders fine without them, it just cannot decode those formats.
 LCD_DEPS="python3-light python3-numpy python3-urllib python3-logging python3-ctypes python3-cffi python3-evdev libtiff6"
 
+# Interpreter packages. python3-base owns /usr/bin/python3.11 and the python3
+# symlink (OpenWrt Py3Package/python3-base). python3-light owns the stdlib
+# slice the renderer imports; it is also the first LCD_DEPS entry and is
+# de-duplicated when the install list is built. libpython is not in this
+# string: its opkg name carries the minor (Package/libpython3 ABI_VERSION).
+PY_CORE="python3-base python3-light"
+
+# GL-E5800 / OpenWrt 23.05 ships CPython 3.11, so the ABI package is
+# libpython3-3.11. Prefer a libpython3-* already in opkg's status DB — that
+# DB survives a zero-byte interpreter — and fall back to this. Never ask
+# python for its version; executing it is the thing that lies.
+LIBPYTHON_FALLBACK=libpython3-3.11
+
 LOCK=/tmp/mudimodem-lcddeps.lock       # /var/lock is not guaranteed here; /tmp is tmpfs and always present
 STAMP=/tmp/mudimodem-lcddeps.failed   # tmpfs on purpose: a reboot earns a fresh try
 
 log() { logger -t mudimodem-lcddeps "$*"; echo "mudimodem-lcddeps: $*"; }
 
-# --- check ------------------------------------------------------------------
-# One interpreter start for the whole set. Prints nothing on success so the init
-# scripts can call it on every start without noise.
-missing_modules() {
-    for m in $MODULES; do
-        python3 -c "import $m" 2>/dev/null || echo "$m"
+# --- package list ------------------------------------------------------------
+# Field 1 of `opkg list-installed` is the package name (`name - version`).
+# A regex match would treat the dot in libpython3-3.11 as "any character".
+pkg_installed() {
+    opkg list-installed 2>/dev/null | while read -r pkg _rest; do
+        [ "$pkg" = "$1" ] && echo y && break
+    done | grep -q y
+}
+
+libpython_pkg() {
+    name=$(opkg list-installed 2>/dev/null | while read -r pkg _rest; do
+        case "$pkg" in
+            libpython3-[0-9]*) echo "$pkg"; break ;;
+        esac
+    done | head -n 1)
+    [ -n "$name" ] || name=$LIBPYTHON_FALLBACK
+    echo "$name"
+}
+
+# libpython first (python3-base links it), then the interpreter, then the
+# stdlib, then the LCD modules, pillow last. python3-light is in both PY_CORE
+# and LCD_DEPS; the first copy wins.
+wanted_packages() {
+    lib=$(libpython_pkg)
+    seen=" "
+    out=""
+    for p in "$lib" $PY_CORE $LCD_DEPS python3-pillow; do
+        case "$seen" in
+            *" $p "*) continue ;;
+        esac
+        seen="$seen$p "
+        out="$out $p"
     done
+    echo "$out"
+}
+
+missing_packages() {
+    out=""
+    for p in $(wanted_packages); do
+        pkg_installed "$p" || out="$out $p"
+    done
+    echo "$out"
+}
+
+# --- check -------------------------------------------------------------------
+# One interpreter start. stdout is exactly SENTINEL, or one missing module
+# name per line, or the token python-runtime when the stdlib itself will not
+# import. A dead interpreter prints nothing (ash ran an empty script). The
+# exit status is ignored on purpose.
+probe_out() {
+    # shellcheck disable=SC2086
+    python3 -c '
+import sys
+sentinel = sys.argv[1]
+mods = sys.argv[2:]
+# stdlib the two LCD scripts import at startup. All of these live in
+# python3-base or python3-light on OpenWrt 23.05 (they are not in the
+# split-out python3-* packages). A damaged stdlib fails closed as
+# python-runtime so the repair reinstalls the interpreter, not "json".
+stdlib = ("sys", "os", "time", "json", "subprocess", "threading",
+          "signal", "re", "socket", "select", "textwrap")
+runtime_bad = False
+for m in stdlib:
+    try:
+        __import__(m)
+    except Exception:
+        runtime_bad = True
+        break
+bad = []
+if not runtime_bad:
+    for m in mods:
+        try:
+            if m == "PIL":
+                __import__("PIL.Image", fromlist=["Image"])
+                __import__("PIL.ImageDraw", fromlist=["ImageDraw"])
+                __import__("PIL.ImageFont", fromlist=["ImageFont"])
+            elif m == "evdev":
+                mod = __import__("evdev", fromlist=["InputDevice", "ecodes"])
+                getattr(mod, "InputDevice")
+                getattr(mod, "ecodes")
+            else:
+                __import__(m)
+        except Exception:
+            bad.append(m)
+if runtime_bad:
+    sys.stdout.write("python-runtime\n")
+    sys.stdout.flush()
+    sys.exit(1)
+if bad:
+    sys.stdout.write("\n".join(bad) + "\n")
+    sys.stdout.flush()
+    sys.exit(1)
+sys.stdout.write(sentinel + "\n")
+sys.stdout.flush()
+' "$SENTINEL" $MODULES 2>/dev/null || true
+}
+
+modules_ok() {
+    [ "$(probe_out)" = "$SENTINEL" ]
 }
 
 do_check() {
-    miss=$(missing_modules)
-    [ -z "$miss" ] && return 0
-    echo "$miss"
+    out=$(probe_out)
+    if [ "$out" = "$SENTINEL" ]; then
+        return 0
+    fi
+    if [ -z "$out" ]; then
+        echo "python-runtime"
+    else
+        printf '%s\n' "$out"
+    fi
     return 1
 }
 
-# --- install ----------------------------------------------------------------
-missing_packages() {
-    out=""
-    for p in $LCD_DEPS; do
-        opkg list-installed 2>/dev/null | grep -q "^$p " || out="$out $p"
+# --- install -----------------------------------------------------------------
+install_one() {
+    if [ "$1" = python3-pillow ]; then
+        # $force is either empty or --force-reinstall. Unquoted so the empty
+        # word disappears; pillow must keep --nodeps either way.
+        # shellcheck disable=SC2086
+        opkg install --nodeps $force python3-pillow >/dev/null 2>&1 \
+            || log "WARN: opkg install --nodeps python3-pillow failed"
+    else
+        # shellcheck disable=SC2086
+        opkg install $force "$1" >/dev/null 2>&1 || log "WARN: opkg install $1 failed"
+    fi
+}
+
+install_pkgs() {
+    for p in "$@"; do
+        install_one "$p"
     done
-    # pillow is checked with the rest but installed --nodeps, so it is tracked
-    # separately and always appended last.
-    opkg list-installed 2>/dev/null | grep -q "^python3-pillow " || out="$out python3-pillow"
-    echo "$out"
+}
+
+probe_failure() {
+    still=$(probe_out)
+    [ -n "$still" ] || still="python-runtime"
+    # echo without quotes collapses the module-name lines to one log line,
+    # matching the pre-sentinel message.
+    # shellcheck disable=SC2086
+    log "ERROR: still cannot import:$(echo $still | sed 's/^/ /')"
 }
 
 do_install() {
     force=""
     miss=$(missing_packages)
     if [ -z "$(echo "$miss" | tr -d ' ')" ]; then
-        if [ -z "$(missing_modules)" ]; then
+        if modules_ok; then
             log "all LCD packages already installed"
             return 0
         fi
-        # opkg's status DB and site-packages have diverged: every package is
-        # marked installed, yet something will not import. Trusting the DB here
-        # would return success and hand the panel straight back to the crash
-        # loop. Reinstall the whole set instead — the files are the truth.
-        log "opkg reports all packages present but modules do not import — forcing reinstall"
-        miss="$LCD_DEPS python3-pillow"
+        # opkg's status DB and the files have diverged: every package is
+        # marked installed, yet the sentinel never appeared. That is both
+        # "site-packages wiped but the DB survived" and "python3.11 is a
+        # zero-byte file". Trusting the DB would return success and hand
+        # the panel straight back to the crash loop. Reinstall the runtime
+        # and the LCD set — the files are the truth.
+        log "opkg reports all packages present but Python did not confirm LCD imports — forcing reinstall"
+        miss=$(wanted_packages)
         force="--force-reinstall"
     fi
-    log "installing missing LCD packages:$miss"
+    log "installing LCD packages:$miss"
     opkg update >/dev/null 2>&1 || log "opkg update failed (continuing; cache may be usable)"
-    for p in $miss; do
-        if [ "$p" = python3-pillow ]; then
-            opkg install --nodeps $force python3-pillow >/dev/null 2>&1 \
-                || log "WARN: opkg install --nodeps python3-pillow failed"
-        else
-            opkg install $force "$p" >/dev/null 2>&1 || log "WARN: opkg install $p failed"
-        fi
-    done
-    # Report against the modules, not opkg's exit status: a package can install
-    # and still not import (that is exactly the libtiff6 failure mode).
-    still=$(missing_modules)
-    if [ -n "$still" ]; then
-        log "ERROR: still cannot import:$(echo $still | sed 's/^/ /')"
+    # shellcheck disable=SC2086
+    install_pkgs $miss
+    if modules_ok; then
+        log "all LCD modules import OK"
+        return 0
+    fi
+    if [ -n "$force" ]; then
+        probe_failure
         return 1
     fi
-    log "all LCD modules import OK"
-    return 0
+    # The packages that were missing are now installed, and the sentinel
+    # still did not appear. Typical cause: numpy was gone AND the
+    # interpreter/stdlib is damaged, so the first pass never replaced
+    # python3-base. Reinstall the whole set once, then re-verify.
+    log "LCD imports still unconfirmed after install — reinstalling the Python runtime"
+    force="--force-reinstall"
+    miss=$(wanted_packages)
+    log "installing LCD packages:$miss"
+    # shellcheck disable=SC2086
+    install_pkgs $miss
+    if modules_ok; then
+        log "all LCD modules import OK"
+        return 0
+    fi
+    probe_failure
+    return 1
 }
 
 # --- heal -------------------------------------------------------------------
@@ -155,7 +312,7 @@ do_heal() {
 
     do_check >/dev/null && { log "nothing to heal"; return 0; }
 
-    log "LCD python modules missing after upgrade — healing"
+    log "LCD python did not confirm imports — healing"
     if ! wait_for_network; then
         log "ERROR: no package feed reachable after 10 min; giving up for this boot"
         : > "$STAMP"
