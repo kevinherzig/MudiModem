@@ -502,6 +502,8 @@ for f in /etc/init.d/mudi /etc/init.d/mudi-watch; do
     || fail "$f does not gate procd on the dep check (post-FOTA crash loop returns)"
 done
 # Stubbed behaviour test — installs nothing, touches no service.
+# Includes a no-op python3 (exit 0, no stdout) and an import failure:
+# check must require the sentinel, not the exit code.
 ssh -o BatchMode=yes "root@$HOST" 'cat > /tmp/mm-lcddeps.test.sh' < test/lcddeps.test.sh
 ssh -o BatchMode=yes "root@$HOST" 'cd /tmp && sh /tmp/mm-lcddeps.test.sh /usr/sbin/mudimodem-lcddeps >/dev/null; rc=$?; rm -f /tmp/mm-lcddeps.test.sh; exit $rc' \
   || fail "mudimodem-lcddeps behaviour test failed"
