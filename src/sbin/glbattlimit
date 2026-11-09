@@ -33,6 +33,7 @@ DEF_LIMIT=80
 POLL=15
 PIDF=/tmp/glbattlimit.pid
 LIMF=/tmp/glbattlimit.limit
+LOCKD=/tmp/glbattlimit.lock
 
 # --- gauge <-> GUI conversion (PROVISIONAL) -------------------------------
 # The GL.iNet GUI/touchscreen does not show the fuel gauge value. Measured
@@ -84,11 +85,106 @@ gate_on() {
 # charging immediately; the pump returns on the next plug event.
 gate_off() { echo "$VREG_NORMAL" > "$BUCK/vreg" 2>/dev/null; }
 
+# Concurrency hardening contributed by @jayck88 (thanks!), mudi7-battery-limit
+# 7cb885a, plus three device fixes on top of that revision:
+#   - `on`/`off` abort when the lock stays busy (a failed acquire must not
+#     fall through into a second teardown)
+#   - a live lock pid whose command line is not this script is a reused pid,
+#     not a holder, and the lock is taken back
+#   - signals are sent only after a fresh cmdline check, and an `on` that
+#     finds the charger already gone restores vreg itself. SIGKILL skips the
+#     watcher's TERM trap, which is what used to do that restore.
+lock_owner_live() {
+    [ -n "$1" ] || return 1
+    kill -0 "$1" 2>/dev/null || return 1
+    cmd=$(tr '\000' ' ' < "/proc/$1/cmdline" 2>/dev/null) || return 1
+    case "$cmd" in
+        "$0 "*|*" $0 "*) return 0 ;;
+    esac
+    return 1
+}
+
+acquire_lock() {
+    n=0
+    while ! mkdir "$LOCKD" 2>/dev/null; do
+        owner=$(cat "$LOCKD/pid" 2>/dev/null)
+        if lock_owner_live "$owner"; then
+            n=$((n + 1))
+            [ "$n" -lt 10 ] || { echo "ERROR: another charge-limit operation is busy."; return 1; }
+            sleep 1
+            continue
+        fi
+        if [ -z "$owner" ]; then
+            # Pid not written yet, or a holder that died in that window.
+            # Wait once so a live `on` can publish its pid before we remove it.
+            n=$((n + 1))
+            if [ "$n" -lt 2 ]; then
+                sleep 1
+                continue
+            fi
+            owner=$(cat "$LOCKD/pid" 2>/dev/null)
+            lock_owner_live "$owner" && continue
+        fi
+        rm -f "$LOCKD/pid"
+        rmdir "$LOCKD" 2>/dev/null || true
+    done
+    echo $$ > "$LOCKD/pid"
+    trap 'rm -f "$LOCKD/pid"; rmdir "$LOCKD" 2>/dev/null || true' 0
+}
+
+# True when pid still has this script's _watch on its command line.
+# The space after _watch is the NUL that ends argv. $0 is matched only as
+# its own argument, so a different path that merely contains this name is
+# left alone. Re-checked immediately before each signal: a pid recycled
+# during the TERM wait must not be killed.
+is_watcher() {
+    [ -n "$1" ] || return 1
+    [ "$1" = "$$" ] && return 1
+    [ -r "/proc/$1/cmdline" ] || return 1
+    cmd=$(tr '\000' ' ' < "/proc/$1/cmdline" 2>/dev/null) || return 1
+    case "$cmd" in
+        "$0 _watch "*|*" $0 _watch "*) return 0 ;;
+    esac
+    return 1
+}
+
+watcher_pids() {
+    for d in /proc/[0-9]*; do
+        [ -r "$d/cmdline" ] || continue
+        p=${d##*/}
+        is_watcher "$p" && echo "$p"
+    done
+}
+
 stop_watcher() {
-    [ -f "$PIDF" ] || return 0
-    p=$(cat "$PIDF" 2>/dev/null)
-    [ -n "$p" ] && kill "$p" 2>/dev/null
-    sleep 1
+    pids=$(watcher_pids)
+    for p in $pids; do
+        is_watcher "$p" && kill "$p" 2>/dev/null || true
+    done
+    n=0
+    live=""
+    while [ "$n" -lt 2 ]; do
+        live=""
+        for p in $pids; do
+            if kill -0 "$p" 2>/dev/null && is_watcher "$p"; then
+                live="$live $p"
+            fi
+        done
+        [ -z "$live" ] && break
+        sleep 1
+        n=$((n + 1))
+    done
+    # ash defers TERM traps while its external sleep is running. SIGKILL those
+    # shells so they cannot finish the sleep, run the trap, and delete the
+    # replacement watcher's pid file. Check the command line again first.
+    for p in $live; do
+        is_watcher "$p" && kill -KILL "$p" 2>/dev/null || true
+    done
+    rm -f "$PIDF" "$LIMF"
+}
+
+clear_own_state() {
+    [ "$(cat "$PIDF" 2>/dev/null)" = "$$" ] || return 0
     rm -f "$PIDF" "$LIMF"
 }
 
@@ -96,12 +192,12 @@ watch_loop() {
     echo $$ > "$PIDF"
     lim=$(cat "$LIMF" 2>/dev/null)
     [ -z "$lim" ] && lim=$DEF_LIMIT
-    trap 'gate_off; rm -f "$PIDF" "$LIMF"; log "stopped, limit released"; exit 0' INT TERM
+    trap 'gate_off; clear_own_state; log "stopped, limit released"; exit 0' INT TERM
     log "active, limit ${lim}%"
     while :; do
         if [ "$(online)" != "1" ]; then
             gate_off
-            rm -f "$PIDF" "$LIMF"
+            clear_own_state
             log "unplugged - factory state restored"
             exit 0
         fi
@@ -131,8 +227,13 @@ case "$1" in
         echo "Limit must be between 50 and 100 (gauge scale)."
         exit 1
     fi
+    acquire_lock || exit 1
     stop_watcher
     if [ "$(online)" != "1" ]; then
+        # The watcher we just stopped may have been SIGKILLed inside sleep,
+        # so its trap never restored the buck. Do it here or the next plug
+        # charges into a lowered vreg with nobody watching.
+        gate_off
         echo "No charger connected - nothing to do."
         exit 1
     fi
@@ -146,6 +247,7 @@ case "$1" in
 
   off)
     need
+    acquire_lock || exit 1
     stop_watcher
     gate_off
     echo "Charge limit off - normal charging."
