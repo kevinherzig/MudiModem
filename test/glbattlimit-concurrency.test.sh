@@ -29,6 +29,8 @@ grep -q 'acquire_lock' "$SRC" || { echo "FAIL: lock missing" >&2; exit 1; }
 grep -q 'clear_own_state' "$SRC" || { echo "FAIL: owner-scoped cleanup missing" >&2; exit 1; }
 grep -q 'kill -KILL' "$SRC" || { echo "FAIL: SIGKILL teardown missing" >&2; exit 1; }
 grep -q 'on \[PERCENT\] gui' "$SRC" || { echo "FAIL: gui arg missing" >&2; exit 1; }
+grep -F '[ "$n" -lt 10 ]' "$SRC" >/dev/null || { echo "FAIL: lock retry bound drifted" >&2; exit 1; }
+grep -q 'acquire_lock || exit 1' "$SRC" || { echo "FAIL: busy lock must abort" >&2; exit 1; }
 
 WORK=
 BIN=
@@ -41,13 +43,15 @@ MODE=
 HOTPLUG=
 
 cleanup() {
-    if [ -n "${BIN:-}" ]; then
+    # Anything we spawned is rooted at $WORK (the copy, decoys, holders).
+    if [ -n "${WORK:-}" ]; then
         for d in /proc/[0-9]*; do
             [ -r "$d/cmdline" ] || continue
             p=${d##*/}
+            [ "$p" = "$$" ] && continue
             cmd=$(tr '\000' ' ' < "$d/cmdline" 2>/dev/null || true)
             case "$cmd" in
-                *"$BIN _watch "*) kill -KILL "$p" 2>/dev/null || true ;;
+                *"$WORK"*) kill -KILL "$p" 2>/dev/null || true ;;
             esac
         done
     fi
@@ -154,6 +158,7 @@ prepare() {
         -e "s|^LOCKD=.*|LOCKD=$LOCKD|" \
         -e 's|^POLL=15$|POLL=8|' \
         -e 's|^    sleep 2$|    sleep 1|' \
+        -e 's/-lt 10/-lt 3/' \
         "$SRC" > "$BIN"
     case "$MODE" in
         ash-ext|ash-builtin)
@@ -170,6 +175,8 @@ prepare() {
     chmod 0755 "$BIN"
     grep -q '^POLL=8$' "$BIN" || fail "POLL rewrite failed"
     grep -q 'sleep 2' "$BIN" && fail "startup sleep 2 still in the test copy"
+    grep -q -- '-lt 3' "$BIN" || fail "lock retry was not shortened in the test copy"
+    grep -q -- '-lt 10' "$BIN" && fail "production lock bound leaked into the test copy"
     case "$MODE" in
         system|ash-builtin) busybox ash -n "$BIN" 2>/dev/null || sh -n "$BIN" ;;
         ash-ext) busybox ash -n "$BIN" ;;
@@ -329,6 +336,102 @@ suite() {
     "$BIN" off >/dev/null 2>&1 || fail "off after below-limit"
     [ "$(count_watchers)" -eq 0 ] || fail "watcher left after below-limit off"
     echo "  ok: below-limit charging is unchanged"
+
+    # SIGKILL skips the watcher's trap. `on` while that watcher is asleep and
+    # the charger has already dropped must still restore the factory vreg.
+    "$BIN" on 80 >/dev/null 2>&1 || fail "on before unplug failed"
+    assert_one "before unplug"
+    [ "$(cat "$FAKE/buck/vreg")" = "3950000" ] || fail "expected gate before unplug"
+    printf '%s\n' 0 > "$FAKE/charger/online"
+    if "$BIN" on 80 >"$WORK/out" 2>&1; then fail "on after unplug should fail"; fi
+    grep -q 'No charger connected' "$WORK/out" || fail "unplug message: $(cat "$WORK/out")"
+    [ "$(count_watchers)" -eq 0 ] || fail "unplug on left a watcher"
+    [ "$(cat "$FAKE/buck/vreg")" = "4400000" ] || fail "unplug on left vreg $(cat "$FAKE/buck/vreg")"
+    [ ! -d "$LOCKD" ] || fail "lock leaked after unplug on"
+    printf '%s\n' 1 > "$FAKE/charger/online"
+    echo "  ok: on after unplug restores factory vreg"
+
+    # A live pid in the lock that is not this script (pid reuse) is stale.
+    sleep 30 &
+    holder=$!
+    mkdir "$LOCKD"
+    printf '%s\n' "$holder" > "$LOCKD/pid"
+    "$BIN" on 80 >/dev/null 2>&1 || fail "could not reclaim a foreign lock"
+    assert_one "after foreign-lock reclaim"
+    kill -0 "$holder" 2>/dev/null || fail "reclaim killed the unrelated holder"
+    kill "$holder" 2>/dev/null || true
+    wait "$holder" 2>/dev/null || true
+    echo "  ok: reused lock pid is reclaimed and not killed"
+
+    # A live holder whose command line is this script must block `on`.
+    # The holder is sleep(1) with argv0 set to the script path.
+    "$BIN" off >/dev/null 2>&1 || fail "off before busy lock"
+    [ "$(count_watchers)" -eq 0 ] || fail "watcher still up before busy lock"
+    if ! command -v python3 >/dev/null 2>&1; then
+        fail "python3 required to spawn a same-argv0 lock holder"
+    fi
+    python3 -c 'import os,time; os.execv("/bin/sleep", ["'"$BIN"'", "30"])' &
+    holder=$!
+    i=0
+    while [ "$i" -lt 20 ]; do
+        cmd=$(tr '\000' ' ' < "/proc/$holder/cmdline" 2>/dev/null || true)
+        case "$cmd" in
+            "$BIN "*) break ;;
+        esac
+        i=$((i + 1))
+        sleep 0.1
+    done
+    case "$cmd" in
+        "$BIN "*) ;;
+        *) fail "holder cmdline not rewritten: $cmd" ;;
+    esac
+    mkdir "$LOCKD"
+    printf '%s\n' "$holder" > "$LOCKD/pid"
+    if "$BIN" on 80 >"$WORK/out" 2>&1; then fail "busy lock should fail"; fi
+    grep -q 'another charge-limit operation is busy' "$WORK/out" || fail "busy message: $(cat "$WORK/out")"
+    [ "$(count_watchers)" -eq 0 ] || fail "busy on started a watcher"
+    kill -0 "$holder" 2>/dev/null || fail "busy on killed the lock holder"
+    [ "$(cat "$LOCKD/pid" 2>/dev/null)" = "$holder" ] || fail "busy on stole the lock"
+    kill "$holder" 2>/dev/null || true
+    wait "$holder" 2>/dev/null || true
+    rm -rf "$LOCKD"
+    echo "  ok: a real holder makes on fail without starting a watcher"
+
+    # off must not signal a different program that happens to use _watch.
+    mkdir -p "$WORK/other"
+    cat > "$WORK/other/glbattlimit" <<'EOF'
+#!/bin/sh
+if [ "$1" = "_watch" ]; then
+    sleep 30
+    exit 0
+fi
+exec "$0" _watch
+EOF
+    chmod 0755 "$WORK/other/glbattlimit"
+    "$WORK/other/glbattlimit" >/dev/null 2>&1 &
+    decoy=$!
+    i=0
+    decoy_cmd=
+    while [ "$i" -lt 30 ]; do
+        decoy_cmd=$(tr '\000' ' ' < "/proc/$decoy/cmdline" 2>/dev/null || true)
+        case "$decoy_cmd" in
+            *"$WORK/other/glbattlimit _watch "*) break ;;
+        esac
+        i=$((i + 1))
+        sleep 0.1
+    done
+    case "$decoy_cmd" in
+        *"$WORK/other/glbattlimit _watch "*) ;;
+        *) fail "decoy never reached _watch (cmd=$decoy_cmd)" ;;
+    esac
+    "$BIN" on 80 >/dev/null 2>&1 || fail "on beside decoy failed"
+    assert_one "beside decoy"
+    "$BIN" off >/dev/null 2>&1 || fail "off beside decoy failed"
+    [ "$(count_watchers)" -eq 0 ] || fail "off left our watcher"
+    kill -0 "$decoy" 2>/dev/null || fail "off killed a different _watch"
+    kill "$decoy" 2>/dev/null || true
+    wait "$decoy" 2>/dev/null || true
+    echo "  ok: off does not signal a different _watch program"
 
     # Owner-scoped cleanup: a dying watcher's trap must not delete a pid
     # file that no longer names it (the other half of the race).

@@ -778,10 +778,14 @@ MudiModem/
 - ✅ **glbattlimit one watcher (issue #7)** — the vendored `src/sbin/glbattlimit` now matches
   ChiliApple/mudi7-battery-limit `7cb885a` (jayck88, 2026-07-29). A second `on` during the
   watcher's `sleep` used to let the old TERM trap delete the new PID file; the i2c hotplug
-  then started another `_watch`, and `status`/`off` saw only the pid file. The script takes
+  then started another `_watch`, and `status`/`off` saw only the pid file.   The script takes
   a mkdir lock around `on`/`off`, SIGKILLs a watcher whose trap is stuck behind `sleep`, and
-  removes the PID/limit files only when they still name that process. GUI conversion, the
-  sysfs gate, and the hotplug/init/rpc wiring are unchanged. Bump to 1.8.1.
+  removes the PID/limit files only when they still name that process. On top of that
+  upstream revision, a busy lock aborts instead of starting a second teardown, a reused
+  lock pid is reclaimed, signals are re-checked against `/proc` cmdline, and an `on` that
+  finds the charger already unplugged restores factory `vreg` (SIGKILL skips the watcher's
+  own restore). GUI conversion, the sysfs gate, and the hotplug/init/rpc wiring are unchanged.
+  Bump to 1.8.1.
 - 🔭 Later: `install.sh`/`uninstall.sh` (device-guarded + idempotent, mirroring MudiUI's); register
   the watchdog `boot-check` in a boot hook; an ipk. (`/etc/sysupgrade.conf` itself is already
   handled by `deploy.sh` — see the corrected bullet below.)
